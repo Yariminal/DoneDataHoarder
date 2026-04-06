@@ -287,13 +287,129 @@ document.addEventListener('alpine:init', () => {
   /* ----------------------------------------------------------
    * Pipeline runner
    * -------------------------------------------------------- */
+  /* ----------------------------------------------------------
+   * Setup component
+   * -------------------------------------------------------- */
+  Alpine.data('setup', () => ({
+    selectedFolder: localStorage.getItem('datahoarder_folder') || '',
+    selectedModel: localStorage.getItem('datahoarder_model') || 'gemma3:12b',
+    showBrowser: false,
+    currentPath: '',
+    parentPath: null,
+    drives: [],
+    folders: [],
+    ollamaStatus: null,
+    installedModels: [],
+    recommendedModels: [],
+    pulling: null,
+
+    async init() {
+      await this.loadOllamaStatus();
+      await this.loadInstalledModels();
+      this.recommendedModels = [
+        { name: 'gemma3:4b',   desc: 'Gemma 3 4B - Fast, good quality, multimodal', size: '3.3 GB', vision: true },
+        { name: 'gemma3:12b',  desc: 'Gemma 3 12B - Best balance, multimodal', size: '8.1 GB', vision: true },
+        { name: 'gemma3:27b',  desc: 'Gemma 3 27B - Highest quality, needs 20GB+ RAM', size: '17 GB', vision: true },
+        { name: 'llava:7b',    desc: 'LLaVA 7B - Lightweight vision model', size: '4.7 GB', vision: true },
+        { name: 'llava:13b',   desc: 'LLaVA 13B - Higher quality vision', size: '8.0 GB', vision: true },
+        { name: 'llama3.2:3b', desc: 'Llama 3.2 3B - Fast text-only', size: '2.0 GB', vision: false },
+      ];
+    },
+
+    async browsePath(path) {
+      try {
+        const data = await api.get(`/browse?path=${encodeURIComponent(path)}`);
+        this.currentPath = data.current;
+        this.parentPath = data.parent;
+        this.drives = data.drives;
+        this.folders = data.folders;
+      } catch (e) {
+        Alpine.store('app').toast('Failed to browse: ' + e.message, 'error');
+      }
+    },
+
+    goBack() {
+      if (this.parentPath) {
+        this.browsePath(this.parentPath);
+      } else {
+        this.currentPath = '';
+        this.parentPath = null;
+        this.drives = [];
+        this.folders = [];
+      }
+    },
+
+    selectFolder(path) {
+      this.selectedFolder = path;
+      this.showBrowser = false;
+      this.saveSettings();
+      Alpine.store('app').toast('Folder selected: ' + path, 'success');
+    },
+
+    saveSettings() {
+      localStorage.setItem('datahoarder_folder', this.selectedFolder);
+      localStorage.setItem('datahoarder_model', this.selectedModel);
+    },
+
+    async loadOllamaStatus() {
+      try {
+        this.ollamaStatus = await api.get('/ollama/status');
+      } catch (e) {
+        Alpine.store('app').toast('Failed to check Ollama status', 'error');
+      }
+    },
+
+    async loadInstalledModels() {
+      try {
+        const data = await api.get('/ollama/models');
+        this.installedModels = data.models;
+      } catch (e) {
+        Alpine.store('app').toast('Failed to load models', 'error');
+      }
+    },
+
+    isInstalled(modelName) {
+      return this.installedModels.some(m => m.name === modelName);
+    },
+
+    async pullModel(modelName) {
+      this.pulling = modelName;
+      try {
+        await api.post('/ollama/pull', { model: modelName });
+        Alpine.store('app').toast(`Downloaded ${modelName}`, 'success');
+        await this.loadInstalledModels();
+      } catch (e) {
+        Alpine.store('app').toast(`Pull failed: ${e.message}`, 'error');
+      } finally {
+        this.pulling = null;
+      }
+    },
+
+    async startOllama() {
+      try {
+        const res = await api.post('/ollama/start');
+        Alpine.store('app').toast(res.status, 'success');
+        await new Promise(r => setTimeout(r, 3000));
+        await this.loadOllamaStatus();
+      } catch (e) {
+        Alpine.store('app').toast('Failed to start Ollama: ' + e.message, 'error');
+      }
+    },
+  }));
+
   Alpine.data('pipeline', () => ({
-    rootPath: '',
-    model: 'gemma3:12b',
+    rootPath: localStorage.getItem('datahoarder_folder') || '',
+    model: localStorage.getItem('datahoarder_model') || 'gemma3:12b',
     backend: 'ollama',
     workers: 1,
     running: null,
     result: null,
+
+    async init() {
+      // Reload settings from storage each time user visits this tab
+      this.rootPath = localStorage.getItem('datahoarder_folder') || '';
+      this.model = localStorage.getItem('datahoarder_model') || 'gemma3:12b';
+    },
 
     async runStep(step) {
       this.running = step;
@@ -303,7 +419,7 @@ document.addEventListener('alpine:init', () => {
         let data;
         switch (step) {
           case 'scan':
-            if (!this.rootPath) { Alpine.store('app').toast('Enter a root path', 'error'); break; }
+            if (!this.rootPath) { Alpine.store('app').toast('Select a folder in Setup first', 'error'); this.running = null; break; }
             data = await api.post('/pipeline/scan', { root_path: this.rootPath });
             break;
           case 'enrich':

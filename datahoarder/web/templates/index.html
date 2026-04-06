@@ -39,6 +39,9 @@
         <span class="nav-icon">&#128203;</span> Duplicates
       </button></li>
       <div class="sidebar-sep"></div>
+      <li><button :class="{ active: $store.app.tab === 'setup' }" @click="$store.app.tab = 'setup'">
+        <span class="nav-icon">&#9965;</span> Setup
+      </button></li>
       <li><button :class="{ active: $store.app.tab === 'pipeline' }" @click="$store.app.tab = 'pipeline'">
         <span class="nav-icon">&#9881;</span> Pipeline
       </button></li>
@@ -486,6 +489,127 @@
           <pre class="text-sm text-mono mt-1" style="white-space:pre-wrap; color:var(--text-dim)" x-text="JSON.stringify(result, null, 2)"></pre>
         </div>
       </template>
+    </section>
+
+    <!-- ====================== SETUP ========================= -->
+    <section x-show="$store.app.tab === 'setup'" x-data="setup" x-cloak>
+      <div class="page-title">&#9965; Setup & Configuration</div>
+
+      <!-- Folder Selection -->
+      <div class="card mb-2">
+        <div class="card-label">Root Folder</div>
+        <div class="mt-1" style="display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center;">
+          <input type="text" class="input" x-model="selectedFolder" readonly placeholder="Select a folder...">
+          <button class="btn btn-primary btn-sm" @click="showBrowser = true">Browse</button>
+        </div>
+        <p class="text-dim text-sm mt-1" x-text="selectedFolder ? 'Selected: ' + selectedFolder : 'Click Browse to select a folder to organize'"></p>
+      </div>
+
+      <!-- Folder Browser Modal -->
+      <template x-if="showBrowser">
+        <div class="modal-backdrop" @click.self="showBrowser = false">
+          <div class="modal" style="max-width:600px;">
+            <button class="modal-close" @click="showBrowser = false">&#10005;</button>
+            <div class="modal-title">Select Folder</div>
+            <div class="mt-1" x-show="!currentPath">
+              <p class="text-dim text-sm mb-1">Available Drives:</p>
+              <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(140px, 1fr)); gap:8px;">
+                <template x-for="drive in drives" :key="drive.name">
+                  <button class="btn btn-outline" @click="browsePath(drive.name)" style="text-align:left; padding:8px;">
+                    <div x-text="drive.name" style="font-weight:600"></div>
+                    <div class="text-dim text-sm" x-text="drive.free_bytes ? (drive.free_bytes/1024/1024/1024).toFixed(1) + ' GB free' : ''"></div>
+                  </button>
+                </template>
+              </div>
+            </div>
+            <div x-show="currentPath">
+              <div style="margin-bottom:12px;">
+                <button class="btn btn-outline btn-sm" @click="goBack()" x-show="parentPath">← Back</button>
+                <div class="text-sm text-mono mt-1" x-text="currentPath"></div>
+              </div>
+              <div style="border:1px solid var(--border); border-radius:6px; max-height:300px; overflow-y:auto;">
+                <template x-for="folder in folders" :key="folder.path">
+                  <div style="padding:8px 12px; border-bottom:1px solid var(--border); cursor:pointer; display:flex; align-items:center; gap:8px; hover:background:var(--surface-2);"
+                       @click="browsePath(folder.path)" @dblclick="selectFolder(folder.path)">
+                    <span>&#128193;</span>
+                    <div style="flex:1;">
+                      <div class="text-sm" x-text="folder.name"></div>
+                    </div>
+                    <span class="text-dim text-sm" x-show="folder.locked">🔒</span>
+                  </div>
+                </template>
+              </div>
+              <button class="btn btn-success mt-1 btn-sm" @click="selectFolder(currentPath)">Select this folder</button>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <!-- Ollama Management -->
+      <div class="card">
+        <div class="card-label">AI Model (Ollama)</div>
+
+        <!-- Status -->
+        <div class="mt-1 p-2" style="background:var(--surface-2); border-radius:6px;">
+          <template x-if="ollamaStatus">
+            <div>
+              <div style="display:grid; grid-template-columns:140px 1fr; gap:8px 12px; font-size:.88rem;">
+                <strong>Installed:</strong>
+                <span x-text="ollamaStatus.installed ? '✓ Yes' : '✗ No'" :style="'color:' + (ollamaStatus.installed ? 'var(--success)' : 'var(--danger)')"></span>
+                <strong>Running:</strong>
+                <span x-text="ollamaStatus.running ? '✓ Yes' : '✗ No'" :style="'color:' + (ollamaStatus.running ? 'var(--success)' : 'var(--danger)')"></span>
+                <template x-if="ollamaStatus.version">
+                  <strong>Version:</strong>
+                  <span class="text-mono" x-text="ollamaStatus.version"></span>
+                </template>
+              </div>
+              <template x-if="!ollamaStatus.installed">
+                <div class="mt-1">
+                  <a href="https://ollama.com/download" target="_blank" class="btn btn-primary btn-sm">Download Ollama</a>
+                </div>
+              </template>
+              <template x-if="ollamaStatus.installed && !ollamaStatus.running">
+                <button class="btn btn-primary btn-sm mt-1" @click="startOllama()">Start Ollama</button>
+              </template>
+            </div>
+          </template>
+        </div>
+
+        <!-- Model Selection -->
+        <div class="mt-2">
+          <label class="text-sm mb-1" style="display:block;">Select Model:</label>
+          <select class="input" x-model="selectedModel" @change="saveSettings()">
+            <option value="">-- Choose a model --</option>
+            <template x-for="m in installedModels" :key="m.name">
+              <option :value="m.name" x-text="m.name + (m.vision ? ' (vision)' : '')"></option>
+            </template>
+          </select>
+        </div>
+
+        <!-- Available Models -->
+        <div class="mt-2">
+          <div class="text-sm mb-1" style="font-weight:600;">Available Models to Install:</div>
+          <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); gap:12px;">
+            <template x-for="rec in recommendedModels" :key="rec.name">
+              <div style="border:1px solid var(--border); border-radius:6px; padding:12px;">
+                <div class="text-sm" style="font-weight:600;" x-text="rec.name"></div>
+                <div class="text-dim text-sm mt-1" x-text="rec.desc"></div>
+                <div class="text-dim text-sm mt-1">Size: <span x-text="rec.size"></span></div>
+                <div class="mt-2">
+                  <template x-if="!isInstalled(rec.name)">
+                    <button class="btn btn-primary btn-sm" @click="pullModel(rec.name)" :disabled="pulling === rec.name">
+                      <span x-text="pulling === rec.name ? 'Pulling...' : 'Pull'"></span>
+                    </button>
+                  </template>
+                  <template x-if="isInstalled(rec.name)">
+                    <span class="badge badge-success">✓ Installed</span>
+                  </template>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
     </section>
 
   </main>
