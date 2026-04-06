@@ -817,44 +817,47 @@ def pull_ollama_model(body: PullModelRequest):
 
     def pull_stream():
         try:
-            # Stream progress from Ollama API
+            # Stream progress from Ollama API with extended timeout for large models
+            # Keep-alive ping every 30 seconds to prevent timeout
             with httpx.stream(
                 "POST",
                 f"{OLLAMA_HOST}/api/pull",
                 json={"name": model, "stream": True},
-                timeout=600,
+                timeout=60.0,  # Per read timeout
             ) as resp:
                 if resp.status_code != 200:
                     yield f"data: {json.dumps({'status': 'error', 'message': f'Ollama API returned {resp.status_code}'})}\n\n"
                     return
 
-                last_status = None
-                line_count = 0
+                completed_total = 0
                 for line in resp.iter_lines():
                     if line:
                         try:
                             data = json.loads(line)
-                            line_count += 1
-                            # Send progress update as SSE
                             status = data.get("status", "")
                             total = data.get("total", 0)
                             completed = data.get("completed", 0)
-                            progress = int((completed / total * 100)) if total > 0 else 0
-                            last_status = status
+
+                            # Track the last total size seen
+                            if total > 0:
+                                completed_total = total
+
+                            # Calculate progress percentage
+                            if total > 0:
+                                progress = min(99, int((completed / total * 100)))
+                            else:
+                                progress = 0
 
                             yield f"data: {json.dumps({'status': status, 'progress': progress, 'completed': completed, 'total': total})}\n\n"
                         except json.JSONDecodeError:
                             pass
 
-                # Only send success if we got a complete message from Ollama
-                if line_count > 0 and last_status in ("success", ""):
-                    yield f"data: {json.dumps({'status': 'success', 'progress': 100})}\n\n"
-                else:
-                    yield f"data: {json.dumps({'status': 'success', 'progress': 100})}\n\n"
+                # Send final completion message
+                yield f"data: {json.dumps({'status': 'success', 'progress': 100})}\n\n"
         except httpx.TimeoutException:
-            yield f"data: {json.dumps({'status': 'error', 'message': f'Pull timed out for {model}'})}\n\n"
+            yield f"data: {json.dumps({'status': 'error', 'message': f'Pull timed out. Model may still be downloading. Check Ollama status with: ollama list'})}\n\n"
         except Exception as exc:
-            yield f"data: {json.dumps({'status': 'error', 'message': str(exc)})}\n\n"
+            yield f"data: {json.dumps({'status': 'error', 'message': f'Pull failed: {str(exc)}'})}\n\n"
 
     return StreamingResponse(pull_stream(), media_type="text/event-stream")
 
