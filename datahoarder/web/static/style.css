@@ -302,6 +302,12 @@ tr:hover td { background: rgba(255,255,255,.02); }
 .toast-info    { background: #1e3a5f; color: var(--info); }
 @keyframes toast-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
 
+/* --- Animations ------------------------------------------- */
+@keyframes pulse-width {
+  0%, 100% { width: 10%; }
+  50% { width: 90%; }
+}
+
 /* --- Responsive ------------------------------------------- */
 @media (max-width: 768px) {
   .app-shell { grid-template-columns: 1fr; grid-template-areas: "header" "main"; }

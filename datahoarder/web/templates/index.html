@@ -614,6 +614,12 @@
                   <template x-if="isInstalled(rec.name)">
                     <span class="badge badge-success">✓ Installed</span>
                   </template>
+                  <!-- Progress bar when pulling -->
+                  <template x-if="pulling === rec.name">
+                    <div style="margin-top:8px; background:var(--surface-2); border-radius:4px; height:6px; overflow:hidden;">
+                      <div style="height:100%; background:var(--primary); animation:pulse-width 2s infinite; border-radius:4px;"></div>
+                    </div>
+                  </template>
                 </div>
               </div>
             </template>
