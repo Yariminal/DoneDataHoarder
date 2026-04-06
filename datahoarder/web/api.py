@@ -835,18 +835,21 @@ def pull_ollama_model(body: PullModelRequest):
     return StreamingResponse(pull_stream(), media_type="text/event-stream")
 
 
-@router.delete("/ollama/models/{model_name:path}")
-def delete_ollama_model(model_name: str):
-    """Delete an Ollama model."""
+@router.post("/ollama/delete")
+def delete_ollama_model(body: PullModelRequest):
+    """Delete an Ollama model via POST request."""
+    model = body.model.strip()
+    if not model:
+        raise HTTPException(400, "Model name required")
     try:
         resp = httpx.request(
             "DELETE",
             f"{OLLAMA_HOST}/api/delete",
-            json={"name": model_name},
+            json={"name": model},
             timeout=30,
         )
         resp.raise_for_status()
-        return {"status": "deleted", "model": model_name}
+        return {"status": "deleted", "model": model}
     except Exception as exc:
         raise HTTPException(500, f"Delete failed: {exc}")
 

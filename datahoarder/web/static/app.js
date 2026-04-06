@@ -406,6 +406,7 @@ document.addEventListener('alpine:init', () => {
     async pullModel(modelName) {
       this.pulling = modelName;
       this.pullProgress[modelName] = 0;
+      let maxProgress = 0;  // Track max progress to prevent backwards movement
       try {
         const response = await fetch(`/api/ollama/pull`, {
           method: 'POST',
@@ -435,7 +436,9 @@ document.addEventListener('alpine:init', () => {
               try {
                 const data = JSON.parse(line.slice(6));
                 if (data.progress !== undefined) {
-                  this.pullProgress[modelName] = data.progress;
+                  // Only allow progress to increase or stay the same, never go backwards
+                  maxProgress = Math.max(maxProgress, data.progress);
+                  this.pullProgress[modelName] = maxProgress;
                 }
                 if (data.status === 'error') {
                   Alpine.store('app').toast(`Pull failed: ${data.message}`, 'error');
@@ -456,6 +459,19 @@ document.addEventListener('alpine:init', () => {
       } finally {
         this.pulling = null;
         delete this.pullProgress[modelName];
+      }
+    },
+
+    async deleteModel(modelName) {
+      if (!confirm(`Are you sure you want to delete ${modelName}? This cannot be undone.`)) {
+        return;
+      }
+      try {
+        await api.post(`/ollama/delete`, { model: modelName });
+        Alpine.store('app').toast(`Deleted ${modelName}`, 'success');
+        await this.loadInstalledModels();
+      } catch (e) {
+        Alpine.store('app').toast(`Delete failed: ${e.message}`, 'error');
       }
     },
 
