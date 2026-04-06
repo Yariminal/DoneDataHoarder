@@ -812,21 +812,33 @@ def pull_ollama_model(body: PullModelRequest):
                 json={"name": model, "stream": True},
                 timeout=600,
             ) as resp:
-                resp.raise_for_status()
+                if resp.status_code != 200:
+                    yield f"data: {json.dumps({'status': 'error', 'message': f'Ollama API returned {resp.status_code}'})}\n\n"
+                    return
+
+                last_status = None
+                line_count = 0
                 for line in resp.iter_lines():
                     if line:
                         try:
                             data = json.loads(line)
+                            line_count += 1
                             # Send progress update as SSE
                             status = data.get("status", "")
                             total = data.get("total", 0)
                             completed = data.get("completed", 0)
                             progress = int((completed / total * 100)) if total > 0 else 0
+                            last_status = status
 
                             yield f"data: {json.dumps({'status': status, 'progress': progress, 'completed': completed, 'total': total})}\n\n"
                         except json.JSONDecodeError:
                             pass
-                yield f"data: {json.dumps({'status': 'success', 'progress': 100})}\n\n"
+
+                # Only send success if we got a complete message from Ollama
+                if line_count > 0 and last_status in ("success", ""):
+                    yield f"data: {json.dumps({'status': 'success', 'progress': 100})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'status': 'success', 'progress': 100})}\n\n"
         except httpx.TimeoutException:
             yield f"data: {json.dumps({'status': 'error', 'message': f'Pull timed out for {model}'})}\n\n"
         except Exception as exc:
