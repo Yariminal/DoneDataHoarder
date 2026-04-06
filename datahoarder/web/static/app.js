@@ -309,16 +309,18 @@ document.addEventListener('alpine:init', () => {
       await this.loadOllamaStatus();
       await this.loadInstalledModels();
       this.recommendedModels = [
-        // Gemma 4 (latest - check ollama.com for availability)
-        { name: 'gemma4:27b',  desc: 'Gemma 4 27B - Latest from Google, multimodal (when available)', size: '16 GB', vision: true, latest: true },
-        { name: 'gemma4:9b',   desc: 'Gemma 4 9B - Latest, balanced, multimodal (when available)', size: '5.5 GB', vision: true, latest: true },
-        // Gemma 2 (stable, available now)
-        { name: 'gemma2:27b',  desc: 'Gemma 2 27B - Highest quality, multimodal, needs 20GB+ RAM', size: '16 GB', vision: true },
+        // Gemma 4 (Latest from Google - NOW AVAILABLE on Ollama!)
+        { name: 'gemma4:31b',  desc: 'Gemma 4 31B - Highest quality, dense, multimodal, 256K context', size: '20 GB', vision: true, latest: true },
+        { name: 'gemma4:26b',  desc: 'Gemma 4 26B - Mixture of Experts, balanced, multimodal, 256K context', size: '18 GB', vision: true, latest: true },
+        { name: 'gemma4:e4b',  desc: 'Gemma 4 E4B - Edge variant, multimodal+audio, 128K context', size: '9.6 GB', vision: true, latest: true },
+        { name: 'gemma4:e2b',  desc: 'Gemma 4 E2B - Lightweight edge, multimodal+audio, 128K context', size: '7.2 GB', vision: true, latest: true },
+        // Gemma 2 (stable, proven quality)
+        { name: 'gemma2:27b',  desc: 'Gemma 2 27B - High quality, multimodal, needs 20GB+ RAM', size: '16 GB', vision: true },
         { name: 'gemma2:9b',   desc: 'Gemma 2 9B - Best balance of quality/speed', size: '5.5 GB', vision: true },
-        // Gemma 3
+        // Gemma 3 (solid performers)
         { name: 'gemma3:12b',  desc: 'Gemma 3 12B - Good quality, multimodal', size: '8.1 GB', vision: true },
         { name: 'gemma3:4b',   desc: 'Gemma 3 4B - Fast, lightweight, multimodal', size: '3.3 GB', vision: true },
-        // Vision-specific
+        // Vision specialists
         { name: 'llava:13b',   desc: 'LLaVA 13B - Specialized vision model', size: '8.0 GB', vision: true },
         { name: 'llava:7b',    desc: 'LLaVA 7B - Lightweight vision', size: '4.7 GB', vision: true },
         // Lightweight text
