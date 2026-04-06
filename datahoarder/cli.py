@@ -476,6 +476,36 @@ def pipeline(
 
 
 # ---------------------------------------------------------------------------
+# serve (web UI)
+# ---------------------------------------------------------------------------
+
+@app.command()
+def serve(
+    db: Annotated[str, typer.Option("--db", help="SQLite database path.", envvar="DATAHOARDER_DB")] = "datahoarder.db",
+    host: Annotated[str, typer.Option("--host", help="Bind address.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", "-p", help="Port number.")] = 8080,
+):
+    """[bold]Launch[/bold] the web review UI in your browser."""
+    import uvicorn
+    from datahoarder.web.app import create_app
+
+    db_path = Path(db)
+    web_app = create_app(db_path)
+
+    console.print(
+        Panel(
+            f"[bold green]DataHoarder Web UI[/bold green]\n\n"
+            f"  Open [cyan]http://{host}:{port}[/cyan] in your browser\n"
+            f"  Database: [dim]{db_path.resolve()}[/dim]\n"
+            f"  Press Ctrl+C to stop",
+            style="green",
+        )
+    )
+
+    uvicorn.run(web_app, host=host, port=port, log_level="warning")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
