@@ -612,7 +612,10 @@
                     </button>
                   </template>
                   <template x-if="isInstalled(rec.name)">
-                    <span class="badge badge-success">✓ Installed</span>
+                    <div style="display:flex; gap:6px; align-items:center;">
+                      <span class="badge badge-success">✓ Installed</span>
+                      <button class="btn btn-danger btn-sm" @click="deleteModel(rec.name)" title="Delete model">Remove</button>
+                    </div>
                   </template>
                   <!-- Progress bar when pulling -->
                   <template x-if="pulling === rec.name">
