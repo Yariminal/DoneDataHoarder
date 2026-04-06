@@ -820,7 +820,7 @@ def list_ollama_models():
         name = m.get("name", "")
         size = m.get("size", 0)
         # Check if this is a vision-capable model
-        is_vision = any(v in name.lower() for v in ("llava", "gemma3", "bakllava", "moondream"))
+        is_vision = any(v in name.lower() for v in ("llava", "gemma3", "gemma4", "bakllava", "moondream"))
         items.append({
             "name": name,
             "size_bytes": size,
@@ -849,19 +849,24 @@ def pull_ollama_model(body: PullModelRequest):
 
     def pull_stream():
         try:
-            # Stream progress from Ollama API with extended timeout for large models
-            # Keep-alive ping every 30 seconds to prevent timeout
+            # Use separate connect/read timeouts: 30s to connect, 1 hour for reads
+            # (large models can take a long time to download)
+            timeout = httpx.Timeout(connect=30.0, read=3600.0, write=30.0, pool=30.0)
             with httpx.stream(
                 "POST",
                 f"{OLLAMA_HOST}/api/pull",
                 json={"name": model, "stream": True},
-                timeout=60.0,  # Per read timeout
+                timeout=timeout,
             ) as resp:
                 if resp.status_code != 200:
                     yield f"data: {json.dumps({'status': 'error', 'message': f'Ollama API returned {resp.status_code}'})}\n\n"
                     return
 
-                completed_total = 0
+                # Track the largest layer to compute overall progress
+                largest_total = 0
+                largest_completed = 0
+                pull_succeeded = False
+
                 for line in resp.iter_lines():
                     if line:
                         try:
@@ -870,22 +875,41 @@ def pull_ollama_model(body: PullModelRequest):
                             total = data.get("total", 0)
                             completed = data.get("completed", 0)
 
-                            # Track the last total size seen
-                            if total > 0:
-                                completed_total = total
+                            # Track progress of the largest layer (the actual model weights)
+                            if total > largest_total:
+                                largest_total = total
+                                largest_completed = completed
+                            elif total == largest_total and total > 0:
+                                largest_completed = completed
 
-                            # Calculate progress percentage
-                            if total > 0:
-                                progress = min(99, int((completed / total * 100)))
+                            # Calculate progress based on largest layer
+                            if largest_total > 0:
+                                progress = min(99, int((largest_completed / largest_total * 100)))
                             else:
                                 progress = 0
 
-                            yield f"data: {json.dumps({'status': status, 'progress': progress, 'completed': completed, 'total': total})}\n\n"
+                            # Detect successful completion from Ollama
+                            if status == "success":
+                                pull_succeeded = True
+
+                            yield f"data: {json.dumps({'status': status, 'progress': progress, 'completed': largest_completed, 'total': largest_total})}\n\n"
                         except json.JSONDecodeError:
                             pass
 
-                # Send final completion message
-                yield f"data: {json.dumps({'status': 'success', 'progress': 100})}\n\n"
+                # Only send success if Ollama actually reported success
+                if pull_succeeded:
+                    yield f"data: {json.dumps({'status': 'success', 'progress': 100})}\n\n"
+                else:
+                    # Verify by checking if model exists
+                    try:
+                        check = httpx.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+                        models = [m.get("name", "") for m in check.json().get("models", [])]
+                        if any(model in m or m in model for m in models):
+                            yield f"data: {json.dumps({'status': 'success', 'progress': 100})}\n\n"
+                        else:
+                            yield f"data: {json.dumps({'status': 'error', 'message': 'Download stream ended but model not found in Ollama.'})}\n\n"
+                    except Exception:
+                        yield f"data: {json.dumps({'status': 'success', 'progress': 100})}\n\n"
         except httpx.TimeoutException:
             yield f"data: {json.dumps({'status': 'error', 'message': f'Pull timed out. Model may still be downloading. Check Ollama status with: ollama list'})}\n\n"
         except Exception as exc:

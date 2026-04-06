@@ -12,12 +12,12 @@ document.addEventListener('alpine:init', () => {
     toasts: [],
     loading: false,
 
-    toast(msg, type = 'info', duration = 3500) {
+    toast(msg, type = 'info') {
       const id = Date.now();
       this.toasts.push({ id, msg, type });
-      setTimeout(() => {
-        this.toasts = this.toasts.filter(t => t.id !== id);
-      }, duration);
+    },
+    dismissToast(id) {
+      this.toasts = this.toasts.filter(t => t.id !== id);
     },
   });
 
@@ -400,7 +400,12 @@ document.addEventListener('alpine:init', () => {
     },
 
     isInstalled(modelName) {
-      return this.installedModels.some(m => m.name === modelName);
+      // Match exact name or name with :latest suffix (Ollama adds :latest by default)
+      return this.installedModels.some(m =>
+        m.name === modelName ||
+        m.name === modelName + ':latest' ||
+        m.name.split(':')[0] === modelName.split(':')[0] && m.name.split(':')[1] === modelName.split(':')[1]
+      );
     },
 
     async pullModel(modelName) {
@@ -485,14 +490,21 @@ document.addEventListener('alpine:init', () => {
           }
         }
 
-        // Verify the model was actually installed
-        await this.loadInstalledModels();
-        const isInstalled = this.isInstalled(modelName);
+        // Verify the model was actually installed (retry a few times with delay)
+        let verified = false;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          await new Promise(r => setTimeout(r, 2000));
+          await this.loadInstalledModels();
+          if (this.isInstalled(modelName)) {
+            verified = true;
+            break;
+          }
+        }
 
-        if (isInstalled) {
+        if (verified) {
           Alpine.store('app').toast(`Downloaded ${modelName}`, 'success');
         } else {
-          Alpine.store('app').toast(`Download completed but model not found in Ollama. Check Ollama status.`, 'warning');
+          Alpine.store('app').toast(`Download completed but model not found in Ollama. Try running "ollama pull ${modelName}" from command line.`, 'warning');
         }
       } catch (e) {
         Alpine.store('app').toast(`Pull failed: ${e.message}`, 'error');
