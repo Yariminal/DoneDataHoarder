@@ -5,10 +5,16 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import platform
+import shutil
+import string
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import BaseModel
 from sqlalchemy import func
@@ -614,3 +620,243 @@ def trigger_propose():
 
     counts = generate_proposals()
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Filesystem browser (for folder selection)
+# ---------------------------------------------------------------------------
+
+class BrowseResponse(BaseModel):
+    current: str
+    parent: Optional[str] = None
+    drives: list[dict] = []
+    folders: list[dict] = []
+
+
+@router.get("/browse")
+def browse_filesystem(path: Optional[str] = None) -> BrowseResponse:
+    """
+    Browse directories for the folder picker.
+    If no path given, returns available drives (Windows) or / (Unix).
+    """
+    # --- List drives (root level) ---
+    if not path:
+        if platform.system() == "Windows":
+            drives = []
+            # Check all drive letters
+            for letter in string.ascii_uppercase:
+                drive = f"{letter}:\\"
+                if os.path.isdir(drive):
+                    try:
+                        total, used, free = shutil.disk_usage(drive)
+                        drives.append({
+                            "name": drive,
+                            "label": f"{letter}: Drive",
+                            "total_bytes": total,
+                            "free_bytes": free,
+                        })
+                    except (PermissionError, OSError):
+                        drives.append({"name": drive, "label": f"{letter}: Drive", "total_bytes": 0, "free_bytes": 0})
+            return BrowseResponse(current="", drives=drives, folders=[])
+        else:
+            path = "/"
+
+    # --- List folders at the given path ---
+    target = Path(path)
+    if not target.exists():
+        raise HTTPException(400, f"Path does not exist: {path}")
+    if not target.is_dir():
+        raise HTTPException(400, f"Not a directory: {path}")
+
+    parent = str(target.parent) if target.parent != target else None
+
+    folders = []
+    try:
+        for entry in sorted(target.iterdir()):
+            if not entry.is_dir():
+                continue
+            name = entry.name
+            # Skip hidden/system dirs
+            if name.startswith(".") or name.startswith("$") or name in (
+                "System Volume Information", "RECYCLER", "$RECYCLE.BIN",
+            ):
+                continue
+            try:
+                # Quick peek: count children and check accessibility
+                children = sum(1 for c in entry.iterdir() if c.is_dir())
+                folders.append({
+                    "name": name,
+                    "path": str(entry),
+                    "has_children": children > 0,
+                })
+            except PermissionError:
+                folders.append({"name": name, "path": str(entry), "has_children": False, "locked": True})
+            except OSError:
+                continue
+    except PermissionError:
+        raise HTTPException(403, f"Cannot read directory: {path}")
+
+    return BrowseResponse(
+        current=str(target),
+        parent=parent,
+        folders=folders,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ollama management (status, models, pull)
+# ---------------------------------------------------------------------------
+
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+# Recommended models for DataHoarder
+RECOMMENDED_MODELS = [
+    {"name": "gemma3:4b",   "desc": "Gemma 3 4B - Fast, good quality, multimodal (vision)", "size": "3.3 GB", "vision": True},
+    {"name": "gemma3:12b",  "desc": "Gemma 3 12B - Best balance of speed and quality, multimodal", "size": "8.1 GB", "vision": True},
+    {"name": "gemma3:27b",  "desc": "Gemma 3 27B - Highest quality, needs 20GB+ RAM", "size": "17 GB", "vision": True},
+    {"name": "llava:7b",    "desc": "LLaVA 7B - Lightweight vision model", "size": "4.7 GB", "vision": True},
+    {"name": "llava:13b",   "desc": "LLaVA 13B - Higher quality vision model", "size": "8.0 GB", "vision": True},
+    {"name": "llama3.2:3b", "desc": "Llama 3.2 3B - Fast text-only model", "size": "2.0 GB", "vision": False},
+]
+
+
+@router.get("/ollama/status")
+def ollama_status():
+    """Check if Ollama is installed and running."""
+    # Check if ollama binary exists
+    ollama_path = shutil.which("ollama")
+    installed = ollama_path is not None
+
+    # Check if server is reachable
+    running = False
+    version = None
+    if installed:
+        try:
+            resp = httpx.get(f"{OLLAMA_HOST}/api/version", timeout=3)
+            if resp.status_code == 200:
+                running = True
+                version = resp.json().get("version")
+        except Exception:
+            pass
+
+    return {
+        "installed": installed,
+        "running": running,
+        "version": version,
+        "ollama_path": ollama_path,
+        "host": OLLAMA_HOST,
+        "download_url": "https://ollama.com/download",
+    }
+
+
+@router.get("/ollama/models")
+def list_ollama_models():
+    """List locally installed Ollama models."""
+    try:
+        resp = httpx.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+        resp.raise_for_status()
+        models = resp.json().get("models", [])
+    except Exception:
+        return {"models": [], "error": "Cannot reach Ollama server"}
+
+    items = []
+    for m in models:
+        name = m.get("name", "")
+        size = m.get("size", 0)
+        # Check if this is a vision-capable model
+        is_vision = any(v in name.lower() for v in ("llava", "gemma3", "bakllava", "moondream"))
+        items.append({
+            "name": name,
+            "size_bytes": size,
+            "modified_at": m.get("modified_at"),
+            "vision": is_vision,
+            "family": m.get("details", {}).get("family", ""),
+            "parameters": m.get("details", {}).get("parameter_size", ""),
+        })
+
+    return {"models": items, "recommended": RECOMMENDED_MODELS}
+
+
+class PullModelRequest(BaseModel):
+    model: str
+
+
+@router.post("/ollama/pull")
+def pull_ollama_model(body: PullModelRequest):
+    """
+    Pull (download) an Ollama model. This is a blocking call that
+    streams progress from Ollama and returns when complete.
+    """
+    model = body.model.strip()
+    if not model:
+        raise HTTPException(400, "Model name required")
+
+    try:
+        # Use the Ollama pull API with stream=False for simplicity
+        resp = httpx.post(
+            f"{OLLAMA_HOST}/api/pull",
+            json={"name": model, "stream": False},
+            timeout=600,  # 10 min timeout for large models
+        )
+        resp.raise_for_status()
+        return {"status": "success", "model": model}
+    except httpx.TimeoutException:
+        raise HTTPException(504, f"Pull timed out for {model}. Try pulling via CLI: ollama pull {model}")
+    except Exception as exc:
+        raise HTTPException(500, f"Pull failed: {exc}")
+
+
+@router.delete("/ollama/models/{model_name:path}")
+def delete_ollama_model(model_name: str):
+    """Delete an Ollama model."""
+    try:
+        resp = httpx.request(
+            "DELETE",
+            f"{OLLAMA_HOST}/api/delete",
+            json={"name": model_name},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return {"status": "deleted", "model": model_name}
+    except Exception as exc:
+        raise HTTPException(500, f"Delete failed: {exc}")
+
+
+@router.post("/ollama/start")
+def start_ollama():
+    """Attempt to start the Ollama server."""
+    ollama_path = shutil.which("ollama")
+    if not ollama_path:
+        raise HTTPException(404, "Ollama not found. Install from https://ollama.com/download")
+
+    try:
+        if platform.system() == "Windows":
+            subprocess.Popen(
+                [ollama_path, "serve"],
+                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.Popen(
+                [ollama_path, "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+
+        # Give it a moment to start
+        import time
+        time.sleep(2)
+
+        # Verify it started
+        try:
+            resp = httpx.get(f"{OLLAMA_HOST}/api/version", timeout=3)
+            if resp.status_code == 200:
+                return {"status": "started", "version": resp.json().get("version")}
+        except Exception:
+            pass
+
+        return {"status": "starting", "message": "Ollama is starting up..."}
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to start Ollama: {exc}")
