@@ -304,10 +304,17 @@ document.addEventListener('alpine:init', () => {
     installedModels: [],
     recommendedModels: [],
     pulling: null,
+    pullProgress: {},  // Track progress per model
 
     async init() {
       await this.loadOllamaStatus();
       await this.loadInstalledModels();
+      // Watch for modal open to auto-load drives
+      this.$watch('showBrowser', (val) => {
+        if (val && !this.currentPath) {
+          this.browsePath('');
+        }
+      });
       this.recommendedModels = [
         // Gemma 4 (Latest from Google - NOW AVAILABLE on Ollama!)
         { name: 'gemma4:31b',  desc: 'Gemma 4 31B - Highest quality, dense, multimodal, 256K context', size: '20 GB', vision: true, latest: true },
