@@ -408,11 +408,18 @@ document.addEventListener('alpine:init', () => {
       this.pullProgress[modelName] = 0;
       let maxProgress = 0;  // Track max progress to prevent backwards movement
       try {
+        // Fetch with extended timeout for large models (3600 seconds = 1 hour)
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 3600000);
+
         const response = await fetch(`/api/ollama/pull`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ model: modelName }),
+          signal: controller.signal,
         });
+
+        clearTimeout(timeoutId);
 
         if (!response.ok) {
           throw new Error(`${response.status} ${response.statusText}`);
