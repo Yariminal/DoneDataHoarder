@@ -16,6 +16,7 @@ from typing import Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Response
+from starlette.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -795,26 +796,43 @@ class PullModelRequest(BaseModel):
 @router.post("/ollama/pull")
 def pull_ollama_model(body: PullModelRequest):
     """
-    Pull (download) an Ollama model. This is a blocking call that
-    streams progress from Ollama and returns when complete.
+    Pull (download) an Ollama model with streaming progress updates.
+    Returns Server-Sent Events (SSE) with progress information.
     """
     model = body.model.strip()
     if not model:
         raise HTTPException(400, "Model name required")
 
-    try:
-        # Use the Ollama pull API with stream=False for simplicity
-        resp = httpx.post(
-            f"{OLLAMA_HOST}/api/pull",
-            json={"name": model, "stream": False},
-            timeout=600,  # 10 min timeout for large models
-        )
-        resp.raise_for_status()
-        return {"status": "success", "model": model}
-    except httpx.TimeoutException:
-        raise HTTPException(504, f"Pull timed out for {model}. Try pulling via CLI: ollama pull {model}")
-    except Exception as exc:
-        raise HTTPException(500, f"Pull failed: {exc}")
+    def pull_stream():
+        try:
+            # Stream progress from Ollama API
+            with httpx.stream(
+                "POST",
+                f"{OLLAMA_HOST}/api/pull",
+                json={"name": model, "stream": True},
+                timeout=600,
+            ) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if line:
+                        try:
+                            data = json.loads(line)
+                            # Send progress update as SSE
+                            status = data.get("status", "")
+                            total = data.get("total", 0)
+                            completed = data.get("completed", 0)
+                            progress = int((completed / total * 100)) if total > 0 else 0
+
+                            yield f"data: {json.dumps({'status': status, 'progress': progress, 'completed': completed, 'total': total})}\n\n"
+                        except json.JSONDecodeError:
+                            pass
+                yield f"data: {json.dumps({'status': 'success', 'progress': 100})}\n\n"
+        except httpx.TimeoutException:
+            yield f"data: {json.dumps({'status': 'error', 'message': f'Pull timed out for {model}'})}\n\n"
+        except Exception as exc:
+            yield f"data: {json.dumps({'status': 'error', 'message': str(exc)})}\n\n"
+
+    return StreamingResponse(pull_stream(), media_type="text/event-stream")
 
 
 @router.delete("/ollama/models/{model_name:path}")
