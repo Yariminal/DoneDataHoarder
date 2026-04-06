@@ -710,13 +710,15 @@ def browse_filesystem(path: Optional[str] = None) -> BrowseResponse:
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 # Recommended models for DataHoarder
-# Latest versions first, includes Gemma 4 (check ollama.com for availability)
+# Latest versions first: Gemma 4 is now available on Ollama!
 RECOMMENDED_MODELS = [
-    # Gemma 4 (latest from Google)
-    {"name": "gemma4:27b",  "desc": "Gemma 4 27B - Latest from Google, multimodal (when available on Ollama)", "size": "16 GB", "vision": True, "latest": True},
-    {"name": "gemma4:9b",   "desc": "Gemma 4 9B - Latest, balanced, multimodal (when available on Ollama)", "size": "5.5 GB", "vision": True, "latest": True},
+    # Gemma 4 (Latest from Google - NOW AVAILABLE on Ollama)
+    {"name": "gemma4:31b",  "desc": "Gemma 4 31B - Highest quality, dense architecture, multimodal, 256K context", "size": "20 GB", "vision": True, "latest": True},
+    {"name": "gemma4:26b",  "desc": "Gemma 4 26B - Mixture of Experts, balanced quality/speed, multimodal, 256K context", "size": "18 GB", "vision": True, "latest": True},
+    {"name": "gemma4:e4b",  "desc": "Gemma 4 E4B - Edge variant, multimodal+audio, 128K context", "size": "9.6 GB", "vision": True, "latest": True},
+    {"name": "gemma4:e2b",  "desc": "Gemma 4 E2B - Lightweight edge variant, multimodal+audio, 128K context", "size": "7.2 GB", "vision": True, "latest": True},
     # Gemma 2 (stable, proven quality)
-    {"name": "gemma2:27b",  "desc": "Gemma 2 27B - Highest quality, multimodal, needs 20GB+ RAM", "size": "16 GB", "vision": True},
+    {"name": "gemma2:27b",  "desc": "Gemma 2 27B - High quality, multimodal, needs 20GB+ RAM", "size": "16 GB", "vision": True},
     {"name": "gemma2:9b",   "desc": "Gemma 2 9B - Best balance of quality and speed", "size": "5.5 GB", "vision": True},
     # Gemma 3 (solid performers)
     {"name": "gemma3:12b",  "desc": "Gemma 3 12B - Good quality, multimodal", "size": "8.1 GB", "vision": True},
