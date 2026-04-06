@@ -573,11 +573,23 @@ def execute_proposals(dry_run: bool = True, min_confidence: float = 0.7):
 def trigger_scan(body: PipelineRequest):
     from datahoarder.core.scanner import scan as do_scan
 
-    root = Path(body.root_path)
-    if not root.exists():
-        raise HTTPException(400, f"Path does not exist: {root}")
-    counts = do_scan(root)
-    return counts
+    try:
+        if not body.root_path or not body.root_path.strip():
+            raise HTTPException(400, "Root path is required")
+
+        root = Path(body.root_path)
+        if not root.exists():
+            raise HTTPException(400, f"Path does not exist: {root}")
+
+        if not root.is_dir():
+            raise HTTPException(400, f"Path is not a directory: {root}")
+
+        counts = do_scan(root)
+        return counts
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"Scan failed: {str(exc)}")
 
 
 @router.post("/pipeline/enrich")
