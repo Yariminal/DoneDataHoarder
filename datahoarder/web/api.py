@@ -572,6 +572,8 @@ def execute_proposals(dry_run: bool = True, min_confidence: float = 0.7):
 @router.post("/pipeline/scan")
 def trigger_scan(body: PipelineRequest):
     from datahoarder.core.scanner import scan as do_scan
+    import io
+    import contextlib
 
     try:
         if not body.root_path or not body.root_path.strip():
@@ -584,7 +586,9 @@ def trigger_scan(body: PipelineRequest):
         if not root.is_dir():
             raise HTTPException(400, f"Path is not a directory: {root}")
 
-        counts = do_scan(root)
+        # Suppress stdout to prevent Rich progress bar Unicode errors in web context
+        with contextlib.redirect_stdout(io.StringIO()):
+            counts = do_scan(root)
         return counts
     except HTTPException:
         raise
@@ -595,24 +599,40 @@ def trigger_scan(body: PipelineRequest):
 @router.post("/pipeline/enrich")
 def trigger_enrich():
     from datahoarder.core.enricher import enrich as do_enrich
+    import io
+    import contextlib
 
-    counts = do_enrich()
-    return counts
+    try:
+        # Suppress stdout to prevent Rich progress bar Unicode errors in web context
+        with contextlib.redirect_stdout(io.StringIO()):
+            counts = do_enrich()
+        return counts
+    except Exception as exc:
+        raise HTTPException(500, f"Enrich failed: {str(exc)}")
 
 
 @router.post("/pipeline/dedup")
 def trigger_dedup():
     from datahoarder.core.dedup import find_exact_duplicates, find_perceptual_duplicates
+    import io
+    import contextlib
 
-    exact = find_exact_duplicates()
-    perc = find_perceptual_duplicates()
-    return {"exact": exact, "perceptual": perc}
+    try:
+        # Suppress stdout to prevent Rich progress bar Unicode errors in web context
+        with contextlib.redirect_stdout(io.StringIO()):
+            exact = find_exact_duplicates()
+            perc = find_perceptual_duplicates()
+        return {"exact": exact, "perceptual": perc}
+    except Exception as exc:
+        raise HTTPException(500, f"Dedup failed: {str(exc)}")
 
 
 @router.post("/pipeline/analyze")
 def trigger_analyze(body: PipelineRequest):
     from datahoarder.ai.router import init_ai
     from datahoarder.analyzers.pipeline import analyze as do_analyze
+    import io
+    import contextlib
 
     try:
         init_ai(
@@ -623,16 +643,28 @@ def trigger_analyze(body: PipelineRequest):
     except RuntimeError as exc:
         raise HTTPException(503, str(exc))
 
-    counts = do_analyze(workers=body.workers)
-    return counts
+    try:
+        # Suppress stdout to prevent Rich progress bar Unicode errors in web context
+        with contextlib.redirect_stdout(io.StringIO()):
+            counts = do_analyze(workers=body.workers)
+        return counts
+    except Exception as exc:
+        raise HTTPException(500, f"Analyze failed: {str(exc)}")
 
 
 @router.post("/pipeline/propose")
 def trigger_propose():
     from datahoarder.proposals.namer import generate_proposals
+    import io
+    import contextlib
 
-    counts = generate_proposals()
-    return counts
+    try:
+        # Suppress stdout to prevent Rich progress bar Unicode errors in web context
+        with contextlib.redirect_stdout(io.StringIO()):
+            counts = generate_proposals()
+        return counts
+    except Exception as exc:
+        raise HTTPException(500, f"Propose failed: {str(exc)}")
 
 
 # ---------------------------------------------------------------------------
