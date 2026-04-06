@@ -37,7 +37,12 @@ magic = [
     "python-magic-bin>=0.4.14; sys_platform == 'win32'",
     "python-magic>=0.4.27; sys_platform != 'win32'",
 ]
-all = ["datahoarder[docs,video,cloud,magic]"]
+web = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "jinja2>=3.1",
+]
+all = ["datahoarder[docs,video,cloud,magic,web]"]
 
 [project.scripts]
 datahoarder = "datahoarder.cli:app"
