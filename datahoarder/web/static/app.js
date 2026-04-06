@@ -425,9 +425,17 @@ document.addEventListener('alpine:init', () => {
 
         while (true) {
           const { done, value } = await reader.read();
-          if (done) break;
 
-          buffer += decoder.decode(value, { stream: true });
+          if (value) {
+            buffer += decoder.decode(value, { stream: true });
+          }
+
+          if (done) {
+            // Process any remaining buffered data
+            buffer += decoder.decode();
+            break;
+          }
+
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
 
@@ -452,8 +460,33 @@ document.addEventListener('alpine:init', () => {
           }
         }
 
-        Alpine.store('app').toast(`Downloaded ${modelName}`, 'success');
+        // Process any remaining buffered data after stream ends
+        if (buffer) {
+          const lines = buffer.split('\n');
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                if (data.progress !== undefined) {
+                  maxProgress = Math.max(maxProgress, data.progress);
+                  this.pullProgress[modelName] = maxProgress;
+                }
+              } catch (e) {
+                // Ignore JSON parse errors
+              }
+            }
+          }
+        }
+
+        // Verify the model was actually installed
         await this.loadInstalledModels();
+        const isInstalled = this.isInstalled(modelName);
+
+        if (isInstalled) {
+          Alpine.store('app').toast(`Downloaded ${modelName}`, 'success');
+        } else {
+          Alpine.store('app').toast(`Download completed but model not found in Ollama. Check Ollama status.`, 'warning');
+        }
       } catch (e) {
         Alpine.store('app').toast(`Pull failed: ${e.message}`, 'error');
       } finally {
