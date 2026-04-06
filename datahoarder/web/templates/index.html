@@ -578,12 +578,22 @@
         <!-- Model Selection -->
         <div class="mt-2">
           <label class="text-sm mb-1" style="display:block;">Select Model:</label>
-          <select class="input" x-model="selectedModel" @change="saveSettings()">
-            <option value="">-- Choose a model --</option>
-            <template x-for="m in installedModels" :key="m.name">
-              <option :value="m.name" x-text="m.name + (m.vision ? ' (vision)' : '')"></option>
-            </template>
-          </select>
+          <div style="display:grid; grid-template-columns:1fr 100px; gap:8px;">
+            <select class="input" x-model="selectedModel" @change="saveSettings()">
+              <option value="">-- Choose a model --</option>
+              <template x-for="m in installedModels" :key="m.name">
+                <option :value="m.name" x-text="m.name + (m.vision ? ' (vision)' : '')"></option>
+              </template>
+            </select>
+            <button class="btn btn-outline btn-sm" @click="showCustomModel = !showCustomModel">Custom</button>
+          </div>
+          <template x-if="showCustomModel">
+            <div class="mt-2">
+              <input type="text" class="input" x-model="customModel" placeholder="e.g., gemma4:27b"
+                     @keyup.enter="selectCustomModel()" style="margin-bottom:6px;">
+              <button class="btn btn-primary btn-sm" @click="selectCustomModel()">Use Custom Model</button>
+            </div>
+          </template>
         </div>
 
         <!-- Available Models -->
