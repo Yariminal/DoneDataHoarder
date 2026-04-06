@@ -616,8 +616,11 @@
                   </template>
                   <!-- Progress bar when pulling -->
                   <template x-if="pulling === rec.name">
-                    <div style="margin-top:8px; background:var(--surface-2); border-radius:4px; height:6px; overflow:hidden;">
-                      <div style="height:100%; background:var(--primary); animation:pulse-width 2s infinite; border-radius:4px;"></div>
+                    <div style="margin-top:8px;">
+                      <div style="margin-bottom:4px; background:var(--surface-2); border-radius:4px; height:8px; overflow:hidden;">
+                        <div style="height:100%; background:var(--primary); border-radius:4px; transition:width .3s;" :style="'width:' + (pullProgress[rec.name] || 0) + '%'"></div>
+                      </div>
+                      <div class="text-sm text-dim" x-text="(pullProgress[rec.name] || 0) + '%'"></div>
                     </div>
                   </template>
                 </div>

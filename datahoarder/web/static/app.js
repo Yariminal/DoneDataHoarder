@@ -405,14 +405,57 @@ document.addEventListener('alpine:init', () => {
 
     async pullModel(modelName) {
       this.pulling = modelName;
+      this.pullProgress[modelName] = 0;
       try {
-        await api.post('/ollama/pull', { model: modelName });
+        const response = await fetch(`/api/ollama/pull`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: modelName }),
+        });
+
+        if (!response.ok) {
+          throw new Error(`${response.status} ${response.statusText}`);
+        }
+
+        // Handle Server-Sent Events for progress
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                if (data.progress !== undefined) {
+                  this.pullProgress[modelName] = data.progress;
+                }
+                if (data.status === 'error') {
+                  Alpine.store('app').toast(`Pull failed: ${data.message}`, 'error');
+                  this.pulling = null;
+                  return;
+                }
+              } catch (e) {
+                // Ignore JSON parse errors
+              }
+            }
+          }
+        }
+
         Alpine.store('app').toast(`Downloaded ${modelName}`, 'success');
         await this.loadInstalledModels();
       } catch (e) {
         Alpine.store('app').toast(`Pull failed: ${e.message}`, 'error');
       } finally {
         this.pulling = null;
+        delete this.pullProgress[modelName];
       }
     },
 
