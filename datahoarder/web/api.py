@@ -710,13 +710,22 @@ def browse_filesystem(path: Optional[str] = None) -> BrowseResponse:
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 # Recommended models for DataHoarder
+# Latest versions first, includes Gemma 4 (check ollama.com for availability)
 RECOMMENDED_MODELS = [
-    {"name": "gemma3:4b",   "desc": "Gemma 3 4B - Fast, good quality, multimodal (vision)", "size": "3.3 GB", "vision": True},
-    {"name": "gemma3:12b",  "desc": "Gemma 3 12B - Best balance of speed and quality, multimodal", "size": "8.1 GB", "vision": True},
-    {"name": "gemma3:27b",  "desc": "Gemma 3 27B - Highest quality, needs 20GB+ RAM", "size": "17 GB", "vision": True},
+    # Gemma 4 (latest from Google)
+    {"name": "gemma4:27b",  "desc": "Gemma 4 27B - Latest from Google, multimodal (when available on Ollama)", "size": "16 GB", "vision": True, "latest": True},
+    {"name": "gemma4:9b",   "desc": "Gemma 4 9B - Latest, balanced, multimodal (when available on Ollama)", "size": "5.5 GB", "vision": True, "latest": True},
+    # Gemma 2 (stable, proven quality)
+    {"name": "gemma2:27b",  "desc": "Gemma 2 27B - Highest quality, multimodal, needs 20GB+ RAM", "size": "16 GB", "vision": True},
+    {"name": "gemma2:9b",   "desc": "Gemma 2 9B - Best balance of quality and speed", "size": "5.5 GB", "vision": True},
+    # Gemma 3 (solid performers)
+    {"name": "gemma3:12b",  "desc": "Gemma 3 12B - Good quality, multimodal", "size": "8.1 GB", "vision": True},
+    {"name": "gemma3:4b",   "desc": "Gemma 3 4B - Fast and lightweight, multimodal", "size": "3.3 GB", "vision": True},
+    # Vision specialists
+    {"name": "llava:13b",   "desc": "LLaVA 13B - Specialized vision model", "size": "8.0 GB", "vision": True},
     {"name": "llava:7b",    "desc": "LLaVA 7B - Lightweight vision model", "size": "4.7 GB", "vision": True},
-    {"name": "llava:13b",   "desc": "LLaVA 13B - Higher quality vision model", "size": "8.0 GB", "vision": True},
-    {"name": "llama3.2:3b", "desc": "Llama 3.2 3B - Fast text-only model", "size": "2.0 GB", "vision": False},
+    # Lightweight text-only
+    {"name": "llama3.2:3b", "desc": "Llama 3.2 3B - Fast text-only, only 2GB", "size": "2.0 GB", "vision": False},
 ]
 
 

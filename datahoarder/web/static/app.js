@@ -293,6 +293,8 @@ document.addEventListener('alpine:init', () => {
   Alpine.data('setup', () => ({
     selectedFolder: localStorage.getItem('datahoarder_folder') || '',
     selectedModel: localStorage.getItem('datahoarder_model') || 'gemma3:12b',
+    customModel: '',
+    showCustomModel: false,
     showBrowser: false,
     currentPath: '',
     parentPath: null,
@@ -307,12 +309,20 @@ document.addEventListener('alpine:init', () => {
       await this.loadOllamaStatus();
       await this.loadInstalledModels();
       this.recommendedModels = [
-        { name: 'gemma3:4b',   desc: 'Gemma 3 4B - Fast, good quality, multimodal', size: '3.3 GB', vision: true },
-        { name: 'gemma3:12b',  desc: 'Gemma 3 12B - Best balance, multimodal', size: '8.1 GB', vision: true },
-        { name: 'gemma3:27b',  desc: 'Gemma 3 27B - Highest quality, needs 20GB+ RAM', size: '17 GB', vision: true },
-        { name: 'llava:7b',    desc: 'LLaVA 7B - Lightweight vision model', size: '4.7 GB', vision: true },
-        { name: 'llava:13b',   desc: 'LLaVA 13B - Higher quality vision', size: '8.0 GB', vision: true },
-        { name: 'llama3.2:3b', desc: 'Llama 3.2 3B - Fast text-only', size: '2.0 GB', vision: false },
+        // Gemma 4 (latest - check ollama.com for availability)
+        { name: 'gemma4:27b',  desc: 'Gemma 4 27B - Latest from Google, multimodal (when available)', size: '16 GB', vision: true, latest: true },
+        { name: 'gemma4:9b',   desc: 'Gemma 4 9B - Latest, balanced, multimodal (when available)', size: '5.5 GB', vision: true, latest: true },
+        // Gemma 2 (stable, available now)
+        { name: 'gemma2:27b',  desc: 'Gemma 2 27B - Highest quality, multimodal, needs 20GB+ RAM', size: '16 GB', vision: true },
+        { name: 'gemma2:9b',   desc: 'Gemma 2 9B - Best balance of quality/speed', size: '5.5 GB', vision: true },
+        // Gemma 3
+        { name: 'gemma3:12b',  desc: 'Gemma 3 12B - Good quality, multimodal', size: '8.1 GB', vision: true },
+        { name: 'gemma3:4b',   desc: 'Gemma 3 4B - Fast, lightweight, multimodal', size: '3.3 GB', vision: true },
+        // Vision-specific
+        { name: 'llava:13b',   desc: 'LLaVA 13B - Specialized vision model', size: '8.0 GB', vision: true },
+        { name: 'llava:7b',    desc: 'LLaVA 7B - Lightweight vision', size: '4.7 GB', vision: true },
+        // Lightweight text
+        { name: 'llama3.2:3b', desc: 'Llama 3.2 3B - Fast text-only, 2GB', size: '2.0 GB', vision: false },
       ];
     },
 
@@ -344,6 +354,18 @@ document.addEventListener('alpine:init', () => {
       this.showBrowser = false;
       this.saveSettings();
       Alpine.store('app').toast('Folder selected: ' + path, 'success');
+    },
+
+    selectCustomModel() {
+      if (!this.customModel.trim()) {
+        Alpine.store('app').toast('Enter a model name', 'error');
+        return;
+      }
+      this.selectedModel = this.customModel.trim();
+      this.customModel = '';
+      this.showCustomModel = false;
+      this.saveSettings();
+      Alpine.store('app').toast('Custom model selected: ' + this.selectedModel, 'success');
     },
 
     saveSettings() {
