@@ -59,6 +59,7 @@ def _upsert_group(
     group_hash: str,
     file_ids: list[int],
     similarity: float = 1.0,
+    session_id: str | None = None,
 ) -> None:
     """Insert or update a DuplicateGroup and its members."""
     group = (
@@ -67,7 +68,10 @@ def _upsert_group(
         .first()
     )
     if group is None:
-        group = DuplicateGroup(dupe_type=dupe_type, group_hash=group_hash)
+        kwargs = dict(dupe_type=dupe_type, group_hash=group_hash)
+        if session_id:
+            kwargs["session_id"] = session_id
+        group = DuplicateGroup(**kwargs)
         session.add(group)
         session.flush()
 
@@ -90,19 +94,21 @@ def _upsert_group(
 # Stage 1 — Exact duplicates (MD5)
 # ---------------------------------------------------------------------------
 
-def find_exact_duplicates() -> dict:
+def find_exact_duplicates(session_id: str | None = None) -> dict:
     """Group files by MD5 and record exact duplicate groups."""
     engine = get_engine()
     counts = {"groups": 0, "duplicates": 0}
 
     with Session(engine) as session:
         # Only consider enriched+ files with a hash
-        rows = (
+        q = (
             session.query(File.id, File.hash_md5)
             .filter(File.hash_md5.isnot(None))
             .filter(File.status.in_([FileStatus.ENRICHED, FileStatus.ANALYZED, FileStatus.PROPOSED]))
-            .all()
         )
+        if session_id:
+            q = q.filter(File.session_id == session_id)
+        rows = q.all()
 
     # Build hash → [id, ...] map
     hash_map: dict[str, list[int]] = defaultdict(list)
@@ -122,7 +128,7 @@ def find_exact_duplicates() -> dict:
 
         with Session(engine) as session:
             for group_hash, file_ids in dupes.items():
-                _upsert_group(session, DupeType.EXACT, group_hash, file_ids)
+                _upsert_group(session, DupeType.EXACT, group_hash, file_ids, session_id=session_id)
                 counts["groups"] += 1
                 counts["duplicates"] += len(file_ids) - 1
                 progress.advance(task)
@@ -135,7 +141,7 @@ def find_exact_duplicates() -> dict:
 # Stage 2 — Perceptual duplicates (pHash)
 # ---------------------------------------------------------------------------
 
-def find_perceptual_duplicates(threshold: int = PHASH_THRESHOLD) -> dict:
+def find_perceptual_duplicates(threshold: int = PHASH_THRESHOLD, session_id: str | None = None) -> dict:
     """Find near-duplicate images using perceptual hashing."""
     if not _HAS_IMAGEHASH:
         return {"error": "imagehash not installed"}
@@ -144,12 +150,14 @@ def find_perceptual_duplicates(threshold: int = PHASH_THRESHOLD) -> dict:
     counts = {"groups": 0, "duplicates": 0}
 
     with Session(engine) as session:
-        rows = (
+        q = (
             session.query(File.id, File.hash_perceptual)
             .filter(File.hash_perceptual.isnot(None))
             .filter(File.mime_type.like("image/%"))
-            .all()
         )
+        if session_id:
+            q = q.filter(File.session_id == session_id)
+        rows = q.all()
 
     if not rows:
         return counts
@@ -195,6 +203,7 @@ def find_perceptual_duplicates(threshold: int = PHASH_THRESHOLD) -> dict:
                 group_hash,
                 group,
                 similarity=0.95,
+                session_id=session_id,
             )
             counts["groups"] += 1
             counts["duplicates"] += len(group) - 1

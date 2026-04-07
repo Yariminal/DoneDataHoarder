@@ -143,13 +143,14 @@ def _best_date(
 # Main enrichment function
 # ---------------------------------------------------------------------------
 
-def enrich(workers: int = 1, limit: Optional[int] = None) -> dict:
+def enrich(workers: int = 1, limit: Optional[int] = None, session_id: str | None = None) -> dict:
     """
     Enrich all PENDING File records with metadata and hashes.
 
     Args:
         workers: reserved for future async implementation (currently sequential)
         limit:   process at most this many files (useful for testing)
+        session_id: if set, only enrich files belonging to this session
 
     Returns:
         Summary dict with counts.
@@ -159,6 +160,8 @@ def enrich(workers: int = 1, limit: Optional[int] = None) -> dict:
 
     with Session(engine) as session:
         query = session.query(File).filter(File.status == FileStatus.PENDING)
+        if session_id:
+            query = query.filter(File.session_id == session_id)
         if limit:
             query = query.limit(limit)
         total = query.count()
@@ -177,13 +180,10 @@ def enrich(workers: int = 1, limit: Optional[int] = None) -> dict:
         offset = 0
         while True:
             with Session(engine) as session:
-                batch = (
-                    session.query(File)
-                    .filter(File.status == FileStatus.PENDING)
-                    .limit(BATCH_SIZE)
-                    .offset(offset)
-                    .all()
-                )
+                enrich_q = session.query(File).filter(File.status == FileStatus.PENDING)
+                if session_id:
+                    enrich_q = enrich_q.filter(File.session_id == session_id)
+                batch = enrich_q.limit(BATCH_SIZE).offset(offset).all()
                 if not batch:
                     break
 

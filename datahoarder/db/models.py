@@ -1,6 +1,7 @@
 """SQLAlchemy ORM models for DataHoarder state database."""
 import enum
 import json
+import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -13,6 +14,64 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 class Base(DeclarativeBase):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Session — top-level container for an entire DataHoarder run
+# ---------------------------------------------------------------------------
+
+class SessionStatus(str, enum.Enum):
+    NEW       = "new"        # just created, no data yet
+    ACTIVE    = "active"     # scan has run, data exists
+    COMPLETED = "completed"  # user explicitly marked done
+
+
+class UserSession(Base):
+    """A session groups all files, proposals, and duplicates from one run."""
+    __tablename__ = "sessions"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+    last_saved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # Configuration captured at session creation
+    root_path: Mapped[str] = mapped_column(String, nullable=False, default="")
+    backend: Mapped[str] = mapped_column(String, default="ollama")
+    model: Mapped[str] = mapped_column(String, default="llama3.2:3b")
+    workers: Mapped[int] = mapped_column(Integer, default=1)
+
+    status: Mapped[SessionStatus] = mapped_column(
+        Enum(SessionStatus), default=SessionStatus.NEW
+    )
+    is_unsaved: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # JSON blob: {files_count, proposals_count, duplicates_count, completed_steps: []}
+    stats_json: Mapped[Optional[str]] = mapped_column(Text, default="{}")
+
+    # --- relationships ---
+    files: Mapped[list["File"]] = relationship(
+        "File", back_populates="session", cascade="all, delete-orphan"
+    )
+
+    @property
+    def stats(self) -> dict:
+        try:
+            return json.loads(self.stats_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+    @stats.setter
+    def stats(self, value: dict):
+        self.stats_json = json.dumps(value)
+
+    def __repr__(self) -> str:
+        return f"<UserSession id={self.id!r} name={self.name!r} status={self.status}>"
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +118,13 @@ class File(Base):
     __tablename__ = "files"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    # --- session ---
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    session: Mapped["UserSession"] = relationship("UserSession", back_populates="files")
 
     # --- identity ---
     path: Mapped[str] = mapped_column(String, unique=True, nullable=False)
@@ -154,6 +220,10 @@ class DuplicateGroup(Base):
     __tablename__ = "duplicate_groups"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
     dupe_type: Mapped[DupeType] = mapped_column(Enum(DupeType), nullable=False)
     group_hash: Mapped[str] = mapped_column(String, nullable=False, index=True)
     # The file we decided to keep (null = undecided)
@@ -191,6 +261,10 @@ class ScanSession(Base):
     __tablename__ = "scan_sessions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
     root_path: Mapped[str] = mapped_column(String, nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
