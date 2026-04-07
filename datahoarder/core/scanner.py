@@ -63,6 +63,7 @@ def scan(
     root: Path,
     force_rescan: bool = False,
     extra_skip_dirs: set[str] | None = None,
+    session_id: str | None = None,
 ) -> dict:
     """
     Walk *root* and upsert File records into the database.
@@ -72,13 +73,16 @@ def scan(
     engine = get_engine()
 
     with Session(engine) as session:
-        sess_record = ScanSession(
+        sess_kwargs = dict(
             root_path=str(root.resolve()),
             started_at=datetime.utcnow(),
         )
+        if session_id:
+            sess_kwargs["session_id"] = session_id
+        sess_record = ScanSession(**sess_kwargs)
         session.add(sess_record)
         session.commit()
-        session_id = sess_record.id
+        scan_session_id = sess_record.id
 
     counts = {"new": 0, "skipped": 0, "errors": 0}
 
@@ -127,18 +131,19 @@ def scan(
 
                 try:
                     stat = file_path.stat()
-                    batch.append(
-                        dict(
-                            path=path_str,
-                            filename=file_path.name,
-                            extension=file_path.suffix.lower() or None,
-                            size_bytes=stat.st_size,
-                            date_modified=datetime.fromtimestamp(stat.st_mtime),
-                            date_created=datetime.fromtimestamp(stat.st_ctime),
-                            status=FileStatus.PENDING,
-                            scanned_at=datetime.utcnow(),
-                        )
+                    record = dict(
+                        path=path_str,
+                        filename=file_path.name,
+                        extension=file_path.suffix.lower() or None,
+                        size_bytes=stat.st_size,
+                        date_modified=datetime.fromtimestamp(stat.st_mtime),
+                        date_created=datetime.fromtimestamp(stat.st_ctime),
+                        status=FileStatus.PENDING,
+                        scanned_at=datetime.utcnow(),
                     )
+                    if session_id:
+                        record["session_id"] = session_id
+                    batch.append(record)
                 except (PermissionError, OSError) as exc:
                     counts["errors"] += 1
                     continue
@@ -153,7 +158,7 @@ def scan(
             _flush(session)
 
             # Mark session complete
-            sess_record = session.get(ScanSession, session_id)
+            sess_record = session.get(ScanSession, scan_session_id)
             if sess_record:
                 sess_record.finished_at = datetime.utcnow()
                 sess_record.files_new = counts["new"]

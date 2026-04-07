@@ -75,6 +75,8 @@ a:hover { text-decoration: underline; }
   padding: 16px 0;
   position: sticky; top: 56px; height: calc(100vh - 56px);
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
 }
 .sidebar-nav { list-style: none; }
 .sidebar-nav li a,
@@ -109,6 +111,14 @@ a:hover { text-decoration: underline; }
   overflow-y: auto;
   max-width: 1400px;
 }
+.main-content.full-width {
+  grid-column: 1 / -1;
+  max-width: 100%;
+}
+
+/* Session step indicators on home page */
+.step-done { color: var(--success); }
+.step-pending { color: var(--text-dim); }
 .page-title {
   font-size: 1.4rem; font-weight: 700;
   margin-bottom: 20px;

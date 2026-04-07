@@ -8,7 +8,7 @@
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
   <script src="/static/app.js"></script>
 </head>
-<body x-data x-init="$store.app.tab = 'dashboard'">
+<body x-data x-init="$store.app.tab = 'home'">
 
 <!-- ============================================================
      App Shell
@@ -17,25 +17,41 @@
 
   <!-- Header -->
   <header class="app-header">
-    <h1><span>Data</span>Hoarder</h1>
-    <div class="header-right">
-      <span class="db-name">v0.1.0</span>
+    <h1 style="cursor:pointer" @click="goHome()"><span>Data</span>Hoarder</h1>
+    <div class="header-right" style="display:flex; align-items:center; gap:12px;">
+      <!-- Session info when active -->
+      <template x-if="$store.session.active">
+        <div style="display:flex; align-items:center; gap:10px;">
+          <span class="text-sm" style="color:var(--text-dim)">Session:</span>
+          <strong class="text-sm" x-text="$store.session.displayName"></strong>
+          <template x-if="$store.session.is_unsaved">
+            <span style="color:var(--warning); font-weight:bold;" title="Unsaved changes">*</span>
+          </template>
+          <button class="btn btn-outline btn-sm" @click="saveCurrentSession()" style="font-size:0.8rem;">
+            Save
+          </button>
+          <button class="btn btn-ghost btn-sm" @click="goHome()" style="font-size:0.8rem;" title="Back to sessions">
+            &#8962; Home
+          </button>
+        </div>
+      </template>
+      <span class="db-name">v0.2.0</span>
     </div>
   </header>
 
-  <!-- Sidebar -->
-  <nav class="sidebar">
+  <!-- Sidebar — hidden when on home page -->
+  <nav class="sidebar" x-show="$store.session.active" x-cloak>
     <ul class="sidebar-nav">
       <li><button :class="{ active: $store.app.tab === 'dashboard' }" @click="$store.app.tab = 'dashboard'">
         <span class="nav-icon">&#9638;</span> Dashboard
       </button></li>
-      <li><button :class="{ active: $store.app.tab === 'files' }" @click="$store.app.tab = 'files'">
+      <li x-show="$store.session.hasScanned"><button :class="{ active: $store.app.tab === 'files' }" @click="$store.app.tab = 'files'">
         <span class="nav-icon">&#128196;</span> Files
       </button></li>
-      <li><button :class="{ active: $store.app.tab === 'proposals' }" @click="$store.app.tab = 'proposals'">
+      <li x-show="$store.session.hasScanned"><button :class="{ active: $store.app.tab === 'proposals' }" @click="$store.app.tab = 'proposals'">
         <span class="nav-icon">&#9998;</span> Review
       </button></li>
-      <li><button :class="{ active: $store.app.tab === 'duplicates' }" @click="$store.app.tab = 'duplicates'">
+      <li x-show="$store.session.hasScanned"><button :class="{ active: $store.app.tab === 'duplicates' }" @click="$store.app.tab = 'duplicates'">
         <span class="nav-icon">&#128203;</span> Duplicates
       </button></li>
       <div class="sidebar-sep"></div>
@@ -46,10 +62,92 @@
         <span class="nav-icon">&#9881;</span> Pipeline
       </button></li>
     </ul>
+
+    <!-- Session footer in sidebar -->
+    <div style="padding:12px 16px; border-top:1px solid var(--border); margin-top:auto;">
+      <template x-if="$store.session.last_saved_at">
+        <div class="text-dim text-sm" x-text="'Saved: ' + new Date($store.session.last_saved_at).toLocaleString()"></div>
+      </template>
+      <template x-if="$store.session.is_unsaved">
+        <div class="text-sm" style="color:var(--warning); margin-top:4px;">Unsaved changes</div>
+      </template>
+    </div>
   </nav>
 
   <!-- Main content area -->
-  <main class="main-content">
+  <main class="main-content" :class="{ 'full-width': !$store.session.active }">
+
+    <!-- ====================== HOME ========================== -->
+    <section x-show="$store.app.tab === 'home'" x-data="home" x-cloak>
+      <div style="max-width:800px; margin:0 auto; padding:40px 20px;">
+        <div style="text-align:center; margin-bottom:40px;">
+          <h2 style="font-size:2rem; font-weight:700; margin-bottom:8px;">Welcome to DataHoarder</h2>
+          <p class="text-dim" style="font-size:1.1rem;">Organize, analyze, and rename your files with AI</p>
+        </div>
+
+        <!-- Create new session -->
+        <div style="text-align:center; margin-bottom:32px;">
+          <button class="btn btn-primary" @click="createSession()" style="font-size:1.1rem; padding:12px 32px;">
+            + New Session
+          </button>
+        </div>
+
+        <!-- Previous sessions -->
+        <template x-if="sessions.length > 0">
+          <div>
+            <h3 style="font-size:1rem; margin-bottom:12px; color:var(--text-dim);">Previous Sessions</h3>
+            <div style="display:grid; gap:12px;">
+              <template x-for="s in sessions" :key="s.id">
+                <div class="card" style="cursor:pointer; transition:border-color .2s;"
+                     @click="loadSession(s.id)"
+                     @mouseenter="$el.style.borderColor='var(--primary)'"
+                     @mouseleave="$el.style.borderColor='var(--border)'">
+                  <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                    <div style="flex:1; min-width:0;">
+                      <div style="font-weight:600; font-size:1rem;" x-text="s.name || 'Unnamed Session'"></div>
+                      <div class="text-dim text-sm" style="margin-top:4px;">
+                        <span x-text="s.root_path || 'No folder set'"></span>
+                      </div>
+                      <div style="display:flex; gap:16px; margin-top:8px; align-items:center;">
+                        <span class="text-sm">
+                          <strong x-text="s.file_count"></strong> files
+                        </span>
+                        <span class="text-sm text-dim" x-text="'Modified ' + formatDate(s.updated_at)"></span>
+                        <!-- Pipeline progress indicators -->
+                        <div style="display:flex; gap:6px; align-items:center;">
+                          <span class="text-sm" :class="stepClass(s.completed_steps, 'scan')"
+                                x-text="stepIcon(s.completed_steps, 'scan') + ' Scan'"></span>
+                          <span class="text-sm" :class="stepClass(s.completed_steps, 'enrich')"
+                                x-text="stepIcon(s.completed_steps, 'enrich') + ' Enrich'"></span>
+                          <span class="text-sm" :class="stepClass(s.completed_steps, 'analyze')"
+                                x-text="stepIcon(s.completed_steps, 'analyze') + ' Analyze'"></span>
+                          <span class="text-sm" :class="stepClass(s.completed_steps, 'propose')"
+                                x-text="stepIcon(s.completed_steps, 'propose') + ' Propose'"></span>
+                        </div>
+                      </div>
+                    </div>
+                    <div style="flex-shrink:0; display:flex; gap:6px; align-items:center;">
+                      <template x-if="s.is_unsaved">
+                        <span class="badge badge-warning" style="font-size:0.75rem;">Unsaved</span>
+                      </template>
+                      <button class="btn btn-danger btn-sm" @click.stop="deleteSession(s.id, s.name)"
+                              title="Delete session" style="font-size:0.75rem;">Delete</button>
+                    </div>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+        </template>
+
+        <template x-if="sessions.length === 0 && !loading">
+          <div style="text-align:center; color:var(--text-dim); margin-top:40px;">
+            <p style="font-size:1.1rem;">No sessions yet</p>
+            <p class="text-sm" style="margin-top:4px;">Create a new session to get started</p>
+          </div>
+        </template>
+      </div>
+    </section>
 
     <!-- ====================== DASHBOARD ====================== -->
     <section x-show="$store.app.tab === 'dashboard'" x-data="dashboard" x-cloak>

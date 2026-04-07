@@ -44,6 +44,7 @@ def analyze(
     limit: Optional[int] = None,
     min_size_kb: int = 0,
     skip_extensions: Optional[set[str]] = None,
+    session_id: str | None = None,
 ) -> dict:
     """
     Run AI analysis on all ENRICHED files.
@@ -72,6 +73,8 @@ def analyze(
 
     with Session(engine) as session:
         query = session.query(File).filter(File.status == FileStatus.ENRICHED)
+        if session_id:
+            query = query.filter(File.session_id == session_id)
         if min_size_kb:
             query = query.filter(File.size_bytes >= min_size_kb * 1024)
         if limit:
@@ -130,13 +133,10 @@ def analyze(
 
         while True:
             with Session(engine) as session:
-                batch = (
-                    session.query(File.id)
-                    .filter(File.status == FileStatus.ENRICHED)
-                    .limit(QUERY_BATCH)
-                    .offset(offset)
-                    .all()
-                )
+                a_q = session.query(File.id).filter(File.status == FileStatus.ENRICHED)
+                if session_id:
+                    a_q = a_q.filter(File.session_id == session_id)
+                batch = a_q.limit(QUERY_BATCH).offset(offset).all()
             if not batch:
                 break
 
@@ -171,6 +171,7 @@ def analyze_with_progress(
     limit: Optional[int] = None,
     min_size_kb: int = 0,
     skip_extensions: Optional[set[str]] = None,
+    session_id: str | None = None,
 ):
     """
     Same as analyze() but yields progress dicts for SSE streaming.
@@ -195,6 +196,8 @@ def analyze_with_progress(
 
     with Session(engine) as session:
         query = session.query(File).filter(File.status == FileStatus.ENRICHED)
+        if session_id:
+            query = query.filter(File.session_id == session_id)
         if min_size_kb:
             query = query.filter(File.size_bytes >= min_size_kb * 1024)
         if limit:
@@ -248,13 +251,10 @@ def analyze_with_progress(
 
     while True:
         with Session(engine) as session:
-            batch = (
-                session.query(File.id)
-                .filter(File.status == FileStatus.ENRICHED)
-                .limit(QUERY_BATCH)
-                .offset(offset)
-                .all()
-            )
+            awp_q = session.query(File.id).filter(File.status == FileStatus.ENRICHED)
+            if session_id:
+                awp_q = awp_q.filter(File.session_id == session_id)
+            batch = awp_q.limit(QUERY_BATCH).offset(offset).all()
         if not batch:
             break
 
