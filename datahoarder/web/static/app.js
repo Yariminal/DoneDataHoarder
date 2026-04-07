@@ -42,11 +42,78 @@ document.addEventListener('alpine:init', () => {
   };
 
   /* ----------------------------------------------------------
+   * Refresh helper — reloads all data tabs after pipeline ops
+   * -------------------------------------------------------- */
+  window.refreshAllTabs = async function () {
+    // Dispatch a custom event that all components can listen for
+    document.dispatchEvent(new CustomEvent('datahoarder:refresh'));
+  };
+
+  /* ----------------------------------------------------------
+   * Results mixin — shared save/load functionality
+   * -------------------------------------------------------- */
+  const resultsMixin = {
+    currentResult: '',
+    savedResults: [],
+
+    async initResults() {
+      await this.loadResultsList();
+    },
+
+    async loadResultsList() {
+      try {
+        this.savedResults = await api.get('/results/list');
+      } catch (e) {
+        console.error('Failed to load results list:', e);
+      }
+    },
+
+    async saveResults(type) {
+      const name = prompt(`Save ${type} results as:`, `${type}_${new Date().toISOString().slice(0, 10)}`);
+      if (!name) return;
+
+      try {
+        const result = await api.post(`/results/save/${type}?name=${encodeURIComponent(name)}`);
+        Alpine.store('app').toast(`Saved ${result.filename} (${result.message})`, 'success');
+        await this.loadResultsList();
+        this.currentResult = '';
+      } catch (e) {
+        Alpine.store('app').toast(`Failed to save results: ${e.message}`, 'error');
+      }
+    },
+
+    async loadResult() {
+      if (!this.currentResult) return;
+
+      try {
+        const result = await api.get(`/results/load/${encodeURIComponent(this.currentResult)}`);
+        const data = result.data;
+
+        if (data.items) {
+          // Only set properties that exist on this component
+          if (this.files !== undefined) this.files = data.items;
+          if (this.proposals !== undefined) this.proposals = data.items;
+          if (this.groups !== undefined) this.groups = data.items;
+          this.total = data.total;
+          this.page = 1;
+        }
+
+        Alpine.store('app').toast(`Loaded ${this.currentResult}`, 'success');
+      } catch (e) {
+        Alpine.store('app').toast(`Failed to load results: ${e.message}`, 'error');
+      }
+    },
+  };
+
+  /* ----------------------------------------------------------
    * Dashboard component
    * -------------------------------------------------------- */
   Alpine.data('dashboard', () => ({
     stats: null,
-    async init() { await this.load(); },
+    async init() {
+      await this.load();
+      document.addEventListener('datahoarder:refresh', () => this.load());
+    },
     async load() {
       try {
         this.stats = await api.get('/stats');
@@ -77,7 +144,7 @@ document.addEventListener('alpine:init', () => {
   }));
 
   /* ----------------------------------------------------------
-   * Files browser
+   * Files browser (with results mixin)
    * -------------------------------------------------------- */
   Alpine.data('fileBrowser', () => ({
     files: [],
@@ -89,8 +156,13 @@ document.addEventListener('alpine:init', () => {
     mimeFilter: '',
     selectedFile: null,
     showModal: false,
+    ...resultsMixin,
 
-    async init() { await this.load(); },
+    async init() {
+      await this.initResults();
+      await this.load();
+      document.addEventListener('datahoarder:refresh', () => this.load());
+    },
 
     async load() {
       try {
@@ -140,7 +212,7 @@ document.addEventListener('alpine:init', () => {
   }));
 
   /* ----------------------------------------------------------
-   * Proposals review
+   * Proposals review (with results mixin)
    * -------------------------------------------------------- */
   Alpine.data('proposalReview', () => ({
     proposals: [],
@@ -152,8 +224,13 @@ document.addEventListener('alpine:init', () => {
     search: '',
     minConfidence: 0,
     bulkConfidence: 80,
+    ...resultsMixin,
 
-    async init() { await this.load(); },
+    async init() {
+      await this.initResults();
+      await this.load();
+      document.addEventListener('datahoarder:refresh', () => this.load());
+    },
 
     async load() {
       try {
@@ -239,14 +316,19 @@ document.addEventListener('alpine:init', () => {
   }));
 
   /* ----------------------------------------------------------
-   * Duplicates
+   * Duplicates (with results mixin)
    * -------------------------------------------------------- */
   Alpine.data('duplicates', () => ({
     groups: [],
     total: 0,
     page: 1,
+    ...resultsMixin,
 
-    async init() { await this.load(); },
+    async init() {
+      await this.initResults();
+      await this.load();
+      document.addEventListener('datahoarder:refresh', () => this.load());
+    },
 
     async load() {
       try {
@@ -285,14 +367,13 @@ document.addEventListener('alpine:init', () => {
   }));
 
   /* ----------------------------------------------------------
-   * Pipeline runner
-   * -------------------------------------------------------- */
-  /* ----------------------------------------------------------
-   * Setup component
+   * Setup component — folder, model, backend, workers
    * -------------------------------------------------------- */
   Alpine.data('setup', () => ({
     selectedFolder: localStorage.getItem('datahoarder_folder') || '',
     selectedModel: localStorage.getItem('datahoarder_model') || 'gemma3:12b',
+    selectedBackend: localStorage.getItem('datahoarder_backend') || 'ollama',
+    selectedWorkers: parseInt(localStorage.getItem('datahoarder_workers') || '1', 10),
     customModel: '',
     showCustomModel: false,
     showBrowser: false,
@@ -304,33 +385,27 @@ document.addEventListener('alpine:init', () => {
     installedModels: [],
     recommendedModels: [],
     pulling: null,
-    pullProgress: {},  // Track progress per model
+    pullProgress: {},
 
     async init() {
       await this.loadOllamaStatus();
       await this.loadInstalledModels();
-      // Watch for modal open to auto-load drives
       this.$watch('showBrowser', (val) => {
         if (val && !this.currentPath) {
           this.browsePath('');
         }
       });
       this.recommendedModels = [
-        // Gemma 4 (Latest from Google - NOW AVAILABLE on Ollama!)
         { name: 'gemma4:31b',  desc: 'Gemma 4 31B - Highest quality, dense, multimodal, 256K context', size: '20 GB', vision: true, latest: true },
         { name: 'gemma4:26b',  desc: 'Gemma 4 26B - Mixture of Experts, balanced, multimodal, 256K context', size: '18 GB', vision: true, latest: true },
         { name: 'gemma4:e4b',  desc: 'Gemma 4 E4B - Edge variant, multimodal+audio, 128K context', size: '9.6 GB', vision: true, latest: true },
         { name: 'gemma4:e2b',  desc: 'Gemma 4 E2B - Lightweight edge, multimodal+audio, 128K context', size: '7.2 GB', vision: true, latest: true },
-        // Gemma 2 (stable, proven quality)
         { name: 'gemma2:27b',  desc: 'Gemma 2 27B - High quality, multimodal, needs 20GB+ RAM', size: '16 GB', vision: true },
         { name: 'gemma2:9b',   desc: 'Gemma 2 9B - Best balance of quality/speed', size: '5.5 GB', vision: true },
-        // Gemma 3 (solid performers)
         { name: 'gemma3:12b',  desc: 'Gemma 3 12B - Good quality, multimodal', size: '8.1 GB', vision: true },
         { name: 'gemma3:4b',   desc: 'Gemma 3 4B - Fast, lightweight, multimodal', size: '3.3 GB', vision: true },
-        // Vision specialists
         { name: 'llava:13b',   desc: 'LLaVA 13B - Specialized vision model', size: '8.0 GB', vision: true },
         { name: 'llava:7b',    desc: 'LLaVA 7B - Lightweight vision', size: '4.7 GB', vision: true },
-        // Lightweight text
         { name: 'llama3.2:3b', desc: 'Llama 3.2 3B - Fast text-only, 2GB', size: '2.0 GB', vision: false },
       ];
     },
@@ -380,6 +455,8 @@ document.addEventListener('alpine:init', () => {
     saveSettings() {
       localStorage.setItem('datahoarder_folder', this.selectedFolder);
       localStorage.setItem('datahoarder_model', this.selectedModel);
+      localStorage.setItem('datahoarder_backend', this.selectedBackend);
+      localStorage.setItem('datahoarder_workers', String(this.selectedWorkers));
     },
 
     async loadOllamaStatus() {
@@ -400,7 +477,6 @@ document.addEventListener('alpine:init', () => {
     },
 
     isInstalled(modelName) {
-      // Match exact name or name with :latest suffix (Ollama adds :latest by default)
       return this.installedModels.some(m =>
         m.name === modelName ||
         m.name === modelName + ':latest' ||
@@ -411,9 +487,8 @@ document.addEventListener('alpine:init', () => {
     async pullModel(modelName) {
       this.pulling = modelName;
       this.pullProgress[modelName] = 0;
-      let maxProgress = 0;  // Track max progress to prevent backwards movement
+      let maxProgress = 0;
       try {
-        // Fetch with extended timeout for large models (3600 seconds = 1 hour)
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 3600000);
 
@@ -430,7 +505,6 @@ document.addEventListener('alpine:init', () => {
           throw new Error(`${response.status} ${response.statusText}`);
         }
 
-        // Handle Server-Sent Events for progress
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
@@ -443,7 +517,6 @@ document.addEventListener('alpine:init', () => {
           }
 
           if (done) {
-            // Process any remaining buffered data
             buffer += decoder.decode();
             break;
           }
@@ -456,7 +529,6 @@ document.addEventListener('alpine:init', () => {
               try {
                 const data = JSON.parse(line.slice(6));
                 if (data.progress !== undefined) {
-                  // Only allow progress to increase or stay the same, never go backwards
                   maxProgress = Math.max(maxProgress, data.progress);
                   this.pullProgress[modelName] = maxProgress;
                 }
@@ -472,7 +544,6 @@ document.addEventListener('alpine:init', () => {
           }
         }
 
-        // Process any remaining buffered data after stream ends
         if (buffer) {
           const lines = buffer.split('\n');
           for (const line of lines) {
@@ -483,14 +554,11 @@ document.addEventListener('alpine:init', () => {
                   maxProgress = Math.max(maxProgress, data.progress);
                   this.pullProgress[modelName] = maxProgress;
                 }
-              } catch (e) {
-                // Ignore JSON parse errors
-              }
+              } catch (e) {}
             }
           }
         }
 
-        // Verify the model was actually installed (retry a few times with delay)
         let verified = false;
         for (let attempt = 0; attempt < 3; attempt++) {
           await new Promise(r => setTimeout(r, 2000));
@@ -539,149 +607,164 @@ document.addEventListener('alpine:init', () => {
     },
   }));
 
+  /* ----------------------------------------------------------
+   * Pipeline runner — reads settings from localStorage (Setup tab)
+   * -------------------------------------------------------- */
   Alpine.data('pipeline', () => ({
-    rootPath: localStorage.getItem('datahoarder_folder') || '',
-    model: localStorage.getItem('datahoarder_model') || 'gemma3:12b',
-    backend: 'ollama',
-    workers: 1,
     running: null,
     result: null,
+    // Analyze progress tracking
+    analyzeProgress: null,  // { current, total, analyzed, skipped, errors }
 
     async init() {
-      // Reload settings from storage each time user visits this tab
-      this.rootPath = localStorage.getItem('datahoarder_folder') || '';
-      this.model = localStorage.getItem('datahoarder_model') || 'gemma3:12b';
+      // Nothing to init — settings come from localStorage via Setup tab
+    },
+
+    getSettings() {
+      return {
+        rootPath: localStorage.getItem('datahoarder_folder') || '',
+        model: localStorage.getItem('datahoarder_model') || 'gemma3:12b',
+        backend: localStorage.getItem('datahoarder_backend') || 'ollama',
+        workers: parseInt(localStorage.getItem('datahoarder_workers') || '1', 10),
+      };
     },
 
     async runStep(step) {
       this.running = step;
       this.result = null;
+      this.analyzeProgress = null;
       Alpine.store('app').loading = true;
+      const settings = this.getSettings();
       try {
         let data;
         switch (step) {
           case 'scan':
-            if (!this.rootPath) { Alpine.store('app').toast('Select a folder in Setup first', 'error'); this.running = null; break; }
-            data = await api.post('/pipeline/scan', { root_path: this.rootPath });
+            if (!settings.rootPath) {
+              Alpine.store('app').toast('Select a folder in Setup first', 'error');
+              this.running = null;
+              Alpine.store('app').loading = false;
+              return;
+            }
+            data = await api.post('/pipeline/scan', { root_path: settings.rootPath });
+            Alpine.store('app').toast(`Scan complete: ${data.new || 0} new files, ${data.skipped || 0} skipped`, 'success');
             break;
           case 'enrich':
             data = await api.post('/pipeline/enrich');
+            Alpine.store('app').toast(`Enrich complete: ${data.enriched || 0} files enriched`, 'success');
             break;
           case 'dedup':
             data = await api.post('/pipeline/dedup');
+            const exactGroups = data.exact?.new_groups || 0;
+            const percGroups = data.perceptual?.new_groups || 0;
+            Alpine.store('app').toast(`Dedup complete: ${exactGroups} exact + ${percGroups} perceptual groups`, 'success');
             break;
           case 'analyze':
-            data = await api.post('/pipeline/analyze', {
-              backend: this.backend, model: this.model, workers: this.workers,
-            });
+            data = await this.runAnalyzeWithProgress(settings);
+            Alpine.store('app').toast(
+              `Analyze complete: ${data.analyzed || 0} analyzed, ${data.skipped || 0} skipped, ${data.errors || 0} errors`,
+              'success'
+            );
             break;
           case 'propose':
             data = await api.post('/pipeline/propose');
+            Alpine.store('app').toast(`Propose complete: ${data.rename || 0} renames + ${data.tags || 0} tags`, 'success');
             break;
           case 'execute-dry':
             data = await api.post('/execute?dry_run=true');
+            Alpine.store('app').toast('Dry run complete — review results below', 'success');
             break;
           case 'execute-commit':
-            if (!confirm('Apply all approved changes to disk? This cannot be undone.')) break;
+            if (!confirm('Apply all approved changes to disk? This cannot be undone.')) {
+              this.running = null;
+              Alpine.store('app').loading = false;
+              return;
+            }
             data = await api.post('/execute?dry_run=false');
+            Alpine.store('app').toast('Changes applied to disk', 'success');
             break;
         }
         this.result = data;
-        Alpine.store('app').toast(`${step} complete`, 'success');
       } catch (e) {
         Alpine.store('app').toast(`${step} failed: ${e.message}`, 'error');
         this.result = { error: e.message };
       } finally {
         this.running = null;
+        this.analyzeProgress = null;
         Alpine.store('app').loading = false;
-      }
-    },
-  }));
-
-  /* ----------------------------------------------------------
-   * Results management mixin (save/load results)
-   * -------------------------------------------------------- */
-  const resultsMixin = {
-    currentResult: '',
-    savedResults: [],
-
-    async initResults() {
-      await this.loadResultsList();
-    },
-
-    async loadResultsList() {
-      try {
-        this.savedResults = await api.get('/results/list');
-      } catch (e) {
-        console.error('Failed to load results list:', e);
+        // Refresh all data tabs
+        await refreshAllTabs();
       }
     },
 
-    async saveResults(type) {
-      const name = prompt(`Save ${type} results as:`, `${type}_${new Date().toLocaleString().slice(0, 10)}`);
-      if (!name) return;
+    async runAnalyzeWithProgress(settings) {
+      // Use SSE endpoint for real-time progress
+      const response = await fetch('/api/pipeline/analyze-stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          backend: settings.backend,
+          model: settings.model,
+          workers: settings.workers,
+        }),
+      });
 
-      try {
-        const result = await api.post(`/results/save/${type}?name=${encodeURIComponent(name)}`);
-        Alpine.store('app').toast(`Saved ${result.filename}`, 'success');
-        await this.loadResultsList();
-        this.currentResult = '';
-      } catch (e) {
-        Alpine.store('app').toast(`Failed to save results: ${e.message}`, 'error');
+      if (!response.ok) {
+        throw new Error(`${response.status} ${response.statusText}`);
       }
-    },
 
-    async loadResult() {
-      if (!this.currentResult) return;
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let finalResult = null;
 
-      try {
-        const result = await api.get(`/results/load/${encodeURIComponent(this.currentResult)}`);
-        const data = result.data;
+      while (true) {
+        const { done, value } = await reader.read();
 
-        // Load the results into current view
-        if (data.items) {
-          this.files = data.items;
-          this.proposals = data.items;
-          this.groups = data.items;
-          this.total = data.total;
-          this.page = 1;
+        if (value) {
+          buffer += decoder.decode(value, { stream: true });
         }
 
-        Alpine.store('app').toast(`Loaded ${this.currentResult}`, 'success');
-      } catch (e) {
-        Alpine.store('app').toast(`Failed to load results: ${e.message}`, 'error');
+        if (done) {
+          buffer += decoder.decode();
+          // Process remaining buffer
+          const lines = buffer.split('\n');
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                if (data.done) finalResult = data;
+                else this.analyzeProgress = data;
+              } catch (e) {}
+            }
+          }
+          break;
+        }
+
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (data.done) {
+                finalResult = data;
+              } else if (data.error) {
+                throw new Error(data.error);
+              } else {
+                this.analyzeProgress = data;
+              }
+            } catch (e) {
+              if (e.message && !e.message.includes('JSON')) throw e;
+            }
+          }
+        }
       }
-    },
-  };
 
-  // Extend data objects with results mixin
-  const originalFileData = Alpine.data('fileBrowser');
-  Alpine.data('fileBrowser', () => ({
-    ...originalFileData(),
-    ...resultsMixin,
-    async init() {
-      await this.initResults();
-      await this.load();
-    },
-  }));
-
-  const originalProposalData = Alpine.data('proposalReview');
-  Alpine.data('proposalReview', () => ({
-    ...originalProposalData(),
-    ...resultsMixin,
-    async init() {
-      await this.initResults();
-      await this.load();
-    },
-  }));
-
-  const originalDuplicatesData = Alpine.data('duplicates');
-  Alpine.data('duplicates', () => ({
-    ...originalDuplicatesData(),
-    ...resultsMixin,
-    async init() {
-      await this.initResults();
-      await this.load();
+      if (finalResult) {
+        return finalResult;
+      }
+      throw new Error('Analyze stream ended without final result');
     },
   }));
 

@@ -86,25 +86,35 @@ class OllamaClient:
         prompt: str,
         image_path: Path | None = None,
         image_bytes: bytes | None = None,
+        images_list: list[bytes] | None = None,
         model: Optional[str] = None,
         system: Optional[str] = None,
         temperature: float = 0.2,
     ) -> str:
-        """Send a prompt + image, return the response string."""
+        """Send a prompt + one or more images, return the response string."""
         model = model or self.vision_model
 
+        b64_images = []
+
+        # Single image from path or bytes
         if image_path is not None:
             with open(image_path, "rb") as f:
                 image_bytes = f.read()
-        if image_bytes is None:
-            raise ValueError("Either image_path or image_bytes must be provided")
+        if image_bytes is not None:
+            b64_images.append(base64.b64encode(image_bytes).decode())
 
-        b64 = base64.b64encode(image_bytes).decode()
+        # Multiple images
+        if images_list:
+            for img in images_list:
+                b64_images.append(base64.b64encode(img).decode())
+
+        if not b64_images:
+            raise ValueError("At least one image must be provided")
 
         payload: dict = {
             "model": model,
             "prompt": prompt,
-            "images": [b64],
+            "images": b64_images,
             "stream": False,
             "options": {"temperature": temperature},
         }
@@ -124,6 +134,7 @@ class OllamaClient:
         prompt: str,
         image_path: Path | None = None,
         image_bytes: bytes | None = None,
+        images_list: list[bytes] | None = None,
         model: Optional[str] = None,
         system: Optional[str] = None,
     ) -> dict:
@@ -137,10 +148,10 @@ class OllamaClient:
         )
         full_prompt = prompt + json_instruction
 
-        if image_path or image_bytes:
+        if image_path or image_bytes or images_list:
             raw = self.generate_with_image(
                 full_prompt, image_path=image_path, image_bytes=image_bytes,
-                model=model, system=system,
+                images_list=images_list, model=model, system=system,
             )
         else:
             raw = self.generate(full_prompt, model=model, system=system)

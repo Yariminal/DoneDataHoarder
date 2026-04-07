@@ -652,6 +652,34 @@ def trigger_analyze(body: PipelineRequest):
         raise HTTPException(500, f"Analyze failed: {str(exc)}")
 
 
+@router.post("/pipeline/analyze-stream")
+def trigger_analyze_stream(body: PipelineRequest):
+    """Analyze with Server-Sent Events for real-time progress reporting."""
+    from datahoarder.ai.router import init_ai
+    from datahoarder.analyzers.pipeline import analyze_with_progress
+    import io
+    import contextlib
+
+    try:
+        init_ai(
+            backend=body.backend,
+            text_model=body.model,
+            vision_model=body.model,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
+
+    def generate():
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                for progress in analyze_with_progress(workers=body.workers):
+                    yield f"data: {json.dumps(progress)}\n\n"
+        except Exception as exc:
+            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
 @router.post("/pipeline/propose")
 def trigger_propose():
     from datahoarder.proposals.namer import generate_proposals
@@ -659,7 +687,6 @@ def trigger_propose():
     import contextlib
 
     try:
-        # Suppress stdout to prevent Rich progress bar Unicode errors in web context
         with contextlib.redirect_stdout(io.StringIO()):
             counts = generate_proposals()
         return counts
@@ -991,13 +1018,13 @@ def save_results(result_type: str, name: Optional[str] = Query(None)):
 
     # Get current data based on type
     if result_type == "files":
-        response = get_files(page=1, per_page=10000)
+        response = list_files(page=1, per_page=10000)
         data = {"items": response["items"], "total": response["total"]}
     elif result_type == "proposals":
-        response = get_proposals(page=1, per_page=10000, status=None)
+        response = list_proposals(page=1, per_page=10000, status=None)
         data = {"items": response["items"], "total": response["total"]}
     else:  # duplicates
-        response = get_duplicates(page=1, per_page=10000)
+        response = list_duplicates(page=1, per_page=10000)
         data = {"items": response["items"], "total": response["total"]}
 
     filename = manager_save(result_type, data, name)

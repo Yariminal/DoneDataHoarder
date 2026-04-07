@@ -93,9 +93,12 @@ def analyze(
 
             analyzer = _get_analyzer(analyzers, file_rec.mime_type, ext)
             if not analyzer:
-                # No analyzer — mark as skipped with a note
                 file_rec.status = FileStatus.SKIPPED
-                file_rec.ai_description = "No analyzer available for this file type"
+                mime = file_rec.mime_type or ""
+                if mime.startswith("video/") or ext in (".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v"):
+                    file_rec.ai_description = "Skipped: install ffmpeg to analyze video files"
+                else:
+                    file_rec.ai_description = "No analyzer available for this file type"
                 session.commit()
                 return file_id, "skipped", None
 
@@ -161,3 +164,114 @@ def analyze(
             offset += QUERY_BATCH
 
     return counts
+
+
+def analyze_with_progress(
+    workers: int = 2,
+    limit: Optional[int] = None,
+    min_size_kb: int = 0,
+    skip_extensions: Optional[set[str]] = None,
+):
+    """
+    Same as analyze() but yields progress dicts for SSE streaming.
+
+    Yields:
+        {"current": N, "total": M, "analyzed": A, "skipped": S, "errors": E}
+        ...
+        {"done": true, "analyzed": A, "skipped": S, "errors": E}  (final)
+    """
+    from datahoarder.ai.router import get_client
+
+    client = get_client()
+    analyzers_list: list[BaseAnalyzer] = [
+        ImageAnalyzer(client),
+        VideoAnalyzer(client),
+        DocumentAnalyzer(client),
+    ]
+
+    engine = get_engine()
+    counts = {"analyzed": 0, "skipped": 0, "errors": 0}
+    skip_ext = skip_extensions or set()
+
+    with Session(engine) as session:
+        query = session.query(File).filter(File.status == FileStatus.ENRICHED)
+        if min_size_kb:
+            query = query.filter(File.size_bytes >= min_size_kb * 1024)
+        if limit:
+            query = query.limit(limit)
+        total = query.count()
+
+    if total == 0:
+        yield {"done": True, **counts}
+        return
+
+    # Yield initial state
+    yield {"current": 0, "total": total, **counts}
+
+    def process_file_inner(file_id: int) -> tuple[int, str, Optional[str]]:
+        with Session(engine) as session:
+            file_rec = session.get(File, file_id)
+            if not file_rec:
+                return file_id, "error", "File not found in DB"
+
+            ext = file_rec.extension or ""
+            if ext in skip_ext:
+                file_rec.status = FileStatus.SKIPPED
+                session.commit()
+                return file_id, "skipped", None
+
+            analyzer = _get_analyzer(analyzers_list, file_rec.mime_type, ext)
+            if not analyzer:
+                file_rec.status = FileStatus.SKIPPED
+                mime = file_rec.mime_type or ""
+                if mime.startswith("video/") or ext in (".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v"):
+                    file_rec.ai_description = "Skipped: install ffmpeg to analyze video files"
+                else:
+                    file_rec.ai_description = "No analyzer available for this file type"
+                session.commit()
+                return file_id, "skipped", None
+
+            ctx = build_context(file_rec)
+            try:
+                result: AnalysisResult = analyzer.analyze(file_rec, ctx)
+                analyzer.save_result(file_rec, result, model_name=str(type(client).__name__))
+                return file_id, "analyzed", None
+            except Exception as exc:
+                tb = traceback.format_exc()
+                file_rec.status = FileStatus.ERROR
+                file_rec.error_message = f"{exc}\n{tb}"[:1000]
+                session.commit()
+                return file_id, "error", str(exc)
+
+    offset = 0
+    processed = 0
+
+    while True:
+        with Session(engine) as session:
+            batch = (
+                session.query(File.id)
+                .filter(File.status == FileStatus.ENRICHED)
+                .limit(QUERY_BATCH)
+                .offset(offset)
+                .all()
+            )
+        if not batch:
+            break
+
+        file_ids = [row[0] for row in batch]
+
+        with ThreadPoolExecutor(max_workers=max(workers, 1)) as pool:
+            futures = {pool.submit(process_file_inner, fid): fid for fid in file_ids}
+            for future in as_completed(futures):
+                fid, status, error = future.result()
+                counts[status if status in counts else "errors"] += 1
+                processed += 1
+                yield {"current": processed, "total": total, **counts}
+                if limit and processed >= limit:
+                    break
+
+        if limit and processed >= limit:
+            break
+        offset += QUERY_BATCH
+
+    yield {"done": True, **counts}

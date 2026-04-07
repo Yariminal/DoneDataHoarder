@@ -39,7 +39,9 @@ AUDIO_EXTENSIONS = {
     ".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".wma", ".opus",
 }
 
-FRAME_COUNT = 4           # number of evenly-spaced frames to sample
+# Sample frames at these percentages of the video duration.
+# Chosen to capture beginning context, two mid-points, and near-end.
+FRAME_POSITIONS = [0.02, 0.45, 0.78, 0.94]
 MAX_SIDE = 768            # resize frames before sending to vision model
 WHISPER_MODEL = "base"    # base / small / medium / large
 TRANSCRIPT_MAX_CHARS = 1500
@@ -157,11 +159,14 @@ class VideoAnalyzer(BaseAnalyzer):
 
     def can_handle(self, mime_type: str, extension: str) -> bool:
         ext = extension.lower()
-        if ext in VIDEO_EXTENSIONS or ext in AUDIO_EXTENSIONS:
-            return True
-        if mime_type and (mime_type.startswith("video/") or mime_type.startswith("audio/")):
-            return True
-        return False
+        is_video = ext in VIDEO_EXTENSIONS or (mime_type and mime_type.startswith("video/"))
+        is_audio = ext in AUDIO_EXTENSIONS or (mime_type and mime_type.startswith("audio/"))
+
+        # Videos require ffmpeg for frame extraction — skip if unavailable
+        if is_video and not _HAS_FFMPEG:
+            return False
+
+        return is_video or is_audio
 
     def analyze(self, file_rec: File, context: str) -> AnalysisResult:
         path = Path(file_rec.path)
@@ -197,32 +202,31 @@ class VideoAnalyzer(BaseAnalyzer):
                 result.tags.insert(0, audio_type)
             return result
 
-        # --- Video: extract frames ---
+        # --- Video: extract frames at 2%, 45%, 78%, 94% of duration ---
         duration = _get_duration_seconds(path)
         frames: list[bytes] = []
         if duration and duration > 0 and _HAS_FFMPEG:
-            # Sample evenly: skip first and last 5%
-            start = duration * 0.05
-            end = duration * 0.95
-            span = end - start
-            for i in range(FRAME_COUNT):
-                ts = start + (span * i / max(FRAME_COUNT - 1, 1))
+            for pct in FRAME_POSITIONS:
+                ts = duration * pct
                 frame = _extract_frame(path, ts)
                 if frame:
                     frames.append(frame)
 
+        pct_labels = ", ".join(f"{int(p*100)}%" for p in FRAME_POSITIONS[:len(frames)])
         prompt = VIDEO_PROMPT.format(
             context=context,
             transcript_section=transcript_section,
             frame_count=len(frames),
         )
+        if frames:
+            prompt += f"\nFrames sampled at: {pct_labels} of the video duration."
 
         try:
             if frames:
-                # Send first frame as the image; describe all frames in prompt
+                # Send all sampled frames to the vision model
                 data = self._client.generate_json(
                     prompt,
-                    image_bytes=frames[0],
+                    images_list=frames,
                     system=SYSTEM_PROMPT,
                 )
             else:

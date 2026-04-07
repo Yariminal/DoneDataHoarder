@@ -50,18 +50,27 @@ class GeminiClient:
         prompt: str,
         image_path: Path | None = None,
         image_bytes: bytes | None = None,
+        images_list: list[bytes] | None = None,
         mime_type: str = "image/jpeg",
         temperature: float = 0.2,
     ) -> str:
+        parts = [prompt]
+
         if image_path is not None:
             with open(image_path, "rb") as f:
                 image_bytes = f.read()
-        if image_bytes is None:
-            raise ValueError("Either image_path or image_bytes must be provided")
+        if image_bytes is not None:
+            parts.append({"mime_type": mime_type, "data": image_bytes})
 
-        part = {"mime_type": mime_type, "data": image_bytes}
+        if images_list:
+            for img in images_list:
+                parts.append({"mime_type": mime_type, "data": img})
+
+        if len(parts) < 2:
+            raise ValueError("At least one image must be provided")
+
         cfg = genai.types.GenerationConfig(temperature=temperature)
-        resp = self._model.generate_content([prompt, part], generation_config=cfg)
+        resp = self._model.generate_content(parts, generation_config=cfg)
         return resp.text.strip()
 
     def generate_json(
@@ -69,6 +78,7 @@ class GeminiClient:
         prompt: str,
         image_path: Path | None = None,
         image_bytes: bytes | None = None,
+        images_list: list[bytes] | None = None,
         mime_type: str = "image/jpeg",
     ) -> dict:
         json_instruction = (
@@ -77,10 +87,11 @@ class GeminiClient:
         )
         full_prompt = prompt + json_instruction
 
-        if image_path or image_bytes:
+        if image_path or image_bytes or images_list:
             raw = self.generate_with_image(
                 full_prompt, image_path=image_path,
-                image_bytes=image_bytes, mime_type=mime_type,
+                image_bytes=image_bytes, images_list=images_list,
+                mime_type=mime_type,
             )
         else:
             raw = self.generate(full_prompt)
