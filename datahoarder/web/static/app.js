@@ -8,7 +8,7 @@ document.addEventListener('alpine:init', () => {
    * Global store
    * -------------------------------------------------------- */
   Alpine.store('app', {
-    tab: 'dashboard',
+    tab: 'home',
     toasts: [],
     loading: false,
 
@@ -18,6 +18,70 @@ document.addEventListener('alpine:init', () => {
     },
     dismissToast(id) {
       this.toasts = this.toasts.filter(t => t.id !== id);
+    },
+  });
+
+  /* ----------------------------------------------------------
+   * Session store — tracks the current active session
+   * -------------------------------------------------------- */
+  Alpine.store('session', {
+    current_session_id: null,
+    name: null,
+    is_unsaved: false,
+    created_at: null,
+    updated_at: null,
+    last_saved_at: null,
+    root_path: '',
+    backend: 'ollama',
+    model: 'gemma3:12b',
+    workers: 1,
+    stats: {},
+    file_count: 0,
+    proposal_count: 0,
+    duplicate_count: 0,
+
+    get active() {
+      return !!this.current_session_id;
+    },
+
+    get displayName() {
+      return this.name || 'Unnamed Session';
+    },
+
+    get hasScanned() {
+      const steps = this.stats?.completed_steps || [];
+      return steps.includes('scan');
+    },
+
+    clear() {
+      this.current_session_id = null;
+      this.name = null;
+      this.is_unsaved = false;
+      this.created_at = null;
+      this.updated_at = null;
+      this.last_saved_at = null;
+      this.root_path = '';
+      this.stats = {};
+      this.file_count = 0;
+      this.proposal_count = 0;
+      this.duplicate_count = 0;
+    },
+
+    loadFrom(data) {
+      this.current_session_id = data.id;
+      this.name = data.name;
+      this.is_unsaved = data.is_unsaved || false;
+      this.created_at = data.created_at;
+      this.updated_at = data.updated_at;
+      this.last_saved_at = data.last_saved_at;
+      this.root_path = data.root_path || '';
+      this.backend = data.backend || 'ollama';
+      this.model = data.model || 'gemma3:12b';
+      this.workers = data.workers || 1;
+      this.stats = data.stats || {};
+      this.file_count = data.file_count || 0;
+      this.proposal_count = data.proposal_count || 0;
+      this.duplicate_count = data.duplicate_count || 0;
     },
   });
 
@@ -39,6 +103,20 @@ document.addEventListener('alpine:init', () => {
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       return res.json();
     },
+    async patch(url, body = {}) {
+      const res = await fetch(`/api${url}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return res.json();
+    },
+    async del(url) {
+      const res = await fetch(`/api${url}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return res.json();
+    },
   };
 
   /* ----------------------------------------------------------
@@ -48,6 +126,144 @@ document.addEventListener('alpine:init', () => {
     // Dispatch a custom event that all components can listen for
     document.dispatchEvent(new CustomEvent('datahoarder:refresh'));
   };
+
+  window.saveCurrentSession = async function () {
+    const session = Alpine.store('session');
+    if (!session.active) return;
+
+    let name = session.name;
+    if (!name) {
+      name = prompt('Enter a name for this session:', `Session ${new Date().toLocaleDateString()}`);
+      if (!name) return;
+    }
+
+    try {
+      const data = await api.post(`/sessions/${session.current_session_id}/save`, { name });
+      session.name = data.name;
+      session.is_unsaved = false;
+      session.last_saved_at = data.last_saved_at;
+      Alpine.store('app').toast(`Session saved: ${data.name}`, 'success');
+    } catch (e) {
+      Alpine.store('app').toast('Failed to save session: ' + e.message, 'error');
+    }
+  };
+
+  window.goHome = function () {
+    const session = Alpine.store('session');
+    if (session.active && session.is_unsaved) {
+      if (!confirm('You have unsaved changes. Leave without saving?')) return;
+    }
+    session.clear();
+    Alpine.store('app').tab = 'home';
+  };
+
+  /* ----------------------------------------------------------
+   * Home component — session list, create/load/delete sessions
+   * -------------------------------------------------------- */
+  Alpine.data('home', () => ({
+    sessions: [],
+    loading: false,
+
+    async init() {
+      await this.loadSessions();
+    },
+
+    async loadSessions() {
+      this.loading = true;
+      try {
+        const data = await api.get('/sessions');
+        this.sessions = data.items || [];
+      } catch (e) {
+        Alpine.store('app').toast('Failed to load sessions: ' + e.message, 'error');
+      } finally {
+        this.loading = false;
+      }
+    },
+
+    async createSession() {
+      try {
+        const data = await api.post('/sessions', {
+          root_path: '',
+          backend: localStorage.getItem('datahoarder_backend') || 'ollama',
+          model: localStorage.getItem('datahoarder_model') || 'gemma3:12b',
+          workers: parseInt(localStorage.getItem('datahoarder_workers') || '1', 10),
+        });
+        Alpine.store('session').loadFrom(data);
+        Alpine.store('app').tab = 'setup';
+        Alpine.store('app').toast('New session created. Configure your settings and run the pipeline.', 'success');
+      } catch (e) {
+        Alpine.store('app').toast('Failed to create session: ' + e.message, 'error');
+      }
+    },
+
+    async loadSession(sessionId) {
+      try {
+        const data = await api.get(`/sessions/${sessionId}`);
+        Alpine.store('session').loadFrom(data);
+        // Restore settings to localStorage for compatibility
+        if (data.root_path) localStorage.setItem('datahoarder_folder', data.root_path);
+        if (data.model) localStorage.setItem('datahoarder_model', data.model);
+        if (data.backend) localStorage.setItem('datahoarder_backend', data.backend);
+        if (data.workers) localStorage.setItem('datahoarder_workers', String(data.workers));
+        Alpine.store('app').tab = 'dashboard';
+        Alpine.store('app').toast(`Loaded session: ${data.name || 'Unnamed Session'}`, 'success');
+        // Refresh all data tabs
+        await refreshAllTabs();
+      } catch (e) {
+        Alpine.store('app').toast('Failed to load session: ' + e.message, 'error');
+      }
+    },
+
+    async deleteSession(sessionId, sessionName) {
+      const name = sessionName || 'Unnamed Session';
+      if (!confirm(`Permanently delete "${name}"? This cannot be undone.`)) return;
+      try {
+        await api.del(`/sessions/${sessionId}`);
+        this.sessions = this.sessions.filter(s => s.id !== sessionId);
+        // If we deleted the active session, clear it
+        if (Alpine.store('session').current_session_id === sessionId) {
+          Alpine.store('session').clear();
+        }
+        Alpine.store('app').toast(`Deleted session: ${name}`, 'success');
+      } catch (e) {
+        Alpine.store('app').toast('Failed to delete session: ' + e.message, 'error');
+      }
+    },
+
+    formatDate(isoStr) {
+      if (!isoStr) return '-';
+      const d = new Date(isoStr);
+      const now = new Date();
+      const diffMs = now - d;
+      const mins = Math.floor(diffMs / 60000);
+      if (mins < 1) return 'just now';
+      if (mins < 60) return `${mins} min ago`;
+      const hours = Math.floor(mins / 60);
+      if (hours < 24) return `${hours}h ago`;
+      const days = Math.floor(hours / 24);
+      if (days < 7) return `${days}d ago`;
+      return d.toLocaleDateString();
+    },
+
+    stepIcon(steps, step) {
+      return (steps || []).includes(step) ? '✓' : '○';
+    },
+
+    stepClass(steps, step) {
+      return (steps || []).includes(step) ? 'step-done' : 'step-pending';
+    },
+  }));
+
+  /* ----------------------------------------------------------
+   * Unsaved changes warning
+   * -------------------------------------------------------- */
+  window.addEventListener('beforeunload', (e) => {
+    const session = Alpine.store('session');
+    if (session && session.active && session.is_unsaved) {
+      e.preventDefault();
+      e.returnValue = 'You have unsaved changes. Are you sure you want to leave?';
+    }
+  });
 
   /* ----------------------------------------------------------
    * Results mixin — shared save/load functionality
@@ -457,6 +673,14 @@ document.addEventListener('alpine:init', () => {
       localStorage.setItem('datahoarder_model', this.selectedModel);
       localStorage.setItem('datahoarder_backend', this.selectedBackend);
       localStorage.setItem('datahoarder_workers', String(this.selectedWorkers));
+      // Sync to session store
+      const session = Alpine.store('session');
+      if (session.active) {
+        session.root_path = this.selectedFolder;
+        session.model = this.selectedModel;
+        session.backend = this.selectedBackend;
+        session.workers = this.selectedWorkers;
+      }
     },
 
     async loadOllamaStatus() {
@@ -626,6 +850,7 @@ document.addEventListener('alpine:init', () => {
         model: localStorage.getItem('datahoarder_model') || 'gemma3:12b',
         backend: localStorage.getItem('datahoarder_backend') || 'ollama',
         workers: parseInt(localStorage.getItem('datahoarder_workers') || '1', 10),
+        session_id: Alpine.store('session').current_session_id || '',
       };
     },
 
@@ -645,17 +870,17 @@ document.addEventListener('alpine:init', () => {
               Alpine.store('app').loading = false;
               return;
             }
-            data = await api.post('/pipeline/scan', { root_path: settings.rootPath });
+            data = await api.post('/pipeline/scan', { root_path: settings.rootPath, session_id: settings.session_id });
             Alpine.store('app').toast(`Scan complete: ${data.new || 0} new files, ${data.skipped || 0} skipped`, 'success');
             break;
           case 'enrich':
-            data = await api.post('/pipeline/enrich');
+            data = await api.post('/pipeline/enrich', { session_id: settings.session_id });
             Alpine.store('app').toast(`Enrich complete: ${data.enriched || 0} files enriched`, 'success');
             break;
           case 'dedup':
-            data = await api.post('/pipeline/dedup');
-            const exactGroups = data.exact?.new_groups || 0;
-            const percGroups = data.perceptual?.new_groups || 0;
+            data = await api.post('/pipeline/dedup', { session_id: settings.session_id });
+            const exactGroups = data.exact?.groups || 0;
+            const percGroups = data.perceptual?.groups || 0;
             Alpine.store('app').toast(`Dedup complete: ${exactGroups} exact + ${percGroups} perceptual groups`, 'success');
             break;
           case 'analyze':
@@ -666,7 +891,7 @@ document.addEventListener('alpine:init', () => {
             );
             break;
           case 'propose':
-            data = await api.post('/pipeline/propose');
+            data = await api.post('/pipeline/propose', { session_id: settings.session_id });
             Alpine.store('app').toast(`Propose complete: ${data.rename || 0} renames + ${data.tags || 0} tags`, 'success');
             break;
           case 'execute-dry':
@@ -691,6 +916,14 @@ document.addEventListener('alpine:init', () => {
         this.running = null;
         this.analyzeProgress = null;
         Alpine.store('app').loading = false;
+        // Refresh session state (marks unsaved, updates stats)
+        const sid = Alpine.store('session').current_session_id;
+        if (sid) {
+          try {
+            const sessData = await api.get(`/sessions/${sid}`);
+            Alpine.store('session').loadFrom(sessData);
+          } catch (e) { /* ignore */ }
+        }
         // Refresh all data tabs
         await refreshAllTabs();
       }
@@ -705,6 +938,7 @@ document.addEventListener('alpine:init', () => {
           backend: settings.backend,
           model: settings.model,
           workers: settings.workers,
+          session_id: settings.session_id || '',
         }),
       });
 

@@ -197,6 +197,7 @@ def execute(
     min_confidence: float = 0.7,
     proposal_ids: Optional[list[int]] = None,
     proposal_types: Optional[list[ProposalType]] = None,
+    session_id: str | None = None,
 ) -> dict:
     """
     Apply approved (or all pending) proposals.
@@ -220,6 +221,8 @@ def execute(
         query = session.query(Proposal).filter(
             Proposal.status.in_([ProposalStatus.PENDING, ProposalStatus.APPROVED])
         )
+        if session_id:
+            query = query.join(File).filter(File.session_id == session_id)
         if proposal_ids:
             query = query.filter(Proposal.id.in_(proposal_ids))
         if proposal_types:
