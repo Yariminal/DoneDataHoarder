@@ -148,6 +148,18 @@
           <option value="text/">Text</option>
         </select>
         <div class="spacer"></div>
+
+        <!-- Results management -->
+        <div style="display:flex; gap:6px; align-items:center;">
+          <select class="input" x-model="currentResult" @change="loadResult()" style="font-size:0.85rem;">
+            <option value="">Load results...</option>
+            <template x-for="r in savedResults" :key="r.filename">
+              <option :value="r.filename" x-text="r.filename + ' (' + new Date(r.saved_at).toLocaleString() + ')'"></option>
+            </template>
+          </select>
+          <button class="btn btn-outline btn-sm" @click="saveResults('files')" title="Save current results">Save</button>
+        </div>
+
         <span class="text-dim text-sm" x-text="total.toLocaleString() + ' files'"></span>
       </div>
 
@@ -268,6 +280,16 @@
           <option value="add_tags">Tags</option>
           <option value="mark_duplicate">Duplicates</option>
         </select>
+
+        <!-- Results management -->
+        <select class="input" x-model="currentResult" @change="loadResult()" style="font-size:0.85rem;">
+          <option value="">Load results...</option>
+          <template x-for="r in savedResults" :key="r.filename">
+            <option :value="r.filename" x-text="r.filename + ' (' + new Date(r.saved_at).toLocaleString() + ')'"></option>
+          </template>
+        </select>
+        <button class="btn btn-outline btn-sm" @click="saveResults('proposals')" title="Save current results">Save</button>
+
         <div class="spacer"></div>
 
         <!-- Bulk approve -->
@@ -348,6 +370,18 @@
     <!-- ====================== DUPLICATES ===================== -->
     <section x-show="$store.app.tab === 'duplicates'" x-data="duplicates" x-cloak>
       <div class="page-title">&#128203; Duplicate Groups</div>
+
+      <!-- Toolbar -->
+      <div class="toolbar" style="margin-bottom:12px;">
+        <div class="spacer"></div>
+        <select class="input" x-model="currentResult" @change="loadResult()" style="font-size:0.85rem;">
+          <option value="">Load results...</option>
+          <template x-for="r in savedResults" :key="r.filename">
+            <option :value="r.filename" x-text="r.filename + ' (' + new Date(r.saved_at).toLocaleString() + ')'"></option>
+          </template>
+        </select>
+        <button class="btn btn-outline btn-sm" @click="saveResults('duplicates')" title="Save current results">Save</button>
+      </div>
 
       <p class="text-dim mb-2" x-text="total + ' duplicate groups found'"></p>
 

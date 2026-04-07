@@ -598,4 +598,91 @@ document.addEventListener('alpine:init', () => {
     },
   }));
 
+  /* ----------------------------------------------------------
+   * Results management mixin (save/load results)
+   * -------------------------------------------------------- */
+  const resultsMixin = {
+    currentResult: '',
+    savedResults: [],
+
+    async initResults() {
+      await this.loadResultsList();
+    },
+
+    async loadResultsList() {
+      try {
+        this.savedResults = await api.get('/results/list');
+      } catch (e) {
+        console.error('Failed to load results list:', e);
+      }
+    },
+
+    async saveResults(type) {
+      const name = prompt(`Save ${type} results as:`, `${type}_${new Date().toLocaleString().slice(0, 10)}`);
+      if (!name) return;
+
+      try {
+        const result = await api.post(`/results/save/${type}?name=${encodeURIComponent(name)}`);
+        Alpine.store('app').toast(`Saved ${result.filename}`, 'success');
+        await this.loadResultsList();
+        this.currentResult = '';
+      } catch (e) {
+        Alpine.store('app').toast(`Failed to save results: ${e.message}`, 'error');
+      }
+    },
+
+    async loadResult() {
+      if (!this.currentResult) return;
+
+      try {
+        const result = await api.get(`/results/load/${encodeURIComponent(this.currentResult)}`);
+        const data = result.data;
+
+        // Load the results into current view
+        if (data.items) {
+          this.files = data.items;
+          this.proposals = data.items;
+          this.groups = data.items;
+          this.total = data.total;
+          this.page = 1;
+        }
+
+        Alpine.store('app').toast(`Loaded ${this.currentResult}`, 'success');
+      } catch (e) {
+        Alpine.store('app').toast(`Failed to load results: ${e.message}`, 'error');
+      }
+    },
+  };
+
+  // Extend data objects with results mixin
+  const originalFileData = Alpine.data('fileBrowser');
+  Alpine.data('fileBrowser', () => ({
+    ...originalFileData(),
+    ...resultsMixin,
+    async init() {
+      await this.initResults();
+      await this.load();
+    },
+  }));
+
+  const originalProposalData = Alpine.data('proposalReview');
+  Alpine.data('proposalReview', () => ({
+    ...originalProposalData(),
+    ...resultsMixin,
+    async init() {
+      await this.initResults();
+      await this.load();
+    },
+  }));
+
+  const originalDuplicatesData = Alpine.data('duplicates');
+  Alpine.data('duplicates', () => ({
+    ...originalDuplicatesData(),
+    ...resultsMixin,
+    async init() {
+      await this.initResults();
+      await this.load();
+    },
+  }));
+
 });
