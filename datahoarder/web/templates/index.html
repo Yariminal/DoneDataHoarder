@@ -429,22 +429,14 @@
     <section x-show="$store.app.tab === 'pipeline'" x-data="pipeline" x-cloak>
       <div class="page-title">&#9881; Pipeline</div>
 
-      <!-- Config -->
+      <!-- Current settings summary -->
       <div class="card mb-2" style="max-width:600px">
-        <div class="card-label">Configuration</div>
-        <div class="mt-1" style="display:grid; grid-template-columns:120px 1fr; gap:8px 12px; align-items:center;">
-          <label class="text-sm">Root path</label>
-          <input type="text" class="input" x-model="rootPath" placeholder="D:\YourHDD">
-          <label class="text-sm">AI Backend</label>
-          <select class="input" x-model="backend">
-            <option value="ollama">Ollama (local)</option>
-            <option value="gemini">Gemini (cloud)</option>
-            <option value="auto">Auto</option>
-          </select>
-          <label class="text-sm">Model</label>
-          <input type="text" class="input" x-model="model" placeholder="gemma3:12b">
-          <label class="text-sm">Workers</label>
-          <input type="number" class="input" x-model.number="workers" min="1" max="8" style="width:80px">
+        <div class="card-label">Active Settings <span class="text-dim text-sm">(change in Setup tab)</span></div>
+        <div class="mt-1 text-sm" style="display:grid; grid-template-columns:100px 1fr; gap:4px 12px;">
+          <strong>Folder:</strong> <span class="text-mono" x-text="getSettings().rootPath || '(not set)'"></span>
+          <strong>Model:</strong> <span class="text-mono" x-text="getSettings().model"></span>
+          <strong>Backend:</strong> <span x-text="getSettings().backend"></span>
+          <strong>Workers:</strong> <span x-text="getSettings().workers"></span>
         </div>
       </div>
 
@@ -454,10 +446,10 @@
           <div class="step-num" :class="{ active: running === 'scan' }">1</div>
           <div class="step-info">
             <div class="step-name">Scan</div>
-            <div class="step-desc">Walk filesystem and index all files</div>
+            <div class="step-desc">Recursively walk filesystem and index all files and folders</div>
           </div>
           <button class="btn btn-primary btn-sm" :disabled="running" @click="runStep('scan')">
-            <span x-text="running === 'scan' ? 'Running...' : 'Run'"></span>
+            <span x-text="running === 'scan' ? 'Scanning...' : 'Run'"></span>
           </button>
         </div>
         <div class="pipeline-step">
@@ -467,7 +459,7 @@
             <div class="step-desc">Extract metadata, hashes, EXIF dates</div>
           </div>
           <button class="btn btn-primary btn-sm" :disabled="running" @click="runStep('enrich')">
-            <span x-text="running === 'enrich' ? 'Running...' : 'Run'"></span>
+            <span x-text="running === 'enrich' ? 'Enriching...' : 'Run'"></span>
           </button>
         </div>
         <div class="pipeline-step">
@@ -477,7 +469,7 @@
             <div class="step-desc">Find exact and near-duplicate files</div>
           </div>
           <button class="btn btn-primary btn-sm" :disabled="running" @click="runStep('dedup')">
-            <span x-text="running === 'dedup' ? 'Running...' : 'Run'"></span>
+            <span x-text="running === 'dedup' ? 'Deduplicating...' : 'Run'"></span>
           </button>
         </div>
         <div class="pipeline-step">
@@ -485,9 +477,22 @@
           <div class="step-info">
             <div class="step-name">Analyze</div>
             <div class="step-desc">AI analysis (vision + text) of all files</div>
+            <!-- Live progress counter -->
+            <template x-if="analyzeProgress">
+              <div class="mt-1">
+                <div class="text-sm" style="color:var(--primary); font-weight:600;"
+                     x-text="'Analyzing: ' + analyzeProgress.current + ' / ' + analyzeProgress.total + ' files'"></div>
+                <div style="margin-top:4px; background:var(--surface-2); border-radius:4px; height:6px; overflow:hidden;">
+                  <div style="height:100%; background:var(--primary); border-radius:4px; transition:width .3s;"
+                       :style="'width:' + (analyzeProgress.total ? (analyzeProgress.current / analyzeProgress.total * 100) : 0) + '%'"></div>
+                </div>
+                <div class="text-dim text-sm mt-1"
+                     x-text="'Done: ' + (analyzeProgress.analyzed || 0) + ' | Skipped: ' + (analyzeProgress.skipped || 0) + ' | Errors: ' + (analyzeProgress.errors || 0)"></div>
+              </div>
+            </template>
           </div>
           <button class="btn btn-primary btn-sm" :disabled="running" @click="runStep('analyze')">
-            <span x-text="running === 'analyze' ? 'Running...' : 'Run'"></span>
+            <span x-text="running === 'analyze' ? 'Analyzing...' : 'Run'"></span>
           </button>
         </div>
         <div class="pipeline-step">
@@ -497,7 +502,7 @@
             <div class="step-desc">Generate rename/tag proposals</div>
           </div>
           <button class="btn btn-primary btn-sm" :disabled="running" @click="runStep('propose')">
-            <span x-text="running === 'propose' ? 'Running...' : 'Run'"></span>
+            <span x-text="running === 'propose' ? 'Proposing...' : 'Run'"></span>
           </button>
         </div>
 
@@ -578,6 +583,23 @@
           </div>
         </div>
       </template>
+
+      <!-- Pipeline Settings -->
+      <div class="card mb-2">
+        <div class="card-label">Pipeline Settings</div>
+        <div class="mt-1" style="display:grid; grid-template-columns:120px 1fr; gap:8px 12px; align-items:center; max-width:400px;">
+          <label class="text-sm">AI Backend</label>
+          <select class="input" x-model="selectedBackend" @change="saveSettings()">
+            <option value="ollama">Ollama (local)</option>
+            <option value="gemini">Gemini (cloud)</option>
+            <option value="auto">Auto</option>
+          </select>
+          <label class="text-sm">Workers</label>
+          <input type="number" class="input" x-model.number="selectedWorkers" @change="saveSettings()" min="1" max="8" style="width:80px">
+          <div></div>
+          <p class="text-dim text-sm">Parallel threads for AI analysis (1-8). Higher = faster but uses more RAM.</p>
+        </div>
+      </div>
 
       <!-- Ollama Management -->
       <div class="card">
