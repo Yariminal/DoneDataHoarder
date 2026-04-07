@@ -13,6 +13,7 @@ Naming conventions:
                    <description>.<ext>  (if no date)
   Other:           <description>.<ext>
 """
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -65,24 +66,40 @@ def _month_prefix(dt: Optional[datetime]) -> str:
 def build_new_name(file_rec: File) -> Optional[str]:
     """
     Construct a proposed new filename (with extension) for a file.
+    Prefers AI tags over description for more specific, meaningful names.
     Returns None if we can't improve on the original name.
     """
     path = Path(file_rec.path)
     ext = path.suffix.lower()
     desc = file_rec.ai_description or ""
-    suggested = (file_rec.ai_tags or "")  # fallback
+    tags_str = file_rec.ai_tags or ""
 
-    # Prefer the AI-suggested name if it was stored in proposals (we re-derive it here)
-    # We'll use ai_description as the human-readable description to build from
-    if not desc and not suggested:
+    if not desc and not tags_str:
         return None
 
-    # Build stem from AI suggested name embedded in description
-    # (the analyzers store suggested_name as the stem, but we only have description in the model)
-    # Use first 8 words of description as the stem
-    words = re.sub(r"[^a-zA-Z0-9\s]", " ", desc).split()
-    stem_from_desc = "_".join(w.lower() for w in words[:6] if len(w) > 2)
-    stem_from_desc = _safe(stem_from_desc)
+    stem_from_desc = None
+
+    # Try to use tags first (more specific and meaningful)
+    if tags_str:
+        try:
+            tags = json.loads(tags_str)
+            # Filter out generic/vague tags that don't add meaningful info
+            generic_tags = {"artwork", "photo", "image", "picture", "file", "document", "text"}
+            specific_tags = [t.lower().replace(" ", "_") for t in tags if t.lower() not in generic_tags]
+
+            if specific_tags:
+                # Use first 2-3 most relevant tags for more descriptive names
+                stem_from_desc = "_".join(specific_tags[:3])
+                stem_from_desc = _safe(stem_from_desc)
+        except (json.JSONDecodeError, TypeError):
+            # If tags fail to parse, fall through to description
+            pass
+
+    # Fallback: use description if tags didn't work or were empty
+    if not stem_from_desc and desc:
+        words = re.sub(r"[^a-zA-Z0-9\s]", " ", desc).split()
+        stem_from_desc = "_".join(w.lower() for w in words[:6] if len(w) > 2)
+        stem_from_desc = _safe(stem_from_desc)
 
     if not stem_from_desc:
         return None
