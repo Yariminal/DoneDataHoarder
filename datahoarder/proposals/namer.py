@@ -139,7 +139,7 @@ def _resolve_collision(proposed_path: Path, original_path: Path) -> Path:
 # Proposal generation
 # ---------------------------------------------------------------------------
 
-def generate_proposals(limit: Optional[int] = None) -> dict:
+def generate_proposals(limit: Optional[int] = None, session_id: str | None = None) -> dict:
     """
     Create Proposal records for all ANALYZED files.
 
@@ -156,6 +156,8 @@ def generate_proposals(limit: Optional[int] = None) -> dict:
 
     with Session(engine) as session:
         query = session.query(File).filter(File.status == FileStatus.ANALYZED)
+        if session_id:
+            query = query.filter(File.session_id == session_id)
         if limit:
             query = query.limit(limit)
         total = query.count()
@@ -175,13 +177,10 @@ def generate_proposals(limit: Optional[int] = None) -> dict:
         offset = 0
         while True:
             with Session(engine) as session:
-                batch = (
-                    session.query(File)
-                    .filter(File.status == FileStatus.ANALYZED)
-                    .limit(100)
-                    .offset(offset)
-                    .all()
-                )
+                p_q = session.query(File).filter(File.status == FileStatus.ANALYZED)
+                if session_id:
+                    p_q = p_q.filter(File.session_id == session_id)
+                batch = p_q.limit(100).offset(offset).all()
                 if not batch:
                     break
 

@@ -31,8 +31,15 @@ from datahoarder.db.models import (
     ProposalStatus,
     ProposalType,
     ScanSession,
+    SessionStatus,
+    UserSession,
 )
 from datahoarder.db.session import get_engine
+
+# ---------------------------------------------------------------------------
+# Global: current active session ID (set by frontend, used by all endpoints)
+# ---------------------------------------------------------------------------
+_current_session_id: str | None = None
 
 router = APIRouter()
 
@@ -108,6 +115,251 @@ class PipelineRequest(BaseModel):
     backend: str = "ollama"
     model: str = "gemma3:12b"
     workers: int = 1
+    session_id: str = ""
+
+
+class CreateSessionRequest(BaseModel):
+    root_path: str = ""
+    backend: str = "ollama"
+    model: str = "gemma3:12b"
+    workers: int = 1
+
+
+class SaveSessionRequest(BaseModel):
+    name: str
+
+
+# ---------------------------------------------------------------------------
+# Sessions
+# ---------------------------------------------------------------------------
+
+@router.post("/sessions")
+def create_session(body: CreateSessionRequest):
+    """Create a new session and return its ID."""
+    engine = get_engine()
+    with Session(engine) as session:
+        user_session = UserSession(
+            root_path=body.root_path,
+            backend=body.backend,
+            model=body.model,
+            workers=body.workers,
+            status=SessionStatus.NEW,
+            is_unsaved=False,
+        )
+        session.add(user_session)
+        session.commit()
+
+        global _current_session_id
+        _current_session_id = user_session.id
+
+        return {
+            "id": user_session.id,
+            "name": user_session.name,
+            "created_at": user_session.created_at.isoformat(),
+            "status": user_session.status.value,
+        }
+
+
+@router.get("/sessions")
+def list_sessions():
+    """List all sessions with preview stats."""
+    engine = get_engine()
+    with Session(engine) as session:
+        sessions = (
+            session.query(UserSession)
+            .order_by(UserSession.updated_at.desc())
+            .all()
+        )
+        items = []
+        for s in sessions:
+            # Count files in this session
+            file_count = (
+                session.query(func.count(File.id))
+                .filter(File.session_id == s.id)
+                .scalar() or 0
+            )
+            # Count proposals
+            proposal_count = (
+                session.query(func.count(Proposal.id))
+                .join(File)
+                .filter(File.session_id == s.id)
+                .scalar() or 0
+            )
+            # Count duplicate groups
+            dupe_count = (
+                session.query(func.count(DuplicateGroup.id))
+                .filter(DuplicateGroup.session_id == s.id)
+                .scalar() or 0
+            )
+
+            # Determine completed pipeline steps
+            stats = s.stats
+            completed_steps = stats.get("completed_steps", [])
+
+            items.append({
+                "id": s.id,
+                "name": s.name,
+                "created_at": s.created_at.isoformat(),
+                "updated_at": s.updated_at.isoformat(),
+                "last_saved_at": s.last_saved_at.isoformat() if s.last_saved_at else None,
+                "root_path": s.root_path,
+                "status": s.status.value,
+                "is_unsaved": s.is_unsaved,
+                "file_count": file_count,
+                "proposal_count": proposal_count,
+                "duplicate_count": dupe_count,
+                "completed_steps": completed_steps,
+                "backend": s.backend,
+                "model": s.model,
+                "workers": s.workers,
+            })
+
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/sessions/{session_id}")
+def get_session_detail(session_id: str):
+    """Load a specific session with full details."""
+    engine = get_engine()
+    with Session(engine) as session:
+        user_session = session.get(UserSession, session_id)
+        if not user_session:
+            raise HTTPException(404, "Session not found")
+
+        file_count = (
+            session.query(func.count(File.id))
+            .filter(File.session_id == session_id)
+            .scalar() or 0
+        )
+        proposal_count = (
+            session.query(func.count(Proposal.id))
+            .join(File)
+            .filter(File.session_id == session_id)
+            .scalar() or 0
+        )
+        dupe_count = (
+            session.query(func.count(DuplicateGroup.id))
+            .filter(DuplicateGroup.session_id == session_id)
+            .scalar() or 0
+        )
+
+        global _current_session_id
+        _current_session_id = session_id
+
+        return {
+            "id": user_session.id,
+            "name": user_session.name,
+            "created_at": user_session.created_at.isoformat(),
+            "updated_at": user_session.updated_at.isoformat(),
+            "last_saved_at": user_session.last_saved_at.isoformat() if user_session.last_saved_at else None,
+            "root_path": user_session.root_path,
+            "backend": user_session.backend,
+            "model": user_session.model,
+            "workers": user_session.workers,
+            "status": user_session.status.value,
+            "is_unsaved": user_session.is_unsaved,
+            "stats": user_session.stats,
+            "file_count": file_count,
+            "proposal_count": proposal_count,
+            "duplicate_count": dupe_count,
+        }
+
+
+@router.post("/sessions/{session_id}/save")
+def save_session(session_id: str, body: SaveSessionRequest):
+    """Save session with a user-provided name."""
+    engine = get_engine()
+    with Session(engine) as session:
+        user_session = session.get(UserSession, session_id)
+        if not user_session:
+            raise HTTPException(404, "Session not found")
+
+        # Check for duplicate names (exclude this session)
+        if body.name and body.name.strip():
+            existing = (
+                session.query(UserSession)
+                .filter(UserSession.name == body.name.strip())
+                .filter(UserSession.id != session_id)
+                .first()
+            )
+            if existing:
+                raise HTTPException(409, f"Session name '{body.name}' already exists")
+            user_session.name = body.name.strip()
+
+        user_session.is_unsaved = False
+        user_session.last_saved_at = datetime.utcnow()
+        user_session.updated_at = datetime.utcnow()
+        session.commit()
+
+        return {
+            "id": user_session.id,
+            "name": user_session.name,
+            "is_unsaved": False,
+            "last_saved_at": user_session.last_saved_at.isoformat(),
+        }
+
+
+@router.patch("/sessions/{session_id}")
+def mark_session_dirty(session_id: str):
+    """Mark a session as having unsaved changes."""
+    engine = get_engine()
+    with Session(engine) as session:
+        user_session = session.get(UserSession, session_id)
+        if not user_session:
+            raise HTTPException(404, "Session not found")
+
+        user_session.is_unsaved = True
+        user_session.updated_at = datetime.utcnow()
+        session.commit()
+
+    return {"id": session_id, "is_unsaved": True}
+
+
+@router.delete("/sessions/{session_id}")
+def delete_session(session_id: str):
+    """Delete a session and all its associated data."""
+    engine = get_engine()
+    with Session(engine) as session:
+        user_session = session.get(UserSession, session_id)
+        if not user_session:
+            raise HTTPException(404, "Session not found")
+
+        session.delete(user_session)
+        session.commit()
+
+    global _current_session_id
+    if _current_session_id == session_id:
+        _current_session_id = None
+
+    return {"status": "deleted", "id": session_id}
+
+
+def _require_session_id(body_session_id: str = "") -> str:
+    """Helper: resolve the active session_id from request body or global state."""
+    sid = body_session_id or _current_session_id
+    if not sid:
+        raise HTTPException(400, "No active session. Create or load a session first.")
+    return sid
+
+
+def _mark_session_unsaved(session_id: str, step: str | None = None) -> None:
+    """Helper: mark a session as unsaved and optionally record a completed step."""
+    engine = get_engine()
+    with Session(engine) as session:
+        user_session = session.get(UserSession, session_id)
+        if user_session:
+            user_session.is_unsaved = True
+            user_session.updated_at = datetime.utcnow()
+            if user_session.status == SessionStatus.NEW:
+                user_session.status = SessionStatus.ACTIVE
+            if step:
+                stats = user_session.stats
+                completed = stats.get("completed_steps", [])
+                if step not in completed:
+                    completed.append(step)
+                stats["completed_steps"] = completed
+                user_session.stats = stats
+            session.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -116,57 +368,59 @@ class PipelineRequest(BaseModel):
 
 @router.get("/stats", response_model=StatsResponse)
 def get_stats():
+    sid = _current_session_id
     engine = get_engine()
     with Session(engine) as session:
-        total_files = session.query(func.count(File.id)).scalar() or 0
-        total_size = session.query(func.sum(File.size_bytes)).scalar() or 0
+        file_q = session.query(File)
+        if sid:
+            file_q = file_q.filter(File.session_id == sid)
+
+        total_files = file_q.count()
+        total_size = file_q.with_entities(func.sum(File.size_bytes)).scalar() or 0
 
         # By status
-        status_rows = (
-            session.query(File.status, func.count(File.id))
-            .group_by(File.status)
-            .all()
-        )
+        status_q = session.query(File.status, func.count(File.id))
+        if sid:
+            status_q = status_q.filter(File.session_id == sid)
+        status_rows = status_q.group_by(File.status).all()
         by_status = {s.value: c for s, c in status_rows}
 
         # Top extensions
-        ext_rows = (
-            session.query(File.extension, func.count(File.id))
-            .filter(File.extension.isnot(None))
-            .group_by(File.extension)
-            .order_by(func.count(File.id).desc())
-            .limit(15)
-            .all()
-        )
+        ext_q = session.query(File.extension, func.count(File.id)).filter(File.extension.isnot(None))
+        if sid:
+            ext_q = ext_q.filter(File.session_id == sid)
+        ext_rows = ext_q.group_by(File.extension).order_by(func.count(File.id).desc()).limit(15).all()
         by_extension = [{"ext": e, "count": c} for e, c in ext_rows]
 
         # By MIME category
-        mime_rows = (
-            session.query(
-                func.substr(File.mime_type, 1, func.instr(File.mime_type, "/") - 1),
-                func.count(File.id),
-            )
-            .filter(File.mime_type.isnot(None))
-            .group_by(func.substr(File.mime_type, 1, func.instr(File.mime_type, "/") - 1))
-            .order_by(func.count(File.id).desc())
-            .all()
-        )
+        mime_q = session.query(
+            func.substr(File.mime_type, 1, func.instr(File.mime_type, "/") - 1),
+            func.count(File.id),
+        ).filter(File.mime_type.isnot(None))
+        if sid:
+            mime_q = mime_q.filter(File.session_id == sid)
+        mime_rows = mime_q.group_by(func.substr(File.mime_type, 1, func.instr(File.mime_type, "/") - 1)).order_by(func.count(File.id).desc()).all()
         by_mime = [{"category": m or "unknown", "count": c} for m, c in mime_rows]
 
         # Proposals
-        prop_rows = (
-            session.query(Proposal.status, func.count(Proposal.id))
-            .group_by(Proposal.status)
-            .all()
-        )
+        prop_q = session.query(Proposal.status, func.count(Proposal.id))
+        if sid:
+            prop_q = prop_q.join(File).filter(File.session_id == sid)
+        prop_rows = prop_q.group_by(Proposal.status).all()
         proposal_counts = {s.value: c for s, c in prop_rows}
 
         # Duplicates
-        dupe_count = session.query(func.count(DuplicateGroup.id)).scalar() or 0
+        dupe_q = session.query(func.count(DuplicateGroup.id))
+        if sid:
+            dupe_q = dupe_q.filter(DuplicateGroup.session_id == sid)
+        dupe_count = dupe_q.scalar() or 0
 
         # Wasted bytes in duplicate groups
         dupe_wasted = 0
-        groups = session.query(DuplicateGroup).all()
+        grp_q = session.query(DuplicateGroup)
+        if sid:
+            grp_q = grp_q.filter(DuplicateGroup.session_id == sid)
+        groups = grp_q.all()
         for g in groups:
             for m in g.members:
                 if m.file_id != g.keep_file_id:
@@ -204,6 +458,8 @@ def list_files(
     engine = get_engine()
     with Session(engine) as session:
         query = session.query(File)
+        if _current_session_id:
+            query = query.filter(File.session_id == _current_session_id)
 
         if status:
             try:
@@ -361,6 +617,8 @@ def list_proposals(
     engine = get_engine()
     with Session(engine) as session:
         query = session.query(Proposal).join(File)
+        if _current_session_id:
+            query = query.filter(File.session_id == _current_session_id)
 
         if status:
             try:
@@ -502,13 +760,11 @@ def bulk_reject():
 def list_duplicates(page: int = 1, per_page: int = 20):
     engine = get_engine()
     with Session(engine) as session:
-        total = session.query(func.count(DuplicateGroup.id)).scalar() or 0
-        groups = (
-            session.query(DuplicateGroup)
-            .offset((page - 1) * per_page)
-            .limit(per_page)
-            .all()
-        )
+        q = session.query(DuplicateGroup)
+        if _current_session_id:
+            q = q.filter(DuplicateGroup.session_id == _current_session_id)
+        total = q.count()
+        groups = q.offset((page - 1) * per_page).limit(per_page).all()
 
         items = []
         for g in groups:
@@ -561,7 +817,10 @@ def set_keeper(group_id: int, body: SetKeeperRequest):
 def execute_proposals(dry_run: bool = True, min_confidence: float = 0.7):
     from datahoarder.executor import execute as do_execute
 
-    counts = do_execute(dry_run=dry_run, min_confidence=min_confidence)
+    sid = _current_session_id
+    counts = do_execute(dry_run=dry_run, min_confidence=min_confidence, session_id=sid)
+    if sid:
+        _mark_session_unsaved(sid, step="execute")
     return counts
 
 
@@ -576,6 +835,8 @@ def trigger_scan(body: PipelineRequest):
     import contextlib
 
     try:
+        sid = _require_session_id(body.session_id)
+
         if not body.root_path or not body.root_path.strip():
             raise HTTPException(400, "Root path is required")
 
@@ -586,9 +847,22 @@ def trigger_scan(body: PipelineRequest):
         if not root.is_dir():
             raise HTTPException(400, f"Path is not a directory: {root}")
 
+        # Update session root_path
+        engine = get_engine()
+        with Session(engine) as session:
+            user_session = session.get(UserSession, sid)
+            if user_session:
+                user_session.root_path = str(root.resolve())
+                user_session.backend = body.backend
+                user_session.model = body.model
+                user_session.workers = body.workers
+                session.commit()
+
         # Suppress stdout to prevent Rich progress bar Unicode errors in web context
         with contextlib.redirect_stdout(io.StringIO()):
-            counts = do_scan(root)
+            counts = do_scan(root, session_id=sid)
+
+        _mark_session_unsaved(sid, step="scan")
         return counts
     except HTTPException:
         raise
@@ -597,32 +871,44 @@ def trigger_scan(body: PipelineRequest):
 
 
 @router.post("/pipeline/enrich")
-def trigger_enrich():
+def trigger_enrich(body: PipelineRequest = PipelineRequest()):
     from datahoarder.core.enricher import enrich as do_enrich
     import io
     import contextlib
 
     try:
+        sid = _require_session_id(body.session_id)
+
         # Suppress stdout to prevent Rich progress bar Unicode errors in web context
         with contextlib.redirect_stdout(io.StringIO()):
-            counts = do_enrich()
+            counts = do_enrich(session_id=sid)
+
+        _mark_session_unsaved(sid, step="enrich")
         return counts
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(500, f"Enrich failed: {str(exc)}")
 
 
 @router.post("/pipeline/dedup")
-def trigger_dedup():
+def trigger_dedup(body: PipelineRequest = PipelineRequest()):
     from datahoarder.core.dedup import find_exact_duplicates, find_perceptual_duplicates
     import io
     import contextlib
 
     try:
+        sid = _require_session_id(body.session_id)
+
         # Suppress stdout to prevent Rich progress bar Unicode errors in web context
         with contextlib.redirect_stdout(io.StringIO()):
-            exact = find_exact_duplicates()
-            perc = find_perceptual_duplicates()
+            exact = find_exact_duplicates(session_id=sid)
+            perc = find_perceptual_duplicates(session_id=sid)
+
+        _mark_session_unsaved(sid, step="dedup")
         return {"exact": exact, "perceptual": perc}
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(500, f"Dedup failed: {str(exc)}")
 
@@ -635,6 +921,7 @@ def trigger_analyze(body: PipelineRequest):
     import contextlib
 
     try:
+        sid = _require_session_id(body.session_id)
         init_ai(
             backend=body.backend,
             text_model=body.model,
@@ -646,7 +933,9 @@ def trigger_analyze(body: PipelineRequest):
     try:
         # Suppress stdout to prevent Rich progress bar Unicode errors in web context
         with contextlib.redirect_stdout(io.StringIO()):
-            counts = do_analyze(workers=body.workers)
+            counts = do_analyze(workers=body.workers, session_id=sid)
+
+        _mark_session_unsaved(sid, step="analyze")
         return counts
     except Exception as exc:
         raise HTTPException(500, f"Analyze failed: {str(exc)}")
@@ -660,6 +949,8 @@ def trigger_analyze_stream(body: PipelineRequest):
     import io
     import contextlib
 
+    sid = _require_session_id(body.session_id)
+
     try:
         init_ai(
             backend=body.backend,
@@ -672,8 +963,9 @@ def trigger_analyze_stream(body: PipelineRequest):
     def generate():
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                for progress in analyze_with_progress(workers=body.workers):
+                for progress in analyze_with_progress(workers=body.workers, session_id=sid):
                     yield f"data: {json.dumps(progress)}\n\n"
+            _mark_session_unsaved(sid, step="analyze")
         except Exception as exc:
             yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
@@ -681,15 +973,21 @@ def trigger_analyze_stream(body: PipelineRequest):
 
 
 @router.post("/pipeline/propose")
-def trigger_propose():
+def trigger_propose(body: PipelineRequest = PipelineRequest()):
     from datahoarder.proposals.namer import generate_proposals
     import io
     import contextlib
 
     try:
+        sid = _require_session_id(body.session_id)
+
         with contextlib.redirect_stdout(io.StringIO()):
-            counts = generate_proposals()
+            counts = generate_proposals(session_id=sid)
+
+        _mark_session_unsaved(sid, step="propose")
         return counts
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(500, f"Propose failed: {str(exc)}")
 
