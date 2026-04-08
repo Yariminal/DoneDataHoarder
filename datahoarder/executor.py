@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import io
+
 from rich.console import Console
 from rich.table import Table
 from sqlalchemy.orm import Session
@@ -21,6 +23,11 @@ from datahoarder.db.models import (
 from datahoarder.db.session import get_engine
 
 console = Console()
+
+
+def _make_quiet_console() -> Console:
+    """Create a Console that writes to a buffer (safe for web/non-terminal use)."""
+    return Console(file=io.StringIO(), force_terminal=False)
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +205,7 @@ def execute(
     proposal_ids: Optional[list[int]] = None,
     proposal_types: Optional[list[ProposalType]] = None,
     session_id: str | None = None,
+    _console: Console | None = None,
 ) -> dict:
     """
     Apply approved (or all pending) proposals.
@@ -207,15 +215,17 @@ def execute(
         min_confidence:   Only apply proposals above this confidence level.
         proposal_ids:     If set, only apply these specific proposal IDs.
         proposal_types:   If set, only apply these proposal types.
+        _console:         Optional Console override (use _make_quiet_console() for web).
 
     Returns:
         Summary dict.
     """
+    con = _console or console
     engine = get_engine()
     counts = {"applied": 0, "failed": 0, "skipped": 0}
 
     if dry_run:
-        console.print("[bold yellow]DRY RUN — no files will be changed[/bold yellow]\n")
+        con.print("[bold yellow]DRY RUN -- no files will be changed[/bold yellow]\n")
 
     with Session(engine) as session:
         query = session.query(Proposal).filter(
@@ -233,7 +243,7 @@ def execute(
             )
 
         proposals = query.all()
-        console.print(f"[bold]Processing {len(proposals)} proposals…[/bold]")
+        con.print(f"[bold]Processing {len(proposals)} proposals...[/bold]")
 
         for prop in proposals:
             file_rec = session.get(File, prop.file_id)
@@ -271,16 +281,16 @@ def execute(
                     prop.status = ProposalStatus.REJECTED
                     color = "red"
 
-                console.print(f"  [{color}]{msg}[/{color}]")
+                con.print(f"  [{color}]{msg}[/{color}]")
 
             except Exception as exc:
                 counts["failed"] += 1
-                console.print(f"  [red]ERROR on proposal {prop.id}: {exc}[/red]")
+                con.print(f"  [red]ERROR on proposal {prop.id}: {exc}[/red]")
 
         if not dry_run:
             session.commit()
 
-    console.print(
+    con.print(
         f"\n[bold]Done:[/bold] {counts['applied']} applied, "
         f"{counts['failed']} failed, {counts['skipped']} skipped"
     )
