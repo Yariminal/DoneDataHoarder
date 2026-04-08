@@ -820,16 +820,18 @@ def set_keeper(group_id: int, body: SetKeeperRequest):
 
 @router.post("/execute")
 def execute_proposals(body: ExecuteRequest):
-    from datahoarder.executor import execute as do_execute
-    import io
-    import contextlib
+    from datahoarder.executor import execute as do_execute, _make_quiet_console
 
     sid = body.session_id or _current_session_id
     if not sid:
         raise HTTPException(400, "No active session. Create or load a session first.")
 
-    with contextlib.redirect_stdout(io.StringIO()):
-        counts = do_execute(dry_run=body.dry_run, min_confidence=body.min_confidence, session_id=sid)
+    counts = do_execute(
+        dry_run=body.dry_run,
+        min_confidence=body.min_confidence,
+        session_id=sid,
+        _console=_make_quiet_console(),
+    )
     _mark_session_unsaved(sid, step="execute")
     return counts
 
