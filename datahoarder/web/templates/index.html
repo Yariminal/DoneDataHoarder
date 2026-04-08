@@ -532,11 +532,26 @@
         <div class="card-label">Active Settings <span class="text-dim text-sm">(change in Setup tab)</span></div>
         <div class="mt-1 text-sm" style="display:grid; grid-template-columns:100px 1fr; gap:4px 12px;">
           <strong>Folder:</strong> <span class="text-mono" x-text="getSettings().rootPath || '(not set)'"></span>
-          <strong>Model:</strong> <span class="text-mono" x-text="getSettings().model"></span>
+          <strong>Model:</strong> <span class="text-mono" :style="!getSettings().model ? 'color:var(--danger)' : ''" x-text="getSettings().model || '(not selected)'"></span>
           <strong>Backend:</strong> <span x-text="getSettings().backend"></span>
           <strong>Workers:</strong> <span x-text="getSettings().workers"></span>
         </div>
       </div>
+
+      <!-- Model selection warning -->
+      <template x-if="!getSettings().model">
+        <div style="background:var(--danger-bg); border:1px solid var(--danger); border-radius:6px; padding:12px; margin-bottom:16px; max-width:600px;">
+          <div style="display:flex; gap:8px; align-items:flex-start;">
+            <span style="font-size:1.2rem; flex-shrink:0;">⚠</span>
+            <div>
+              <div style="color:var(--danger); font-weight:600;">No model selected</div>
+              <div class="text-sm" style="color:var(--text-dim); margin-top:4px;">
+                Go to <strong>Setup</strong> tab and select an AI model before running Analyze.
+              </div>
+            </div>
+          </div>
+        </div>
+      </template>
 
       <!-- Steps -->
       <div class="pipeline-steps">
@@ -589,7 +604,8 @@
               </div>
             </template>
           </div>
-          <button class="btn btn-primary btn-sm" :disabled="running" @click="runStep('analyze')">
+          <button class="btn btn-primary btn-sm" :disabled="running || !getSettings().model" @click="runStep('analyze')"
+                  :title="!getSettings().model ? 'Select a model in Setup first' : ''">
             <span x-text="running === 'analyze' ? 'Analyzing...' : 'Run'"></span>
           </button>
         </div>
