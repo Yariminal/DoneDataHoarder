@@ -129,6 +129,12 @@ class SaveSessionRequest(BaseModel):
     name: str
 
 
+class ExecuteRequest(BaseModel):
+    session_id: str = ""
+    dry_run: bool = True
+    min_confidence: float = 0.7
+
+
 # ---------------------------------------------------------------------------
 # Sessions
 # ---------------------------------------------------------------------------
@@ -813,16 +819,18 @@ def set_keeper(group_id: int, body: SetKeeperRequest):
 # ---------------------------------------------------------------------------
 
 @router.post("/execute")
-def execute_proposals(dry_run: bool = True, min_confidence: float = 0.7):
+def execute_proposals(body: ExecuteRequest):
     from datahoarder.executor import execute as do_execute
     import io
     import contextlib
 
-    sid = _current_session_id
+    sid = body.session_id or _current_session_id
+    if not sid:
+        raise HTTPException(400, "No active session. Create or load a session first.")
+
     with contextlib.redirect_stdout(io.StringIO()):
-        counts = do_execute(dry_run=dry_run, min_confidence=min_confidence, session_id=sid)
-    if sid:
-        _mark_session_unsaved(sid, step="execute")
+        counts = do_execute(dry_run=body.dry_run, min_confidence=body.min_confidence, session_id=sid)
+    _mark_session_unsaved(sid, step="execute")
     return counts
 
 

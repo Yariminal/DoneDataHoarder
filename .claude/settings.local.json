@@ -91,7 +91,11 @@
       "Bash(curl -s -X POST http://127.0.0.1:8080/api/pipeline/propose -H 'Content-Type: application/json' -d '{\"session_id\": \"1bce2794-8762-4455-9467-5fef93e8844f\"}')",
       "Bash(curl -s \"http://127.0.0.1:8080/api/duplicates?session_id=1bce2794-8762-4455-9467-5fef93e8844f\")",
       "Bash(curl -s -X POST \"http://127.0.0.1:8080/api/execute?dry_run=false&min_confidence=0.7\")",
-      "Bash(taskkill //PID 24552 //F)"
+      "Bash(taskkill //PID 24552 //F)",
+      "Bash(node -c datahoarder/web/static/app.js)",
+      "Bash(pkill -f \"uvicorn.*create_default_app\")",
+      "Bash(taskkill //PID 9912 //F)",
+      "Bash(taskkill //PID 3008 //F)"
     ]
   }
 }
