@@ -1,8 +1,26 @@
 """
 Video analyzer — samples frames + optional audio transcription.
 
-Frame extraction requires:  pip install ffmpeg-python  (and ffmpeg in PATH)
-Transcription requires:     pip install faster-whisper
+This analyzer gracefully handles missing dependencies:
+
+✓ With ffmpeg-python + ffmpeg binary:
+  - Extracts 4 keyframes from videos (2%, 45%, 78%, 94%)
+  - Uses vision model for frame analysis
+
+✓ With faster-whisper:
+  - Transcribes audio/video speech content
+  - Provides speech-to-text for analysis
+
+⚠ Without optional dependencies:
+  - Videos analyzed with transcript only (text-based)
+  - Audio analyzed with basic metadata (no transcription)
+  - Confidence scores reduced to reflect incomplete analysis
+
+Installation:
+  Optional: pip install ffmpeg-python  (also requires ffmpeg binary)
+  Optional: pip install faster-whisper
+
+See INSTALL.md for platform-specific ffmpeg setup instructions.
 """
 import io
 import subprocess
@@ -162,10 +180,9 @@ class VideoAnalyzer(BaseAnalyzer):
         is_video = ext in VIDEO_EXTENSIONS or (mime_type and mime_type.startswith("video/"))
         is_audio = ext in AUDIO_EXTENSIONS or (mime_type and mime_type.startswith("audio/"))
 
-        # Videos require ffmpeg for frame extraction — skip if unavailable
-        if is_video and not _HAS_FFMPEG:
-            return False
-
+        # Handle both video and audio files.
+        # Videos without ffmpeg will be analyzed with transcript only (text-based).
+        # Audio files with whisper will be transcribed; without it, basic analysis only.
         return is_video or is_audio
 
     def analyze(self, file_rec: File, context: str) -> AnalysisResult:
@@ -183,10 +200,21 @@ class VideoAnalyzer(BaseAnalyzer):
         )
 
         if is_audio_only:
+            whisper_note = ""
+            if not _HAS_WHISPER:
+                whisper_note = (
+                    "\n⚠ faster-whisper not installed: audio transcription unavailable. "
+                    "Install for better audio analysis: pip install faster-whisper"
+                )
+                transcript_section = "No transcript available (whisper not installed)."
+
             prompt = AUDIO_PROMPT.format(
                 context=context,
                 transcript_section=transcript_section,
             )
+            if whisper_note:
+                prompt += whisper_note
+
             try:
                 data = self._client.generate_json(prompt, system=SYSTEM_PROMPT)
             except Exception as exc:
@@ -197,20 +225,36 @@ class VideoAnalyzer(BaseAnalyzer):
                 )
             result = AnalysisResult.from_ai_response(data)
             result.transcript = transcript
+
+            # Lower confidence slightly if critical tools are missing
+            if not _HAS_WHISPER:
+                result.confidence = max(0.0, result.confidence - 0.15)
+
             audio_type = data.get("audio_type", "")
             if audio_type and audio_type not in result.tags:
                 result.tags.insert(0, audio_type)
             return result
 
         # --- Video: extract frames at 2%, 45%, 78%, 94% of duration ---
-        duration = _get_duration_seconds(path)
         frames: list[bytes] = []
-        if duration and duration > 0 and _HAS_FFMPEG:
-            for pct in FRAME_POSITIONS:
-                ts = duration * pct
-                frame = _extract_frame(path, ts)
-                if frame:
-                    frames.append(frame)
+        ffmpeg_warning = ""
+
+        if not _HAS_FFMPEG:
+            # ffmpeg not available — can't extract frames, but still analyze with transcript
+            ffmpeg_warning = (
+                "\n⚠ ffmpeg not installed: video frame extraction unavailable. "
+                "Analysis based on transcript/metadata only. "
+                "Install ffmpeg for full video analysis: https://ffmpeg.org/download.html"
+            )
+        else:
+            # Try to extract frames
+            duration = _get_duration_seconds(path)
+            if duration and duration > 0:
+                for pct in FRAME_POSITIONS:
+                    ts = duration * pct
+                    frame = _extract_frame(path, ts)
+                    if frame:
+                        frames.append(frame)
 
         pct_labels = ", ".join(f"{int(p*100)}%" for p in FRAME_POSITIONS[:len(frames)])
         prompt = VIDEO_PROMPT.format(
@@ -220,6 +264,8 @@ class VideoAnalyzer(BaseAnalyzer):
         )
         if frames:
             prompt += f"\nFrames sampled at: {pct_labels} of the video duration."
+        if ffmpeg_warning:
+            prompt += ffmpeg_warning
 
         try:
             if frames:
@@ -241,6 +287,13 @@ class VideoAnalyzer(BaseAnalyzer):
 
         result = AnalysisResult.from_ai_response(data)
         result.transcript = transcript
+
+        # Lower confidence if critical tools are missing
+        if not _HAS_FFMPEG:
+            result.confidence = max(0.0, result.confidence - 0.20)
+        if not _HAS_WHISPER:
+            result.confidence = max(0.0, result.confidence - 0.10)
+
         video_type = data.get("video_type", "")
         if video_type and video_type not in result.tags:
             result.tags.insert(0, video_type)
