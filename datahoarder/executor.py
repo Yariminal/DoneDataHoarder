@@ -89,7 +89,7 @@ def _apply_rename(proposal: Proposal, dry_run: bool) -> tuple[bool, str]:
         except OSError as exc:
             return False, str(exc)
 
-    return True, f"{'[DRY RUN] ' if dry_run else ''}Renamed: {src.name} → {dst.name}"
+    return True, f"{'[DRY RUN] ' if dry_run else ''}Renamed: {src.name} -> {dst.name}"
 
 
 def _apply_tags(proposal: Proposal, file_rec: File, dry_run: bool) -> tuple[bool, str]:
@@ -149,7 +149,7 @@ def _delete_duplicate(file_id: int, dry_run: bool) -> tuple[bool, str]:
         f.status = FileStatus.APPLIED
         session.commit()
 
-    return True, f"Trashed: {path.name} → {dst}"
+    return True, f"Trashed: {path.name} -> {dst}"
 
 
 # ---------------------------------------------------------------------------

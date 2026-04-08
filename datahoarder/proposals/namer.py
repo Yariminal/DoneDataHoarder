@@ -120,17 +120,40 @@ def build_new_name(file_rec: File) -> Optional[str]:
     return stem + ext
 
 
-def _resolve_collision(proposed_path: Path, original_path: Path) -> Path:
-    """If proposed_path already exists (and isn't the same file), add a counter suffix."""
-    if not proposed_path.exists() or proposed_path == original_path:
+def _resolve_collision(
+    proposed_path: Path,
+    original_path: Path,
+    reserved_names: set[Path] | None = None,
+) -> Path:
+    """
+    Resolve filename collisions by adding a counter suffix.
+
+    Checks against:
+    1. Files already on disk
+    2. Previously proposed names in this batch (reserved_names)
+
+    Args:
+        proposed_path: The desired target path
+        original_path: The current file path (allow renaming to self)
+        reserved_names: Set of paths already proposed in this batch
+
+    Returns:
+        A non-conflicting path (with _1, _2, etc. suffix if needed)
+    """
+    reserved = reserved_names or set()
+
+    # If no conflict, return as-is
+    if (not proposed_path.exists() and proposed_path not in reserved) or proposed_path == original_path:
         return proposed_path
+
+    # Add counter suffix to resolve conflicts
     stem = proposed_path.stem
     ext = proposed_path.suffix
     parent = proposed_path.parent
     counter = 1
     while True:
         candidate = parent / f"{stem}_{counter}{ext}"
-        if not candidate.exists():
+        if not candidate.exists() and candidate not in reserved:
             return candidate
         counter += 1
 
@@ -175,6 +198,8 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
         task = progress.add_task("Generating proposals…", total=total)
 
         offset = 0
+        reserved_names: set[Path] = set()  # Track proposed names to prevent collisions within batch
+
         while True:
             with Session(engine) as session:
                 p_q = session.query(File).filter(File.status == FileStatus.ANALYZED)
@@ -192,8 +217,10 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
                     new_name = build_new_name(file_rec)
                     if new_name and new_name != path.name:
                         proposed_path = _resolve_collision(
-                            path.parent / new_name, path
+                            path.parent / new_name, path, reserved_names=reserved_names
                         )
+                        # Add to reserved names so other files in this batch won't collide
+                        reserved_names.add(proposed_path)
                         existing = (
                             session.query(Proposal)
                             .filter_by(

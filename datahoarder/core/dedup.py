@@ -3,14 +3,16 @@ Duplicate detector — finds exact and near-duplicate files.
 
 Stage 1 — Exact:     group by MD5 hash (same bytes)
 Stage 2 — Perceptual: group images by pHash distance ≤ threshold
-Stage 3 — Content:   (future) semantic similarity for documents
+Stage 3 — Content:   semantic similarity using AI descriptions and tags
 
 Results are written to DuplicateGroup / DuplicateMember tables.
 The "keep" file in each group defaults to the one with the earliest
 best-date (i.e. original) and longest path (i.e. most specific location).
 """
+import json
 from collections import defaultdict
 from datetime import datetime
+from difflib import SequenceMatcher
 from typing import Optional
 
 from rich.progress import (
@@ -30,7 +32,8 @@ try:
 except ImportError:
     _HAS_IMAGEHASH = False
 
-PHASH_THRESHOLD = 10  # max bit-distance to consider "near-duplicate"
+PHASH_THRESHOLD = 8  # max bit-distance to consider "near-duplicate" (lowered from 10 for better sensitivity)
+AI_SIMILARITY_THRESHOLD = 0.55  # min similarity score for AI-based duplicates
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +206,118 @@ def find_perceptual_duplicates(threshold: int = PHASH_THRESHOLD, session_id: str
                 group_hash,
                 group,
                 similarity=0.95,
+                session_id=session_id,
+            )
+            counts["groups"] += 1
+            counts["duplicates"] += len(group) - 1
+        session.commit()
+
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 — AI-based semantic duplicates (descriptions + tags)
+# ---------------------------------------------------------------------------
+
+def _string_similarity(s1: str, s2: str) -> float:
+    """Calculate string similarity ratio (0.0 to 1.0)."""
+    if not s1 or not s2:
+        return 0.0
+    return SequenceMatcher(None, s1.lower(), s2.lower()).ratio()
+
+
+def _tags_overlap(tags1: list[str], tags2: list[str]) -> float:
+    """Calculate tag overlap as Jaccard similarity."""
+    if not tags1 or not tags2:
+        return 0.0
+    set1, set2 = set(tags1), set(tags2)
+    intersection = len(set1 & set2)
+    union = len(set1 | set2)
+    return intersection / union if union > 0 else 0.0
+
+
+def find_semantic_duplicates(session_id: str | None = None) -> dict:
+    """Find semantically similar files using AI descriptions and tags."""
+    engine = get_engine()
+    counts = {"groups": 0, "duplicates": 0}
+
+    with Session(engine) as session:
+        # Only consider analyzed files with descriptions or tags
+        q = (
+            session.query(File.id, File.ai_description, File.ai_tags)
+            .filter(File.status.in_([FileStatus.ANALYZED, FileStatus.PROPOSED]))
+            .filter((File.ai_description.isnot(None)) | (File.ai_tags.isnot(None)))
+        )
+        if session_id:
+            q = q.filter(File.session_id == session_id)
+        rows = q.all()
+
+    if len(rows) < 2:
+        return counts
+
+    # O(n²) comparison of AI descriptions and tags
+    visited: set[int] = set()
+    groups: list[list[int]] = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold yellow]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+    ) as progress:
+        task = progress.add_task("Comparing AI descriptions…", total=len(rows))
+
+        for i, (id_a, desc_a, tags_a) in enumerate(rows):
+            progress.advance(task)
+            if id_a in visited:
+                continue
+
+            group = [id_a]
+            tags_a_list = []
+            try:
+                if tags_a:
+                    tags_a_list = json.loads(tags_a)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            for id_b, desc_b, tags_b in rows[i + 1:]:
+                if id_b in visited:
+                    continue
+
+                # Calculate similarity across description and tags
+                desc_sim = _string_similarity(desc_a or "", desc_b or "")
+
+                tags_b_list = []
+                try:
+                    if tags_b:
+                        tags_b_list = json.loads(tags_b)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+                tags_sim = _tags_overlap(tags_a_list, tags_b_list)
+
+                # Weighted average: 40% description, 60% tags (tags are more consistent)
+                combined_sim = 0.4 * desc_sim + 0.6 * tags_sim
+
+                if combined_sim >= AI_SIMILARITY_THRESHOLD:
+                    group.append(id_b)
+
+            if len(group) > 1:
+                for gid in group:
+                    visited.add(gid)
+                groups.append(group)
+
+    with Session(engine) as session:
+        for group in groups:
+            # Use string of sorted IDs as group key
+            group_hash = "-".join(str(x) for x in sorted(group))
+            _upsert_group(
+                session,
+                DupeType.PERCEPTUAL,  # Use PERCEPTUAL type for semantic duplicates too
+                group_hash,
+                group,
+                similarity=0.85,
                 session_id=session_id,
             )
             counts["groups"] += 1

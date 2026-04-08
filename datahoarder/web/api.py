@@ -129,6 +129,12 @@ class SaveSessionRequest(BaseModel):
     name: str
 
 
+class ExecuteRequest(BaseModel):
+    session_id: str = ""
+    dry_run: bool = True
+    min_confidence: float = 0.7
+
+
 # ---------------------------------------------------------------------------
 # Sessions
 # ---------------------------------------------------------------------------
@@ -757,12 +763,11 @@ def bulk_reject():
 # ---------------------------------------------------------------------------
 
 @router.get("/duplicates")
-def list_duplicates(page: int = 1, per_page: int = 20):
+def list_duplicates(page: int = 1, per_page: int = 20, session_id: str = Query(...)):
+    _require_session_id(session_id)
     engine = get_engine()
     with Session(engine) as session:
-        q = session.query(DuplicateGroup)
-        if _current_session_id:
-            q = q.filter(DuplicateGroup.session_id == _current_session_id)
+        q = session.query(DuplicateGroup).filter(DuplicateGroup.session_id == session_id)
         total = q.count()
         groups = q.offset((page - 1) * per_page).limit(per_page).all()
 
@@ -814,13 +819,18 @@ def set_keeper(group_id: int, body: SetKeeperRequest):
 # ---------------------------------------------------------------------------
 
 @router.post("/execute")
-def execute_proposals(dry_run: bool = True, min_confidence: float = 0.7):
+def execute_proposals(body: ExecuteRequest):
     from datahoarder.executor import execute as do_execute
+    import io
+    import contextlib
 
-    sid = _current_session_id
-    counts = do_execute(dry_run=dry_run, min_confidence=min_confidence, session_id=sid)
-    if sid:
-        _mark_session_unsaved(sid, step="execute")
+    sid = body.session_id or _current_session_id
+    if not sid:
+        raise HTTPException(400, "No active session. Create or load a session first.")
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        counts = do_execute(dry_run=body.dry_run, min_confidence=body.min_confidence, session_id=sid)
+    _mark_session_unsaved(sid, step="execute")
     return counts
 
 
@@ -853,9 +863,6 @@ def trigger_scan(body: PipelineRequest):
             user_session = session.get(UserSession, sid)
             if user_session:
                 user_session.root_path = str(root.resolve())
-                user_session.backend = body.backend
-                user_session.model = body.model
-                user_session.workers = body.workers
                 session.commit()
 
         # Suppress stdout to prevent Rich progress bar Unicode errors in web context
@@ -893,7 +900,7 @@ def trigger_enrich(body: PipelineRequest = PipelineRequest()):
 
 @router.post("/pipeline/dedup")
 def trigger_dedup(body: PipelineRequest = PipelineRequest()):
-    from datahoarder.core.dedup import find_exact_duplicates, find_perceptual_duplicates
+    from datahoarder.core.dedup import find_exact_duplicates, find_perceptual_duplicates, find_semantic_duplicates
     import io
     import contextlib
 
@@ -904,9 +911,10 @@ def trigger_dedup(body: PipelineRequest = PipelineRequest()):
         with contextlib.redirect_stdout(io.StringIO()):
             exact = find_exact_duplicates(session_id=sid)
             perc = find_perceptual_duplicates(session_id=sid)
+            semantic = find_semantic_duplicates(session_id=sid)  # Stage 3: AI-based semantic duplicates
 
         _mark_session_unsaved(sid, step="dedup")
-        return {"exact": exact, "perceptual": perc}
+        return {"exact": exact, "perceptual": perc, "semantic": semantic}
     except HTTPException:
         raise
     except Exception as exc:
