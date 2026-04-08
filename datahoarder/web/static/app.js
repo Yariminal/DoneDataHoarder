@@ -908,7 +908,7 @@ document.addEventListener('alpine:init', () => {
             Alpine.store('app').toast(`Propose complete: ${data.rename || 0} renames + ${data.tags || 0} tags`, 'success');
             break;
           case 'execute-dry':
-            data = await api.post('/execute?dry_run=true');
+            data = await api.post('/execute', { session_id: settings.session_id, dry_run: true });
             Alpine.store('app').toast('Dry run complete — review results below', 'success');
             break;
           case 'execute-commit':
@@ -917,7 +917,7 @@ document.addEventListener('alpine:init', () => {
               Alpine.store('app').loading = false;
               return;
             }
-            data = await api.post('/execute?dry_run=false');
+            data = await api.post('/execute', { session_id: settings.session_id, dry_run: false });
             Alpine.store('app').toast('Changes applied to disk', 'success');
             break;
         }
