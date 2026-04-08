@@ -33,7 +33,7 @@ document.addEventListener('alpine:init', () => {
     last_saved_at: null,
     root_path: '',
     backend: 'ollama',
-    model: 'gemma3:12b',
+    model: '',
     workers: 1,
     stats: {},
     file_count: 0,
@@ -76,7 +76,7 @@ document.addEventListener('alpine:init', () => {
       this.last_saved_at = data.last_saved_at;
       this.root_path = data.root_path || '';
       this.backend = data.backend || 'ollama';
-      this.model = data.model || 'gemma3:12b';
+      this.model = data.model || '';
       this.workers = data.workers || 1;
       this.stats = data.stats || {};
       this.file_count = data.file_count || 0;
@@ -182,13 +182,18 @@ document.addEventListener('alpine:init', () => {
 
     async createSession() {
       try {
+        // Create new session with empty model to force user selection
         const data = await api.post('/sessions', {
           root_path: '',
-          backend: localStorage.getItem('datahoarder_backend') || 'ollama',
-          model: localStorage.getItem('datahoarder_model') || 'gemma3:12b',
-          workers: parseInt(localStorage.getItem('datahoarder_workers') || '1', 10),
+          backend: 'ollama',
+          model: '',
+          workers: 1,
         });
         Alpine.store('session').loadFrom(data);
+        // Clear localStorage so new session doesn't inherit old settings
+        localStorage.removeItem('datahoarder_model');
+        localStorage.removeItem('datahoarder_folder');
+        localStorage.removeItem('datahoarder_workers');
         Alpine.store('app').tab = 'setup';
         Alpine.store('app').toast('New session created. Configure your settings and run the pipeline.', 'success');
       } catch (e) {
@@ -548,7 +553,8 @@ document.addEventListener('alpine:init', () => {
 
     async load() {
       try {
-        const data = await api.get(`/duplicates?page=${this.page}&per_page=20`);
+        const sid = Alpine.store('session').current_session_id;
+        const data = await api.get(`/duplicates?page=${this.page}&per_page=20&session_id=${sid}`);
         this.groups = data.items;
         this.total = data.total;
       } catch (e) {
@@ -587,7 +593,7 @@ document.addEventListener('alpine:init', () => {
    * -------------------------------------------------------- */
   Alpine.data('setup', () => ({
     selectedFolder: localStorage.getItem('datahoarder_folder') || '',
-    selectedModel: localStorage.getItem('datahoarder_model') || 'gemma3:12b',
+    selectedModel: localStorage.getItem('datahoarder_model') || '',
     selectedBackend: localStorage.getItem('datahoarder_backend') || 'ollama',
     selectedWorkers: parseInt(localStorage.getItem('datahoarder_workers') || '1', 10),
     customModel: '',
@@ -845,12 +851,13 @@ document.addEventListener('alpine:init', () => {
     },
 
     getSettings() {
+      const session = Alpine.store('session');
       return {
-        rootPath: localStorage.getItem('datahoarder_folder') || '',
-        model: localStorage.getItem('datahoarder_model') || 'gemma3:12b',
-        backend: localStorage.getItem('datahoarder_backend') || 'ollama',
-        workers: parseInt(localStorage.getItem('datahoarder_workers') || '1', 10),
-        session_id: Alpine.store('session').current_session_id || '',
+        rootPath: session.root_path || localStorage.getItem('datahoarder_folder') || '',
+        model: session.model || localStorage.getItem('datahoarder_model') || '',
+        backend: session.backend || localStorage.getItem('datahoarder_backend') || 'ollama',
+        workers: session.workers || parseInt(localStorage.getItem('datahoarder_workers') || '1', 10),
+        session_id: session.current_session_id || '',
       };
     },
 
@@ -884,6 +891,12 @@ document.addEventListener('alpine:init', () => {
             Alpine.store('app').toast(`Dedup complete: ${exactGroups} exact + ${percGroups} perceptual groups`, 'success');
             break;
           case 'analyze':
+            if (!settings.model || settings.model === '') {
+              Alpine.store('app').toast('Please select a model in the Setup tab before analyzing', 'error');
+              this.running = null;
+              Alpine.store('app').loading = false;
+              return;
+            }
             data = await this.runAnalyzeWithProgress(settings);
             Alpine.store('app').toast(
               `Analyze complete: ${data.analyzed || 0} analyzed, ${data.skipped || 0} skipped, ${data.errors || 0} errors`,
@@ -895,7 +908,7 @@ document.addEventListener('alpine:init', () => {
             Alpine.store('app').toast(`Propose complete: ${data.rename || 0} renames + ${data.tags || 0} tags`, 'success');
             break;
           case 'execute-dry':
-            data = await api.post('/execute?dry_run=true');
+            data = await api.post('/execute', { session_id: settings.session_id, dry_run: true });
             Alpine.store('app').toast('Dry run complete — review results below', 'success');
             break;
           case 'execute-commit':
@@ -904,7 +917,7 @@ document.addEventListener('alpine:init', () => {
               Alpine.store('app').loading = false;
               return;
             }
-            data = await api.post('/execute?dry_run=false');
+            data = await api.post('/execute', { session_id: settings.session_id, dry_run: false });
             Alpine.store('app').toast('Changes applied to disk', 'success');
             break;
         }
