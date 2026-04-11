@@ -123,6 +123,7 @@ class CreateSessionRequest(BaseModel):
     backend: str = "ollama"
     model: str = "gemma3:12b"
     workers: int = 1
+    preferred_language: str = "leave_as_is"
 
 
 class SaveSessionRequest(BaseModel):
@@ -149,6 +150,7 @@ def create_session(body: CreateSessionRequest):
             backend=body.backend,
             model=body.model,
             workers=body.workers,
+            preferred_language=body.preferred_language,
             status=SessionStatus.NEW,
             is_unsaved=False,
         )
@@ -163,6 +165,7 @@ def create_session(body: CreateSessionRequest):
             "name": user_session.name,
             "created_at": user_session.created_at.isoformat(),
             "status": user_session.status.value,
+            "preferred_language": user_session.preferred_language,
         }
 
 
@@ -218,6 +221,7 @@ def list_sessions():
                 "backend": s.backend,
                 "model": s.model,
                 "workers": s.workers,
+                "preferred_language": s.preferred_language,
             })
 
     return {"items": items, "total": len(items)}
@@ -262,6 +266,7 @@ def get_session_detail(session_id: str):
             "backend": user_session.backend,
             "model": user_session.model,
             "workers": user_session.workers,
+            "preferred_language": user_session.preferred_language,
             "status": user_session.status.value,
             "is_unsaved": user_session.is_unsaved,
             "stats": user_session.stats,
@@ -881,19 +886,15 @@ def trigger_scan(body: PipelineRequest):
 
 @router.post("/pipeline/enrich")
 def trigger_enrich(body: PipelineRequest = PipelineRequest()):
-    from datahoarder.core.enricher import enrich as do_enrich
-    import io
-    import contextlib
+    """Start an enrich background job. Returns job_id immediately."""
+    from datahoarder.core.jobs import job_manager
 
     try:
         sid = _require_session_id(body.session_id)
-
-        # Suppress stdout to prevent Rich progress bar Unicode errors in web context
-        with contextlib.redirect_stdout(io.StringIO()):
-            counts = do_enrich(session_id=sid)
-
-        _mark_session_unsaved(sid, step="enrich")
-        return counts
+        job_id = job_manager.start_enrich(session_id=sid)
+        return {"job_id": job_id, "status": "started"}
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
     except HTTPException:
         raise
     except Exception as exc:
@@ -925,61 +926,102 @@ def trigger_dedup(body: PipelineRequest = PipelineRequest()):
 
 @router.post("/pipeline/analyze")
 def trigger_analyze(body: PipelineRequest):
-    from datahoarder.ai.router import init_ai
-    from datahoarder.analyzers.pipeline import analyze as do_analyze
-    import io
-    import contextlib
+    """Start an analyze background job. Returns job_id immediately."""
+    from datahoarder.core.jobs import job_manager
 
     try:
         sid = _require_session_id(body.session_id)
-        init_ai(
+        job_id = job_manager.start_analyze(
+            session_id=sid,
             backend=body.backend,
-            text_model=body.model,
-            vision_model=body.model,
+            model=body.model,
+            workers=body.workers,
         )
+        return {"job_id": job_id, "status": "started"}
     except RuntimeError as exc:
-        raise HTTPException(503, str(exc))
-
-    try:
-        # Suppress stdout to prevent Rich progress bar Unicode errors in web context
-        with contextlib.redirect_stdout(io.StringIO()):
-            counts = do_analyze(workers=body.workers, session_id=sid)
-
-        _mark_session_unsaved(sid, step="analyze")
-        return counts
+        raise HTTPException(409, str(exc))
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(500, f"Analyze failed: {str(exc)}")
 
 
-@router.post("/pipeline/analyze-stream")
-def trigger_analyze_stream(body: PipelineRequest):
-    """Analyze with Server-Sent Events for real-time progress reporting."""
-    from datahoarder.ai.router import init_ai
-    from datahoarder.analyzers.pipeline import analyze_with_progress
-    import io
-    import contextlib
+# ---------------------------------------------------------------------------
+# Job control endpoints (pause, resume, stream, active)
+# ---------------------------------------------------------------------------
 
-    sid = _require_session_id(body.session_id)
+@router.get("/pipeline/jobs/active")
+def get_active_job():
+    """Return the currently active background job, if any."""
+    from datahoarder.core.jobs import job_manager
+    job = job_manager.get_active()
+    if job:
+        return job.to_dict()
+    return {"job_id": None}
 
-    try:
-        init_ai(
-            backend=body.backend,
-            text_model=body.model,
-            vision_model=body.model,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(503, str(exc))
+
+@router.get("/pipeline/jobs/{job_id}")
+def get_job_status(job_id: str):
+    """Return status of a specific job."""
+    from datahoarder.core.jobs import job_manager
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(404, f"Job {job_id} not found")
+    return job.to_dict()
+
+
+@router.get("/pipeline/jobs/{job_id}/stream")
+def stream_job_progress(job_id: str):
+    """SSE stream of job progress. Reconnectable after page refresh."""
+    from datahoarder.core.jobs import job_manager
+
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(404, f"Job {job_id} not found")
 
     def generate():
         try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                for progress in analyze_with_progress(workers=body.workers, session_id=sid):
-                    yield f"data: {json.dumps(progress)}\n\n"
-            _mark_session_unsaved(sid, step="analyze")
+            for progress in job_manager.subscribe(job_id):
+                yield f"data: {json.dumps(progress)}\n\n"
+        except KeyError:
+            yield f"data: {json.dumps({'error': 'Job not found'})}\n\n"
         except Exception as exc:
             yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@router.post("/pipeline/jobs/{job_id}/pause")
+def pause_job(job_id: str):
+    """Pause a running job."""
+    from datahoarder.core.jobs import job_manager
+    try:
+        job_manager.pause(job_id)
+        return {"status": "paused", "job_id": job_id}
+    except (KeyError, RuntimeError) as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.post("/pipeline/jobs/{job_id}/resume")
+def resume_job(job_id: str):
+    """Resume a paused job."""
+    from datahoarder.core.jobs import job_manager
+    try:
+        job_manager.resume(job_id)
+        return {"status": "resumed", "job_id": job_id}
+    except (KeyError, RuntimeError) as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.post("/pipeline/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    """Cancel a running or paused job."""
+    from datahoarder.core.jobs import job_manager
+    try:
+        job_manager.cancel(job_id)
+        return {"status": "cancelling", "job_id": job_id}
+    except (KeyError, RuntimeError) as exc:
+        raise HTTPException(400, str(exc))
 
 
 @router.post("/pipeline/propose")
@@ -1000,6 +1042,32 @@ def trigger_propose(body: PipelineRequest = PipelineRequest()):
         raise
     except Exception as exc:
         raise HTTPException(500, f"Propose failed: {str(exc)}")
+
+
+@router.post("/pipeline/organize")
+def trigger_organize(body: PipelineRequest = PipelineRequest()):
+    """Use LLM to suggest folder reorganization based on file analysis."""
+    from datahoarder.ai.router import init_ai
+    from datahoarder.proposals.organizer import generate_reorg_proposals
+
+    try:
+        sid = _require_session_id(body.session_id)
+        init_ai(
+            backend=body.backend,
+            text_model=body.model,
+            vision_model=body.model,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
+
+    try:
+        counts = generate_reorg_proposals(session_id=sid)
+        _mark_session_unsaved(sid, step="organize")
+        return counts
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"Organize failed: {str(exc)}")
 
 
 # ---------------------------------------------------------------------------
@@ -1272,28 +1340,43 @@ def delete_ollama_model(body: PullModelRequest):
         raise HTTPException(500, f"Delete failed: {exc}")
 
 
+class StartOllamaRequest(BaseModel):
+    num_parallel: Optional[int] = None
+
+
+def _start_ollama_process(ollama_path: str, num_parallel: int | None = None):
+    """Start the Ollama server process with optional OLLAMA_NUM_PARALLEL."""
+    env = os.environ.copy()
+    if num_parallel and num_parallel > 1:
+        env["OLLAMA_NUM_PARALLEL"] = str(num_parallel)
+
+    if platform.system() == "Windows":
+        subprocess.Popen(
+            [ollama_path, "serve"],
+            env=env,
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        subprocess.Popen(
+            [ollama_path, "serve"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+
 @router.post("/ollama/start")
-def start_ollama():
+def start_ollama(body: StartOllamaRequest = StartOllamaRequest()):
     """Attempt to start the Ollama server."""
     ollama_path = shutil.which("ollama")
     if not ollama_path:
         raise HTTPException(404, "Ollama not found. Install from https://ollama.com/download")
 
     try:
-        if platform.system() == "Windows":
-            subprocess.Popen(
-                [ollama_path, "serve"],
-                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        else:
-            subprocess.Popen(
-                [ollama_path, "serve"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+        _start_ollama_process(ollama_path, body.num_parallel)
 
         # Give it a moment to start
         import time
@@ -1310,6 +1393,53 @@ def start_ollama():
         return {"status": "starting", "message": "Ollama is starting up..."}
     except Exception as exc:
         raise HTTPException(500, f"Failed to start Ollama: {exc}")
+
+
+@router.post("/ollama/restart")
+def restart_ollama(body: StartOllamaRequest = StartOllamaRequest()):
+    """Stop and restart Ollama with updated settings (e.g. OLLAMA_NUM_PARALLEL)."""
+    ollama_path = shutil.which("ollama")
+    if not ollama_path:
+        raise HTTPException(404, "Ollama not found. Install from https://ollama.com/download")
+
+    import time
+
+    # Stop the running Ollama process
+    try:
+        if platform.system() == "Windows":
+            subprocess.run(["taskkill", "/f", "/im", "ollama.exe"],
+                           capture_output=True, timeout=10)
+            # Also kill the runner process
+            subprocess.run(["taskkill", "/f", "/im", "ollama_llama_server.exe"],
+                           capture_output=True, timeout=10)
+        else:
+            subprocess.run(["pkill", "-f", "ollama serve"],
+                           capture_output=True, timeout=10)
+    except Exception:
+        pass  # Process may not be running
+
+    time.sleep(1)
+
+    # Start with new settings
+    try:
+        _start_ollama_process(ollama_path, body.num_parallel)
+        time.sleep(3)
+
+        # Verify it started
+        try:
+            resp = httpx.get(f"{OLLAMA_HOST}/api/version", timeout=5)
+            if resp.status_code == 200:
+                return {
+                    "status": "restarted",
+                    "version": resp.json().get("version"),
+                    "num_parallel": body.num_parallel,
+                }
+        except Exception:
+            pass
+
+        return {"status": "restarting", "message": "Ollama is restarting..."}
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to restart Ollama: {exc}")
 
 
 # ---------------------------------------------------------------------------

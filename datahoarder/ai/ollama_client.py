@@ -9,6 +9,7 @@ Ollama API docs: https://github.com/ollama/ollama/blob/main/docs/api.md
 """
 import base64
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -164,18 +165,35 @@ class OllamaClient:
                 raw = raw[4:]
         raw = raw.strip()
 
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            # Last resort: try to extract the first {...} block
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if start != -1 and end != -1:
+        # LLMs often produce Windows-style backslashes in paths (e.g. LOGOS\תנורים)
+        # which are invalid JSON escapes. Fix them before parsing.
+        def _fix_json(text: str) -> str:
+            return re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', text)
+
+        for attempt_raw in (raw, _fix_json(raw)):
+            try:
+                return json.loads(attempt_raw)
+            except json.JSONDecodeError:
+                pass
+
+        # Try to extract a JSON array [...] or object {...}
+        for attempt_raw in (raw, _fix_json(raw)):
+            arr_start = attempt_raw.find("[")
+            arr_end = attempt_raw.rfind("]")
+            if arr_start != -1 and arr_end != -1:
                 try:
-                    return json.loads(raw[start : end + 1])
+                    return json.loads(attempt_raw[arr_start : arr_end + 1])
                 except json.JSONDecodeError:
                     pass
-            return {"raw_response": raw}
+            start = attempt_raw.find("{")
+            end = attempt_raw.rfind("}")
+            if start != -1 and end != -1:
+                try:
+                    return json.loads(attempt_raw[start : end + 1])
+                except json.JSONDecodeError:
+                    pass
+
+        return {"raw_response": raw}
 
     def close(self):
         self._client.close()

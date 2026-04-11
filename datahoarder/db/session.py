@@ -10,6 +10,26 @@ _engine: Engine | None = None
 _SessionLocal: sessionmaker | None = None
 
 
+def _migrate_add_columns(engine: Engine, inspector) -> None:
+    """Add any missing columns to existing tables (SQLite doesn't do this automatically)."""
+    from sqlalchemy import text
+
+    # Define expected columns for each table: (table, column, sql_type, default)
+    migrations = [
+        ("sessions", "preferred_language", "VARCHAR", "'leave_as_is'"),
+    ]
+
+    for table, column, sql_type, default in migrations:
+        if table not in inspector.get_table_names():
+            continue
+        existing_cols = {c["name"] for c in inspector.get_columns(table)}
+        if column not in existing_cols:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {sql_type} DEFAULT {default}"
+                ))
+
+
 def init_db(db_path: Path) -> Engine:
     """Create engine, run migrations, return engine. Call once at startup."""
     global _engine, _SessionLocal
@@ -30,6 +50,11 @@ def init_db(db_path: Path) -> Engine:
         Base.metadata.drop_all(_engine)
 
     Base.metadata.create_all(_engine)
+
+    # Add any missing columns to existing tables
+    inspector = inspect(_engine)
+    _migrate_add_columns(_engine, inspector)
+
     _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
     return _engine
 

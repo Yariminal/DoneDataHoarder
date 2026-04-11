@@ -35,6 +35,7 @@ document.addEventListener('alpine:init', () => {
     backend: 'ollama',
     model: '',
     workers: 1,
+    preferred_language: 'leave_as_is',
     stats: {},
     file_count: 0,
     proposal_count: 0,
@@ -61,6 +62,7 @@ document.addEventListener('alpine:init', () => {
       this.updated_at = null;
       this.last_saved_at = null;
       this.root_path = '';
+      this.preferred_language = 'leave_as_is';
       this.stats = {};
       this.file_count = 0;
       this.proposal_count = 0;
@@ -78,6 +80,7 @@ document.addEventListener('alpine:init', () => {
       this.backend = data.backend || 'ollama';
       this.model = data.model || '';
       this.workers = data.workers || 1;
+      this.preferred_language = data.preferred_language || 'leave_as_is';
       this.stats = data.stats || {};
       this.file_count = data.file_count || 0;
       this.proposal_count = data.proposal_count || 0;
@@ -122,8 +125,12 @@ document.addEventListener('alpine:init', () => {
   /* ----------------------------------------------------------
    * Refresh helper — reloads all data tabs after pipeline ops
    * -------------------------------------------------------- */
+  // Track a global "data version" — bumped after every pipeline action.
+  // Tabs check this on activation to know if they need to reload.
+  window._dataVersion = 0;
+
   window.refreshAllTabs = async function () {
-    // Dispatch a custom event that all components can listen for
+    window._dataVersion++;
     document.dispatchEvent(new CustomEvent('datahoarder:refresh'));
   };
 
@@ -188,6 +195,7 @@ document.addEventListener('alpine:init', () => {
           backend: 'ollama',
           model: '',
           workers: 1,
+          preferred_language: localStorage.getItem('datahoarder_preferred_language') || 'leave_as_is',
         });
         Alpine.store('session').loadFrom(data);
         // Clear localStorage so new session doesn't inherit old settings
@@ -210,6 +218,7 @@ document.addEventListener('alpine:init', () => {
         if (data.model) localStorage.setItem('datahoarder_model', data.model);
         if (data.backend) localStorage.setItem('datahoarder_backend', data.backend);
         if (data.workers) localStorage.setItem('datahoarder_workers', String(data.workers));
+        if (data.preferred_language) localStorage.setItem('datahoarder_preferred_language', data.preferred_language);
         Alpine.store('app').tab = 'dashboard';
         Alpine.store('app').toast(`Loaded session: ${data.name || 'Unnamed Session'}`, 'success');
         // Refresh all data tabs
@@ -331,13 +340,18 @@ document.addEventListener('alpine:init', () => {
    * -------------------------------------------------------- */
   Alpine.data('dashboard', () => ({
     stats: null,
+    _loadedVersion: -1,
     async init() {
       await this.load();
       document.addEventListener('datahoarder:refresh', () => this.load());
+      this.$watch(() => Alpine.store('app').tab, (tab) => {
+        if (tab === 'dashboard' && this._loadedVersion < window._dataVersion) this.load();
+      });
     },
     async load() {
       try {
         this.stats = await api.get('/stats');
+        this._loadedVersion = window._dataVersion;
       } catch (e) {
         Alpine.store('app').toast('Failed to load stats', 'error');
       }
@@ -377,12 +391,16 @@ document.addEventListener('alpine:init', () => {
     mimeFilter: '',
     selectedFile: null,
     showModal: false,
+    _loadedVersion: -1,
     ...resultsMixin,
 
     async init() {
       await this.initResults();
       await this.load();
       document.addEventListener('datahoarder:refresh', () => this.load());
+      this.$watch(() => Alpine.store('app').tab, (tab) => {
+        if (tab === 'files' && this._loadedVersion < window._dataVersion) this.load();
+      });
     },
 
     async load() {
@@ -394,6 +412,7 @@ document.addEventListener('alpine:init', () => {
         const data = await api.get(url);
         this.files = data.items;
         this.total = data.total;
+        this._loadedVersion = window._dataVersion;
       } catch (e) {
         Alpine.store('app').toast('Failed to load files', 'error');
       }
@@ -445,12 +464,16 @@ document.addEventListener('alpine:init', () => {
     search: '',
     minConfidence: 0,
     bulkConfidence: 80,
+    _loadedVersion: -1,
     ...resultsMixin,
 
     async init() {
       await this.initResults();
       await this.load();
       document.addEventListener('datahoarder:refresh', () => this.load());
+      this.$watch(() => Alpine.store('app').tab, (tab) => {
+        if (tab === 'proposals' && this._loadedVersion < window._dataVersion) this.load();
+      });
     },
 
     async load() {
@@ -463,6 +486,7 @@ document.addEventListener('alpine:init', () => {
         const data = await api.get(url);
         this.proposals = data.items;
         this.total = data.total;
+        this._loadedVersion = window._dataVersion;
       } catch (e) {
         Alpine.store('app').toast('Failed to load proposals', 'error');
       }
@@ -543,12 +567,16 @@ document.addEventListener('alpine:init', () => {
     groups: [],
     total: 0,
     page: 1,
+    _loadedVersion: -1,
     ...resultsMixin,
 
     async init() {
       await this.initResults();
       await this.load();
       document.addEventListener('datahoarder:refresh', () => this.load());
+      this.$watch(() => Alpine.store('app').tab, (tab) => {
+        if (tab === 'duplicates' && this._loadedVersion < window._dataVersion) this.load();
+      });
     },
 
     async load() {
@@ -557,6 +585,7 @@ document.addEventListener('alpine:init', () => {
         const data = await api.get(`/duplicates?page=${this.page}&per_page=20&session_id=${sid}`);
         this.groups = data.items;
         this.total = data.total;
+        this._loadedVersion = window._dataVersion;
       } catch (e) {
         Alpine.store('app').toast('Failed to load duplicates', 'error');
       }
@@ -596,6 +625,8 @@ document.addEventListener('alpine:init', () => {
     selectedModel: localStorage.getItem('datahoarder_model') || '',
     selectedBackend: localStorage.getItem('datahoarder_backend') || 'ollama',
     selectedWorkers: parseInt(localStorage.getItem('datahoarder_workers') || '1', 10),
+    numParallel: parseInt(localStorage.getItem('datahoarder_num_parallel') || '1', 10),
+    preferredLanguage: localStorage.getItem('datahoarder_preferred_language') || 'leave_as_is',
     customModel: '',
     showCustomModel: false,
     showBrowser: false,
@@ -679,6 +710,8 @@ document.addEventListener('alpine:init', () => {
       localStorage.setItem('datahoarder_model', this.selectedModel);
       localStorage.setItem('datahoarder_backend', this.selectedBackend);
       localStorage.setItem('datahoarder_workers', String(this.selectedWorkers));
+      localStorage.setItem('datahoarder_num_parallel', String(this.numParallel));
+      localStorage.setItem('datahoarder_preferred_language', this.preferredLanguage);
       // Sync to session store
       const session = Alpine.store('session');
       if (session.active) {
@@ -686,6 +719,7 @@ document.addEventListener('alpine:init', () => {
         session.model = this.selectedModel;
         session.backend = this.selectedBackend;
         session.workers = this.selectedWorkers;
+        session.preferred_language = this.preferredLanguage;
       }
     },
 
@@ -827,12 +861,24 @@ document.addEventListener('alpine:init', () => {
 
     async startOllama() {
       try {
-        const res = await api.post('/ollama/start');
+        const res = await api.post('/ollama/start', { num_parallel: this.numParallel });
         Alpine.store('app').toast(res.status, 'success');
         await new Promise(r => setTimeout(r, 3000));
         await this.loadOllamaStatus();
       } catch (e) {
         Alpine.store('app').toast('Failed to start Ollama: ' + e.message, 'error');
+      }
+    },
+
+    async restartOllama() {
+      Alpine.store('app').toast('Restarting Ollama with NUM_PARALLEL=' + this.numParallel + '...', 'info');
+      try {
+        const res = await api.post('/ollama/restart', { num_parallel: this.numParallel });
+        Alpine.store('app').toast('Ollama ' + res.status + (res.num_parallel ? ' (parallel=' + res.num_parallel + ')' : ''), 'success');
+        await new Promise(r => setTimeout(r, 2000));
+        await this.loadOllamaStatus();
+      } catch (e) {
+        Alpine.store('app').toast('Failed to restart Ollama: ' + e.message, 'error');
       }
     },
   }));
@@ -843,11 +889,38 @@ document.addEventListener('alpine:init', () => {
   Alpine.data('pipeline', () => ({
     running: null,
     result: null,
-    // Analyze progress tracking
-    analyzeProgress: null,  // { current, total, analyzed, skipped, errors }
+    // Progress tracking for analyze and enrich (background jobs)
+    analyzeProgress: null,
+    enrichProgress: null,
+    progressStartTime: null,
+    // Background job state
+    activeJobId: null,
+    activeJobType: null,
+    jobState: null,  // 'running', 'paused', 'completed', 'failed', 'cancelled'
+    _eventSource: null,
 
     async init() {
-      // Nothing to init — settings come from localStorage via Setup tab
+      // Check for an active background job (reconnect after page refresh)
+      await this.checkActiveJob();
+    },
+
+    async checkActiveJob() {
+      try {
+        const data = await api.get('/pipeline/jobs/active');
+        if (data.job_id) {
+          this.activeJobId = data.job_id;
+          this.activeJobType = data.job_type;
+          this.jobState = data.state;
+          this.running = data.job_type;
+          this.progressStartTime = Date.now();
+          if (data.progress) {
+            if (data.job_type === 'analyze') this.analyzeProgress = data.progress;
+            else if (data.job_type === 'enrich') this.enrichProgress = data.progress;
+          }
+          // Reconnect SSE stream
+          this._connectJobStream(data.job_id, data.job_type);
+        }
+      } catch (e) { /* ignore */ }
     },
 
     getSettings() {
@@ -857,14 +930,26 @@ document.addEventListener('alpine:init', () => {
         model: session.model || localStorage.getItem('datahoarder_model') || '',
         backend: session.backend || localStorage.getItem('datahoarder_backend') || 'ollama',
         workers: session.workers || parseInt(localStorage.getItem('datahoarder_workers') || '1', 10),
+        preferredLanguage: session.preferred_language || localStorage.getItem('datahoarder_preferred_language') || 'leave_as_is',
         session_id: session.current_session_id || '',
       };
     },
 
     async runStep(step) {
+      // Prevent starting a new step while a job is active
+      if (this.activeJobId && (this.jobState === 'running' || this.jobState === 'paused')) {
+        Alpine.store('app').toast('A job is already running. Pause or wait for it to finish.', 'error');
+        return;
+      }
+
       this.running = step;
       this.result = null;
       this.analyzeProgress = null;
+      this.enrichProgress = null;
+      this.progressStartTime = null;
+      this.activeJobId = null;
+      this.activeJobType = null;
+      this.jobState = null;
       Alpine.store('app').loading = true;
       const settings = this.getSettings();
       try {
@@ -881,9 +966,8 @@ document.addEventListener('alpine:init', () => {
             Alpine.store('app').toast(`Scan complete: ${data.new || 0} new files, ${data.skipped || 0} skipped`, 'success');
             break;
           case 'enrich':
-            data = await api.post('/pipeline/enrich', { session_id: settings.session_id });
-            Alpine.store('app').toast(`Enrich complete: ${data.enriched || 0} files enriched`, 'success');
-            break;
+            data = await this._startBackgroundJob('enrich', settings);
+            return;  // _connectJobStream handles the rest
           case 'dedup':
             data = await api.post('/pipeline/dedup', { session_id: settings.session_id });
             const exactGroups = data.exact?.groups || 0;
@@ -897,15 +981,25 @@ document.addEventListener('alpine:init', () => {
               Alpine.store('app').loading = false;
               return;
             }
-            data = await this.runAnalyzeWithProgress(settings);
-            Alpine.store('app').toast(
-              `Analyze complete: ${data.analyzed || 0} analyzed, ${data.skipped || 0} skipped, ${data.errors || 0} errors`,
-              'success'
-            );
-            break;
+            data = await this._startBackgroundJob('analyze', settings);
+            return;  // _connectJobStream handles the rest
           case 'propose':
             data = await api.post('/pipeline/propose', { session_id: settings.session_id });
             Alpine.store('app').toast(`Propose complete: ${data.rename || 0} renames + ${data.tags || 0} tags`, 'success');
+            break;
+          case 'organize':
+            if (!settings.model || settings.model === '') {
+              Alpine.store('app').toast('Please select a model in the Setup tab before organizing', 'error');
+              this.running = null;
+              Alpine.store('app').loading = false;
+              return;
+            }
+            data = await api.post('/pipeline/organize', {
+              session_id: settings.session_id,
+              backend: settings.backend,
+              model: settings.model,
+            });
+            Alpine.store('app').toast(`Organize complete: ${data.move || 0} move proposals generated`, 'success');
             break;
           case 'execute-dry':
             data = await api.post('/execute', { session_id: settings.session_id, dry_run: true });
@@ -926,92 +1020,156 @@ document.addEventListener('alpine:init', () => {
         Alpine.store('app').toast(`${step} failed: ${e.message}`, 'error');
         this.result = { error: e.message };
       } finally {
-        this.running = null;
-        this.analyzeProgress = null;
-        Alpine.store('app').loading = false;
-        // Refresh session state (marks unsaved, updates stats)
-        const sid = Alpine.store('session').current_session_id;
-        if (sid) {
-          try {
-            const sessData = await api.get(`/sessions/${sid}`);
-            Alpine.store('session').loadFrom(sessData);
-          } catch (e) { /* ignore */ }
+        if (step !== 'analyze' && step !== 'enrich') {
+          this.running = null;
+          Alpine.store('app').loading = false;
+          await this._refreshAfterStep();
         }
-        // Refresh all data tabs
-        await refreshAllTabs();
       }
     },
 
-    async runAnalyzeWithProgress(settings) {
-      // Use SSE endpoint for real-time progress
-      const response = await fetch('/api/pipeline/analyze-stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          backend: settings.backend,
-          model: settings.model,
-          workers: settings.workers,
-          session_id: settings.session_id || '',
-        }),
-      });
+    async _startBackgroundJob(type, settings) {
+      // Start the background job via POST — returns immediately with job_id
+      const body = { session_id: settings.session_id || '' };
+      if (type === 'analyze') {
+        body.backend = settings.backend;
+        body.model = settings.model;
+        body.workers = settings.workers;
+      }
+      const res = await api.post(`/pipeline/${type}`, body);
+      this.activeJobId = res.job_id;
+      this.activeJobType = type;
+      this.jobState = 'running';
+      this.progressStartTime = Date.now();
+      Alpine.store('app').loading = false;
 
-      if (!response.ok) {
-        throw new Error(`${response.status} ${response.statusText}`);
+      // Connect to the SSE stream for progress
+      this._connectJobStream(res.job_id, type);
+      return res;
+    },
+
+    _connectJobStream(jobId, type) {
+      // Close any existing connection
+      if (this._eventSource) {
+        this._eventSource.close();
+        this._eventSource = null;
       }
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let finalResult = null;
+      const es = new EventSource(`/api/pipeline/jobs/${jobId}/stream`);
+      this._eventSource = es;
 
-      while (true) {
-        const { done, value } = await reader.read();
+      es.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
 
-        if (value) {
-          buffer += decoder.decode(value, { stream: true });
-        }
+          // Skip heartbeats
+          if (data.heartbeat) return;
 
-        if (done) {
-          buffer += decoder.decode();
-          // Process remaining buffer
-          const lines = buffer.split('\n');
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              try {
-                const data = JSON.parse(line.slice(6));
-                if (data.done) finalResult = data;
-                else this.analyzeProgress = data;
-              } catch (e) {}
-            }
+          // Update progress
+          if (type === 'analyze') this.analyzeProgress = data;
+          else if (type === 'enrich') this.enrichProgress = data;
+
+          // Update job state if provided
+          if (data.state) this.jobState = data.state;
+
+          // Handle completion
+          if (data.done) {
+            es.close();
+            this._eventSource = null;
+            this._onJobComplete(type, data);
           }
-          break;
-        }
+        } catch (e) { /* ignore parse errors */ }
+      };
 
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6));
-              if (data.done) {
-                finalResult = data;
-              } else if (data.error) {
-                throw new Error(data.error);
-              } else {
-                this.analyzeProgress = data;
-              }
-            } catch (e) {
-              if (e.message && !e.message.includes('JSON')) throw e;
-            }
-          }
+      es.onerror = () => {
+        // EventSource will auto-reconnect; no action needed
+        // But if the job is done, clean up
+        if (this.jobState === 'completed' || this.jobState === 'failed' || this.jobState === 'cancelled') {
+          es.close();
+          this._eventSource = null;
         }
+      };
+    },
+
+    async _onJobComplete(type, data) {
+      const state = data.state || 'completed';
+      this.jobState = state;
+
+      if (state === 'completed') {
+        if (type === 'analyze') {
+          Alpine.store('app').toast(
+            `Analyze complete: ${data.analyzed || 0} analyzed, ${data.skipped || 0} skipped, ${data.errors || 0} errors`,
+            'success'
+          );
+        } else if (type === 'enrich') {
+          Alpine.store('app').toast(`Enrich complete: ${data.enriched || 0} files enriched`, 'success');
+        }
+      } else if (state === 'failed') {
+        Alpine.store('app').toast(`${type} failed: ${data.error || 'Unknown error'}`, 'error');
+      } else if (state === 'cancelled') {
+        Alpine.store('app').toast(`${type} cancelled`, 'info');
       }
 
-      if (finalResult) {
-        return finalResult;
+      this.result = data;
+      this.running = null;
+      this.activeJobId = null;
+      this.activeJobType = null;
+      this.analyzeProgress = null;
+      this.enrichProgress = null;
+      this.progressStartTime = null;
+
+      await this._refreshAfterStep();
+    },
+
+    async _refreshAfterStep() {
+      // Refresh session state
+      const sid = Alpine.store('session').current_session_id;
+      if (sid) {
+        try {
+          const sessData = await api.get(`/sessions/${sid}`);
+          Alpine.store('session').loadFrom(sessData);
+        } catch (e) { /* ignore */ }
       }
-      throw new Error('Analyze stream ended without final result');
+      await refreshAllTabs();
+    },
+
+    async pauseJob() {
+      if (!this.activeJobId) return;
+      try {
+        await api.post(`/pipeline/jobs/${this.activeJobId}/pause`);
+        this.jobState = 'paused';
+        Alpine.store('app').toast('Job paused', 'info');
+      } catch (e) {
+        Alpine.store('app').toast('Failed to pause: ' + e.message, 'error');
+      }
+    },
+
+    async resumeJob() {
+      if (!this.activeJobId) return;
+      try {
+        await api.post(`/pipeline/jobs/${this.activeJobId}/resume`);
+        this.jobState = 'running';
+        Alpine.store('app').toast('Job resumed', 'success');
+      } catch (e) {
+        Alpine.store('app').toast('Failed to resume: ' + e.message, 'error');
+      }
+    },
+
+    async cancelJob() {
+      if (!this.activeJobId) return;
+      try {
+        await api.post(`/pipeline/jobs/${this.activeJobId}/cancel`);
+        Alpine.store('app').toast('Cancelling job...', 'info');
+      } catch (e) {
+        Alpine.store('app').toast('Failed to cancel: ' + e.message, 'error');
+      }
+    },
+
+    filesPerMin(progress) {
+      if (!this.progressStartTime || !progress || !progress.current) return null;
+      const elapsed = (Date.now() - this.progressStartTime) / 1000;
+      if (elapsed < 1) return null;
+      return (progress.current / elapsed * 60).toFixed(1);
     },
   }));
 

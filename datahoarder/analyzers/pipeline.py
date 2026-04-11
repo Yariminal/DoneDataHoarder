@@ -4,10 +4,11 @@ Analysis pipeline — orchestrates all analyzers across ENRICHED files.
 Picks the right analyzer per file, runs it, saves results.
 Supports batched parallel processing via ThreadPoolExecutor.
 """
+import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 from rich.progress import (
     BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
@@ -133,10 +134,13 @@ def analyze(
 
         while True:
             with Session(engine) as session:
+                # Always query from offset 0: processed files change status
+                # and no longer match the ENRICHED filter, so the result set
+                # naturally shrinks each iteration.
                 a_q = session.query(File.id).filter(File.status == FileStatus.ENRICHED)
                 if session_id:
                     a_q = a_q.filter(File.session_id == session_id)
-                batch = a_q.limit(QUERY_BATCH).offset(offset).all()
+                batch = a_q.limit(QUERY_BATCH).all()
             if not batch:
                 break
 
@@ -161,7 +165,6 @@ def analyze(
 
             if limit and processed >= limit:
                 break
-            offset += QUERY_BATCH
 
     return counts
 
@@ -172,6 +175,8 @@ def analyze_with_progress(
     min_size_kb: int = 0,
     skip_extensions: Optional[set[str]] = None,
     session_id: str | None = None,
+    pause_event: threading.Event | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ):
     """
     Same as analyze() but yields progress dicts for SSE streaming.
@@ -246,15 +251,16 @@ def analyze_with_progress(
                 session.commit()
                 return file_id, "error", str(exc)
 
-    offset = 0
     processed = 0
 
     while True:
         with Session(engine) as session:
+            # Always query from offset 0: processed files change status
+            # and no longer match the ENRICHED filter.
             awp_q = session.query(File.id).filter(File.status == FileStatus.ENRICHED)
             if session_id:
                 awp_q = awp_q.filter(File.session_id == session_id)
-            batch = awp_q.limit(QUERY_BATCH).offset(offset).all()
+            batch = awp_q.limit(QUERY_BATCH).all()
         if not batch:
             break
 
@@ -263,15 +269,30 @@ def analyze_with_progress(
         with ThreadPoolExecutor(max_workers=max(workers, 1)) as pool:
             futures = {pool.submit(process_file_inner, fid): fid for fid in file_ids}
             for future in as_completed(futures):
+                # Check for cancel before processing result
+                if cancel_check and cancel_check():
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    yield {"cancelled": True, **counts}
+                    return
+
                 fid, status, error = future.result()
                 counts[status if status in counts else "errors"] += 1
                 processed += 1
                 yield {"current": processed, "total": total, **counts}
+
+                # Block if paused (between files)
+                if pause_event:
+                    pause_event.wait()
+
                 if limit and processed >= limit:
                     break
 
+        # Check cancel between batches
+        if cancel_check and cancel_check():
+            yield {"cancelled": True, **counts}
+            return
+
         if limit and processed >= limit:
             break
-        offset += QUERY_BATCH
 
     yield {"done": True, **counts}

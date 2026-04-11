@@ -7,9 +7,10 @@ Safe to re-run; already-enriched files are skipped.
 import hashlib
 import json
 import mimetypes
+import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from rich.progress import (
     BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
@@ -69,7 +70,13 @@ def _mime_type(path: Path) -> str:
     """Best-effort MIME type detection."""
     if _HAS_MAGIC:
         try:
-            return magic.from_file(str(path), mime=True)
+            result = magic.from_file(str(path), mime=True)
+            # Guard: libmagic on Windows sometimes returns error messages
+            # instead of raising exceptions (especially for Unicode paths).
+            # Valid MIME types look like "type/subtype", never start with
+            # error keywords.
+            if result and "/" in result and not result.startswith(("cannot ", "error", "failed")):
+                return result
         except Exception:
             pass
     # Fallback: stdlib mimetypes (extension-based)
@@ -177,13 +184,14 @@ def enrich(workers: int = 1, limit: Optional[int] = None, session_id: str | None
     ) as progress:
         task = progress.add_task("Enriching…", total=total)
 
-        offset = 0
         while True:
             with Session(engine) as session:
+                # Always query from offset 0: processed files change status
+                # and no longer match the PENDING filter.
                 enrich_q = session.query(File).filter(File.status == FileStatus.PENDING)
                 if session_id:
                     enrich_q = enrich_q.filter(File.session_id == session_id)
-                batch = enrich_q.limit(BATCH_SIZE).offset(offset).all()
+                batch = enrich_q.limit(BATCH_SIZE).all()
                 if not batch:
                     break
 
@@ -233,6 +241,101 @@ def enrich(workers: int = 1, limit: Optional[int] = None, session_id: str | None
 
             if limit and (counts["enriched"] + counts["errors"]) >= limit:
                 break
-            offset += BATCH_SIZE
 
     return counts
+
+
+def enrich_with_progress(
+    workers: int = 1,
+    limit: int | None = None,
+    session_id: str | None = None,
+    pause_event: "threading.Event | None" = None,
+    cancel_check: "Callable[[], bool] | None" = None,
+):
+    """
+    Like enrich() but yields progress dicts for SSE streaming.
+    """
+    engine = get_engine()
+    counts = {"enriched": 0, "errors": 0, "skipped": 0}
+
+    with Session(engine) as session:
+        query = session.query(File).filter(File.status == FileStatus.PENDING)
+        if session_id:
+            query = query.filter(File.session_id == session_id)
+        if limit:
+            query = query.limit(limit)
+        total = query.count()
+
+    if total == 0:
+        yield {"current": 0, "total": 0, "enriched": 0, "errors": 0, "skipped": 0, "done": True}
+        return
+
+    current = 0
+    while True:
+        with Session(engine) as session:
+            # Always query from offset 0: processed files change status
+            # and no longer match the PENDING filter.
+            enrich_q = session.query(File).filter(File.status == FileStatus.PENDING)
+            if session_id:
+                enrich_q = enrich_q.filter(File.session_id == session_id)
+            batch = enrich_q.limit(BATCH_SIZE).all()
+            if not batch:
+                break
+
+            for file_rec in batch:
+                # Check for cancel
+                if cancel_check and cancel_check():
+                    session.commit()
+                    yield {"cancelled": True, **counts}
+                    return
+
+                # Block if paused
+                if pause_event:
+                    pause_event.wait()
+
+                path = Path(file_rec.path)
+                current += 1
+
+                if not path.exists():
+                    file_rec.status = FileStatus.ERROR
+                    file_rec.error_message = "File not found on disk"
+                    counts["errors"] += 1
+                    yield {"current": current, "total": total, **counts}
+                    continue
+
+                try:
+                    file_rec.mime_type = _mime_type(path)
+                    mime = file_rec.mime_type or ""
+                    file_rec.hash_md5 = _md5(path)
+
+                    if mime.startswith("image/"):
+                        file_rec.date_exif = _exif_date(path)
+                        file_rec.hash_perceptual = _perceptual_hash(path)
+                    elif mime.startswith(("video/", "audio/")):
+                        file_rec.date_exif = _audio_date(path)
+
+                    file_rec.date_best = _best_date(
+                        file_rec.date_exif,
+                        file_rec.date_modified,
+                        file_rec.date_created,
+                    )
+
+                    file_rec.status = FileStatus.ENRICHED
+                    file_rec.enriched_at = datetime.utcnow()
+                    counts["enriched"] += 1
+                except Exception as exc:
+                    file_rec.status = FileStatus.ERROR
+                    file_rec.error_message = str(exc)[:500]
+                    counts["errors"] += 1
+
+                yield {"current": current, "total": total, **counts}
+
+            session.commit()
+
+        if cancel_check and cancel_check():
+            yield {"cancelled": True, **counts}
+            return
+        if limit and (counts["enriched"] + counts["errors"]) >= limit:
+            break
+
+    yield {"current": current, "total": total, **counts, "done": True}

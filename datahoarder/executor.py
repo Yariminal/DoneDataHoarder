@@ -125,6 +125,63 @@ def _apply_tags(proposal: Proposal, file_rec: File, dry_run: bool) -> tuple[bool
     return True, f"Tags written to {path.name}" if written else f"Tags noted for {path.name}"
 
 
+def _apply_move(proposal: Proposal, dry_run: bool) -> tuple[bool, str]:
+    """Move a file to a new directory on disk."""
+    src = Path(proposal.current_value)
+    dst = Path(proposal.proposed_value)
+
+    if not src.exists():
+        return False, f"Source not found: {src}"
+    if dst.exists():
+        return False, f"Destination already exists: {dst}"
+
+    if dry_run:
+        return True, f"[DRY RUN] Would move: {src} -> {dst}"
+
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+    except OSError as exc:
+        return False, str(exc)
+
+    return True, f"Moved: {src.name} -> {dst.parent.name}/{dst.name}"
+
+
+def _apply_rename_folder(proposal: Proposal, dry_run: bool, db_session: Session) -> tuple[bool, str]:
+    """Rename a folder on disk and update all File paths in the DB."""
+    src = Path(proposal.current_value)
+    dst = Path(proposal.proposed_value)
+
+    if not src.exists():
+        return False, f"Source folder not found: {src}"
+    if not src.is_dir():
+        return False, f"Not a directory: {src}"
+    if dst.exists() and dst != src:
+        return False, f"Destination already exists: {dst}"
+
+    if dry_run:
+        return True, f"[DRY RUN] Would rename folder: {src.name} -> {dst.name}"
+
+    try:
+        src.rename(dst)
+    except OSError as exc:
+        return False, f"Rename failed: {exc}"
+
+    # Update all File records whose paths start with the old folder path
+    src_str = str(src)
+    dst_str = str(dst)
+    files_in_folder = (
+        db_session.query(File)
+        .filter(File.path.like(f"{src_str}%"))
+        .all()
+    )
+    for f in files_in_folder:
+        f.path = f.path.replace(src_str, dst_str, 1)
+        f.filename = Path(f.path).name
+
+    return True, f"Renamed folder: {src.name} -> {dst.name} ({len(files_in_folder)} files updated)"
+
+
 def _delete_duplicate(file_id: int, dry_run: bool) -> tuple[bool, str]:
     """Move a duplicate to a .trash folder instead of hard-deleting."""
     engine = get_engine()
@@ -245,6 +302,22 @@ def execute(
         proposals = query.all()
         con.print(f"[bold]Processing {len(proposals)} proposals...[/bold]")
 
+        # Sort proposals: folder renames go FIRST (deepest paths first so
+        # children are renamed before their parents), then file operations.
+        def _sort_key(p):
+            if p.proposal_type == ProposalType.RENAME_FOLDER:
+                # Deepest paths first (most separators = most nested)
+                depth = (p.current_value or "").count("\\") + (p.current_value or "").count("/")
+                return (0, -depth)  # group 0, deepest first
+            elif p.proposal_type == ProposalType.RENAME:
+                return (1, 0)
+            elif p.proposal_type == ProposalType.MOVE:
+                return (2, 0)
+            else:
+                return (3, 0)
+
+        proposals.sort(key=_sort_key)
+
         for prop in proposals:
             file_rec = session.get(File, prop.file_id)
 
@@ -254,11 +327,47 @@ def execute(
                     if ok and not dry_run:
                         # Update File.path in DB to new location
                         if file_rec:
+                            old_path = file_rec.path
                             file_rec.path = prop.proposed_value
                             file_rec.filename = Path(prop.proposed_value).name
+                            # Cascade: update MOVE proposals that reference
+                            # this file's old path (since renames run before moves)
+                            for other in proposals:
+                                if other is prop or other.status == ProposalStatus.APPLIED:
+                                    continue
+                                if other.proposal_type == ProposalType.MOVE and other.file_id == prop.file_id:
+                                    if other.current_value == old_path:
+                                        # Update source path to new renamed path
+                                        other.current_value = prop.proposed_value
+                                        # Update destination to use new filename
+                                        old_dst = Path(other.proposed_value)
+                                        new_filename = Path(prop.proposed_value).name
+                                        other.proposed_value = str(old_dst.parent / new_filename)
 
                 elif prop.proposal_type == ProposalType.ADD_TAGS:
                     ok, msg = _apply_tags(prop, file_rec, dry_run)
+
+                elif prop.proposal_type == ProposalType.RENAME_FOLDER:
+                    ok, msg = _apply_rename_folder(prop, dry_run, session)
+                    # After a successful folder rename, update paths in all
+                    # remaining proposals that reference the old folder path
+                    if ok and not dry_run:
+                        old_prefix = prop.current_value
+                        new_prefix = prop.proposed_value
+                        for other in proposals:
+                            if other is prop or other.status == ProposalStatus.APPLIED:
+                                continue
+                            if other.current_value and old_prefix in other.current_value:
+                                other.current_value = other.current_value.replace(old_prefix, new_prefix, 1)
+                            if other.proposed_value and old_prefix in other.proposed_value:
+                                other.proposed_value = other.proposed_value.replace(old_prefix, new_prefix, 1)
+
+                elif prop.proposal_type == ProposalType.MOVE:
+                    ok, msg = _apply_move(prop, dry_run)
+                    if ok and not dry_run:
+                        if file_rec:
+                            file_rec.path = prop.proposed_value
+                            file_rec.filename = Path(prop.proposed_value).name
 
                 elif prop.proposal_type == ProposalType.MARK_DUPLICATE:
                     ok, msg = _delete_duplicate(prop.file_id, dry_run)
@@ -273,12 +382,13 @@ def execute(
                     if not dry_run:
                         prop.status = ProposalStatus.APPLIED
                         prop.applied_at = datetime.utcnow()
-                        if file_rec and prop.proposal_type == ProposalType.RENAME:
+                        if file_rec and prop.proposal_type in (ProposalType.RENAME, ProposalType.MOVE, ProposalType.RENAME_FOLDER):
                             file_rec.status = FileStatus.APPLIED
                     color = "green"
                 else:
                     counts["failed"] += 1
-                    prop.status = ProposalStatus.REJECTED
+                    if not dry_run:
+                        prop.status = ProposalStatus.REJECTED
                     color = "red"
 
                 con.print(f"  [{color}]{msg}[/{color}]")
