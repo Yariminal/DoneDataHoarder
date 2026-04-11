@@ -4,11 +4,10 @@ Gemini client — optional cloud AI backend (Google Gemini 2.0 Flash / Pro).
 Usage requires:  pip install google-generativeai
 and setting:     GEMINI_API_KEY environment variable (or passing api_key=).
 """
-import base64
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 try:
     import google.generativeai as genai
@@ -54,7 +53,7 @@ class GeminiClient:
         mime_type: str = "image/jpeg",
         temperature: float = 0.2,
     ) -> str:
-        parts = [prompt]
+        parts: list[Any] = [prompt]
 
         if image_path is not None:
             with open(image_path, "rb") as f:

@@ -11,7 +11,7 @@ from typing import Iterator
 
 from rich.progress import (
     BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
-    TaskProgressColumn, TextColumn, TimeElapsedColumn,
+    TextColumn, TimeElapsedColumn,
 )
 from sqlalchemy.orm import Session
 
@@ -144,7 +144,7 @@ def scan(
                     if session_id:
                         record["session_id"] = session_id
                     batch.append(record)
-                except (PermissionError, OSError) as exc:
+                except (PermissionError, OSError):
                     counts["errors"] += 1
                     continue
 

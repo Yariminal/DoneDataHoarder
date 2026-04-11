@@ -13,7 +13,6 @@ import json
 from collections import defaultdict
 from datetime import datetime
 from difflib import SequenceMatcher
-from typing import Optional
 
 from rich.progress import (
     BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,

@@ -8,7 +8,6 @@ import threading
 import traceback
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
 from typing import Callable, Optional
 
 from rich.progress import (
@@ -130,6 +129,7 @@ def analyze(
     ) as progress:
         task = progress.add_task("Analyzing…", total=total)
 
+        failed_ids: set[int] = set()
         offset = 0
         processed = 0
 
@@ -141,6 +141,8 @@ def analyze(
                 a_q = session.query(File.id).filter(File.status == FileStatus.ENRICHED)
                 if session_id:
                     a_q = a_q.filter(File.session_id == session_id)
+                if failed_ids:
+                    a_q = a_q.filter(File.id.notin_(failed_ids))
                 batch = a_q.limit(QUERY_BATCH).all()
             if not batch:
                 break
@@ -149,25 +151,45 @@ def analyze(
 
             with ThreadPoolExecutor(max_workers=max(workers, 1)) as pool:
                 futures = {pool.submit(process_file, fid): fid for fid in file_ids}
-                for future in as_completed(futures):
-                    try:
-                        # Add timeout to prevent blocking indefinitely
-                        fid, status, error = future.result(timeout=120)
-                    except concurrent.futures.TimeoutError:
-                        # File analysis took too long, mark as error
-                        fid = futures.get(future, "unknown")
-                        status = "errors"
-                        error = "Analysis timeout (>120s)"
-                    counts[status if status in counts else "errors"] += 1
-                    progress.advance(task)
-                    progress.update(
-                        task,
-                        description=(
-                            f"Analyzing… ✓{counts['analyzed']} "
-                            f"skip:{counts['skipped']} err:{counts['errors']}"
-                        ),
+                pending = set(futures.keys())
+                while pending:
+                    done, pending = concurrent.futures.wait(
+                        pending, timeout=2.0, return_when=concurrent.futures.FIRST_COMPLETED
                     )
-                    processed += 1
+                    for future in done:
+                        try:
+                            fid, status, error = future.result()
+                            if fid != "unknown":
+                                failed_ids.add(fid)
+                        except Exception as exc:
+                            fid = futures.get(future, "unknown")
+                            status = "errors"
+                            error = str(exc)
+                            # Mark file as error in DB
+                            if fid != "unknown":
+                                failed_ids.add(fid)
+                                try:
+                                    with Session(engine) as err_db:
+                                        f = err_db.get(File, fid)
+                                        if f:
+                                            f.status = FileStatus.ERROR
+                                            f.error_message = f"Analysis failed: {error}"[:500]
+                                            err_db.commit()
+                                except Exception:
+                                    pass
+
+                        counts[status if status in counts else "errors"] += 1
+                        progress.advance(task)
+                        progress.update(
+                            task,
+                            description=(
+                                f"Analyzing… ✓{counts['analyzed']} "
+                                f"skip:{counts['skipped']} err:{counts['errors']}"
+                            ),
+                        )
+                        processed += 1
+                        if limit and processed >= limit:
+                            break
                     if limit and processed >= limit:
                         break
 
@@ -264,6 +286,7 @@ def analyze_with_progress(
                 return file_id, "error", str(exc)
 
     processed = 0
+    failed_ids: set[int] = set()
 
     while True:
         # Check cancel at top of each batch
@@ -277,6 +300,8 @@ def analyze_with_progress(
             awp_q = db.query(File.id).filter(File.status == FileStatus.ENRICHED)
             if session_id:
                 awp_q = awp_q.filter(File.session_id == session_id)
+            if failed_ids:
+                awp_q = awp_q.filter(File.id.notin_(failed_ids))
             batch = awp_q.limit(QUERY_BATCH).all()
         if not batch:
             break
@@ -304,12 +329,15 @@ def analyze_with_progress(
                 for future in done:
                     try:
                         fid, status, error = future.result(timeout=0)
+                        if fid != "unknown":
+                            failed_ids.add(fid)
                     except Exception as exc:
                         fid = futures.get(future, "unknown")
                         status = "errors"
                         error = str(exc)
                         # Mark file as error in DB
                         if fid != "unknown":
+                            failed_ids.add(fid)
                             try:
                                 with Session(engine) as err_db:
                                     f = err_db.get(File, fid)
@@ -331,7 +359,7 @@ def analyze_with_progress(
                     if limit and processed >= limit:
                         break
 
-        if limit and processed >= limit:
-            break
+            if limit and processed >= limit:
+                break
 
     yield {"done": True, **counts}

@@ -6,7 +6,6 @@ Reads EXIF GPS, camera info, and passes it as additional context.
 """
 import io
 from pathlib import Path
-from typing import Optional
 
 from datahoarder.analyzers.base import AnalysisResult, BaseAnalyzer, SYSTEM_PROMPT
 from datahoarder.db.models import File

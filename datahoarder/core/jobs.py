@@ -13,7 +13,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Generator, Optional
+from typing import Generator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -245,12 +245,6 @@ class JobManager:
         job.pause_event.set()
         job.push_progress({**job.progress, "state": "running"})
 
-    def cancel(self, job_id: str):
-        job = self._get_job(job_id)
-        if job.state not in (JobState.RUNNING, JobState.PAUSED):
-            raise RuntimeError(f"Cannot cancel job in state {job.state.value}")
-        job.cancel_flag = True
-        job.pause_event.set()  # Unblock if paused so it can exit
 
     def force_cancel(self, job_id: str):
         """

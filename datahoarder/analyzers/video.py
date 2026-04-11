@@ -24,7 +24,6 @@ See INSTALL.md for platform-specific ffmpeg setup instructions.
 """
 import io
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -87,12 +86,15 @@ def _extract_frame(path: Path, timestamp: float) -> Optional[bytes]:
     if not _HAS_FFMPEG:
         return None
     try:
-        out, _ = (
-            _ffmpeg
-            .input(str(path), ss=timestamp)
-            .output("pipe:", vframes=1, format="image2", vcodec="mjpeg")
-            .run(capture_stdout=True, capture_stderr=True, quiet=True)
+        # Use subprocess directly to allow timeout, as ffmpeg-python .run() has no timeout
+        cmd = [
+            "ffmpeg", "-y", "-ss", str(timestamp), "-i", str(path),
+            "-vframes", "1", "-f", "image2", "-vcodec", "mjpeg", "-"
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, timeout=30
         )
+        out = result.stdout
         if not out:
             return None
         if _HAS_PIL:
@@ -177,8 +179,8 @@ class VideoAnalyzer(BaseAnalyzer):
 
     def can_handle(self, mime_type: str, extension: str) -> bool:
         ext = extension.lower()
-        is_video = ext in VIDEO_EXTENSIONS or (mime_type and mime_type.startswith("video/"))
-        is_audio = ext in AUDIO_EXTENSIONS or (mime_type and mime_type.startswith("audio/"))
+        is_video = bool(ext in VIDEO_EXTENSIONS or (mime_type and mime_type.startswith("video/")))
+        is_audio = bool(ext in AUDIO_EXTENSIONS or (mime_type and mime_type.startswith("audio/")))
 
         # Handle both video and audio files.
         # Videos without ffmpeg will be analyzed with transcript only (text-based).

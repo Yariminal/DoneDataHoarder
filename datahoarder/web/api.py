@@ -23,14 +23,11 @@ from sqlalchemy.orm import Session
 
 from datahoarder.db.models import (
     DuplicateGroup,
-    DuplicateMember,
-    DupeType,
     File,
     FileStatus,
     Proposal,
     ProposalStatus,
     ProposalType,
-    ScanSession,
     SessionStatus,
     UserSession,
 )
@@ -1324,7 +1321,7 @@ def pull_ollama_model(body: PullModelRequest):
                     except Exception:
                         yield f"data: {json.dumps({'status': 'success', 'progress': 100})}\n\n"
         except httpx.TimeoutException:
-            yield f"data: {json.dumps({'status': 'error', 'message': f'Pull timed out. Model may still be downloading. Check Ollama status with: ollama list'})}\n\n"
+            yield f"data: {json.dumps({'status': 'error', 'message': 'Pull timed out. Model may still be downloading. Check Ollama status with: ollama list'})}\n\n"
         except Exception as exc:
             yield f"data: {json.dumps({'status': 'error', 'message': f'Pull failed: {str(exc)}'})}\n\n"
 
@@ -1361,10 +1358,12 @@ def _start_ollama_process(ollama_path: str, num_parallel: int | None = None):
         env["OLLAMA_NUM_PARALLEL"] = str(num_parallel)
 
     if platform.system() == "Windows":
+        create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        detached_process = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
         subprocess.Popen(
             [ollama_path, "serve"],
             env=env,
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+            creationflags=create_no_window | detached_process,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

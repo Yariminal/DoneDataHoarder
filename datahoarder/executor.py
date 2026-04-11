@@ -17,7 +17,7 @@ from rich.table import Table
 from sqlalchemy.orm import Session
 
 from datahoarder.db.models import (
-    DuplicateGroup, DuplicateMember, File, FileStatus,
+    DuplicateGroup, File, FileStatus,
     Proposal, ProposalStatus, ProposalType,
 )
 from datahoarder.db.session import get_engine
@@ -407,53 +407,3 @@ def execute(
     return counts
 
 
-def approve_all(min_confidence: float = 0.8) -> int:
-    """Bulk-approve all PENDING proposals above confidence threshold."""
-    engine = get_engine()
-    with Session(engine) as session:
-        updated = (
-            session.query(Proposal)
-            .filter(
-                Proposal.status == ProposalStatus.PENDING,
-                Proposal.confidence >= min_confidence,
-            )
-            .update({"status": ProposalStatus.APPROVED})
-        )
-        session.commit()
-    return updated
-
-
-def mark_duplicate_for_deletion(group_id: int, keep_file_id: Optional[int] = None) -> None:
-    """
-    Create MARK_DUPLICATE proposals for all non-keeper files in a duplicate group.
-    """
-    engine = get_engine()
-    with Session(engine) as session:
-        group = session.get(DuplicateGroup, group_id)
-        if not group:
-            raise ValueError(f"Duplicate group {group_id} not found")
-
-        keep_id = keep_file_id or group.keep_file_id
-        if keep_id:
-            group.keep_file_id = keep_id
-
-        for member in group.members:
-            if member.file_id == keep_id:
-                continue
-            existing = (
-                session.query(Proposal)
-                .filter_by(file_id=member.file_id, proposal_type=ProposalType.MARK_DUPLICATE)
-                .first()
-            )
-            if not existing:
-                f = session.get(File, member.file_id)
-                session.add(Proposal(
-                    file_id=member.file_id,
-                    proposal_type=ProposalType.MARK_DUPLICATE,
-                    current_value=f.path if f else None,
-                    proposed_value=".datahoarder_trash/",
-                    reasoning=f"Duplicate of file ID {keep_id} (group {group_id})",
-                    confidence=member.similarity_score or 1.0,
-                    status=ProposalStatus.PENDING,
-                ))
-        session.commit()

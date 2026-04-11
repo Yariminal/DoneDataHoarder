@@ -13,8 +13,6 @@ Usage:
 """
 from __future__ import annotations
 
-import io
-import os
 import sys
 from pathlib import Path
 from typing import Annotated, Optional
@@ -23,7 +21,6 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich import print as rprint
 
 # Force UTF-8 output on Windows (Hebrew/other non-Latin codepages break Rich spinners)
 if sys.platform == "win32":
@@ -184,7 +181,7 @@ def dedup(
         total_wasted = sum(g["wasted_bytes"] for g in summary)
         mb = total_wasted / 1024 / 1024
         console.print(f"\n[bold]Estimated reclaimable space: [green]{mb:.1f} MB[/green][/bold]")
-        console.print(f"Run [bold]datahoarder review --dupes[/bold] to inspect groups.")
+        console.print("Run [bold]datahoarder review --dupes[/bold] to inspect groups.")
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +321,6 @@ def execute(
     db: Annotated[str, typer.Option("--db", help="SQLite database path.", envvar="DATAHOARDER_DB")] = "datahoarder.db",
     commit: Annotated[bool, typer.Option("--commit", help="Apply changes for real (default is dry-run).")] = False,
     min_confidence: Annotated[float, typer.Option("--min-confidence", "-c", help="Only apply proposals above this confidence.")] = 0.7,
-    approved_only: Annotated[bool, typer.Option("--approved-only", help="Only apply explicitly approved proposals.")] = False,
 ):
     """
     [bold red]Execute[/bold red] proposals on disk.
@@ -334,7 +330,6 @@ def execute(
     _init_db(db)
 
     from datahoarder.executor import execute as do_execute
-    from datahoarder.db.models import ProposalStatus
 
     if commit:
         console.print(Panel("[bold red]LIVE RUN — changes will be applied to disk[/bold red]", style="red"))
@@ -363,7 +358,7 @@ def stats(
     _init_db(db)
 
     from datahoarder.db.session import get_engine
-    from datahoarder.db.models import File, FileStatus, Proposal, ProposalStatus, DuplicateGroup
+    from datahoarder.db.models import File, Proposal, ProposalStatus, DuplicateGroup
     from sqlalchemy.orm import Session
     from sqlalchemy import func
 
