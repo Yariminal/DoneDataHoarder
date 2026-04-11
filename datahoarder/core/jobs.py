@@ -7,12 +7,15 @@ SSE endpoints become thin read-only observers of job state.
 from __future__ import annotations
 
 import enum
+import logging
 import queue
 import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Generator, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class JobState(str, enum.Enum):
@@ -248,6 +251,30 @@ class JobManager:
             raise RuntimeError(f"Cannot cancel job in state {job.state.value}")
         job.cancel_flag = True
         job.pause_event.set()  # Unblock if paused so it can exit
+
+    def force_cancel(self, job_id: str):
+        """
+        Force-cancel a job immediately, even if the worker thread is stuck.
+
+        Sets the cancel flag AND immediately transitions the job to CANCELLED
+        state so that new jobs can start and the UI stops showing it as active.
+        The worker thread may still be running in the background but will
+        eventually exit (daemon thread dies with the process).
+        """
+        job = self._jobs.get(job_id)
+        if not job:
+            return
+        job.cancel_flag = True
+        job.pause_event.set()
+        if job.state in (JobState.RUNNING, JobState.PAUSED):
+            self._finish_job(job, JobState.CANCELLED, "Force-cancelled")
+
+    def cancel_session_jobs(self, session_id: str):
+        """Force-cancel all jobs for a given session (used when session is deleted)."""
+        for job in list(self._jobs.values()):
+            if job.session_id == session_id and job.state in (JobState.RUNNING, JobState.PAUSED):
+                logger.info(f"Force-cancelling job {job.job_id} for deleted session {session_id}")
+                self.force_cancel(job.job_id)
 
     def get_job(self, job_id: str) -> Optional[JobInfo]:
         return self._jobs.get(job_id)
