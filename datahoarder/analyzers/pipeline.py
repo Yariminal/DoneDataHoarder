@@ -150,7 +150,14 @@ def analyze(
             with ThreadPoolExecutor(max_workers=max(workers, 1)) as pool:
                 futures = {pool.submit(process_file, fid): fid for fid in file_ids}
                 for future in as_completed(futures):
-                    fid, status, error = future.result()
+                    try:
+                        # Add timeout to prevent blocking indefinitely
+                        fid, status, error = future.result(timeout=120)
+                    except concurrent.futures.TimeoutError:
+                        # File analysis took too long, mark as error
+                        fid = futures.get(future, "unknown")
+                        status = "errors"
+                        error = "Analysis timeout (>120s)"
                     counts[status if status in counts else "errors"] += 1
                     progress.advance(task)
                     progress.update(
