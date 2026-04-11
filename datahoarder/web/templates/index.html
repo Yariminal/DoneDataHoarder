@@ -35,7 +35,7 @@
           </button>
         </div>
       </template>
-      <span class="db-name">v0.2.0</span>
+      <span class="db-name" x-text="'v' + ($store.app.version || '0.2.0')"></span>
     </div>
   </header>
 

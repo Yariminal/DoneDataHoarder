@@ -11,6 +11,7 @@ document.addEventListener('alpine:init', () => {
     tab: 'home',
     toasts: [],
     loading: false,
+    version: '0.2.0',
 
     toast(msg, type = 'info') {
       const id = Date.now();
@@ -121,6 +122,19 @@ document.addEventListener('alpine:init', () => {
       return res.json();
     },
   };
+
+  /* ----------------------------------------------------------
+   * Initialize app version from backend
+   * -------------------------------------------------------- */
+  (async () => {
+    try {
+      const info = await api.get('/info');
+      Alpine.store('app').version = info.version;
+    } catch (e) {
+      // Fallback to default version if API call fails
+      console.warn('Failed to load version:', e.message);
+    }
+  })();
 
   /* ----------------------------------------------------------
    * Refresh helper — reloads all data tabs after pipeline ops

@@ -134,6 +134,26 @@ class ExecuteRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Info
+# ---------------------------------------------------------------------------
+
+@router.get("/info")
+def get_info():
+    """Get app version and info."""
+    try:
+        from importlib.metadata import version
+        app_version = version("datahoarder")
+    except Exception:
+        app_version = "0.2.0"
+
+    return {
+        "name": "DataHoarder",
+        "version": app_version,
+        "description": "AI-powered file organization for data hoarders",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Sessions
 # ---------------------------------------------------------------------------
 
