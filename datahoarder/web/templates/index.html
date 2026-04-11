@@ -570,10 +570,32 @@
           <div class="step-info">
             <div class="step-name">Enrich</div>
             <div class="step-desc">Extract metadata, hashes, EXIF dates</div>
+            <!-- Live progress counter -->
+            <template x-if="enrichProgress">
+              <div class="mt-1">
+                <div class="text-sm" style="color:var(--primary); font-weight:600;"
+                     x-text="'Enriching: ' + enrichProgress.current + ' / ' + enrichProgress.total + ' files' + (filesPerMin(enrichProgress) ? ' (' + filesPerMin(enrichProgress) + ' files/min)' : '')"></div>
+                <div style="margin-top:4px; background:var(--surface-2); border-radius:4px; height:6px; overflow:hidden;">
+                  <div style="height:100%; background:var(--primary); border-radius:4px; transition:width .3s;"
+                       :style="'width:' + (enrichProgress.total ? (enrichProgress.current / enrichProgress.total * 100) : 0) + '%'"></div>
+                </div>
+                <div class="text-dim text-sm mt-1"
+                     x-text="'Done: ' + (enrichProgress.enriched || 0) + ' | Errors: ' + (enrichProgress.errors || 0)"></div>
+              </div>
+            </template>
           </div>
-          <button class="btn btn-primary btn-sm" :disabled="running" @click="runStep('enrich')">
-            <span x-text="running === 'enrich' ? 'Enriching...' : 'Run'"></span>
-          </button>
+          <div class="btn-group">
+            <button class="btn btn-primary btn-sm" :disabled="running" @click="runStep('enrich')"
+                    x-show="!(activeJobType === 'enrich' && (jobState === 'running' || jobState === 'paused'))">
+              <span x-text="running === 'enrich' ? 'Starting...' : 'Run'"></span>
+            </button>
+            <button class="btn btn-outline btn-sm" @click="pauseJob()"
+                    x-show="activeJobType === 'enrich' && jobState === 'running'">Pause</button>
+            <button class="btn btn-primary btn-sm" @click="resumeJob()"
+                    x-show="activeJobType === 'enrich' && jobState === 'paused'">Resume</button>
+            <button class="btn btn-danger btn-sm" @click="cancelJob()"
+                    x-show="activeJobType === 'enrich' && (jobState === 'running' || jobState === 'paused')">Cancel</button>
+          </div>
         </div>
         <div class="pipeline-step">
           <div class="step-num" :class="{ active: running === 'dedup' }">3</div>
@@ -594,7 +616,7 @@
             <template x-if="analyzeProgress">
               <div class="mt-1">
                 <div class="text-sm" style="color:var(--primary); font-weight:600;"
-                     x-text="'Analyzing: ' + analyzeProgress.current + ' / ' + analyzeProgress.total + ' files'"></div>
+                     x-text="'Analyzing: ' + analyzeProgress.current + ' / ' + analyzeProgress.total + ' files' + (filesPerMin(analyzeProgress) ? ' (' + filesPerMin(analyzeProgress) + ' files/min)' : '')"></div>
                 <div style="margin-top:4px; background:var(--surface-2); border-radius:4px; height:6px; overflow:hidden;">
                   <div style="height:100%; background:var(--primary); border-radius:4px; transition:width .3s;"
                        :style="'width:' + (analyzeProgress.total ? (analyzeProgress.current / analyzeProgress.total * 100) : 0) + '%'"></div>
@@ -603,11 +625,23 @@
                      x-text="'Done: ' + (analyzeProgress.analyzed || 0) + ' | Skipped: ' + (analyzeProgress.skipped || 0) + ' | Errors: ' + (analyzeProgress.errors || 0)"></div>
               </div>
             </template>
+            <template x-if="activeJobType === 'analyze' && jobState === 'paused' && !analyzeProgress">
+              <div class="text-sm mt-1" style="color:var(--warning); font-weight:600;">Paused</div>
+            </template>
           </div>
-          <button class="btn btn-primary btn-sm" :disabled="running || !getSettings().model" @click="runStep('analyze')"
-                  :title="!getSettings().model ? 'Select a model in Setup first' : ''">
-            <span x-text="running === 'analyze' ? 'Analyzing...' : 'Run'"></span>
-          </button>
+          <div class="btn-group">
+            <button class="btn btn-primary btn-sm" :disabled="running || !getSettings().model" @click="runStep('analyze')"
+                    :title="!getSettings().model ? 'Select a model in Setup first' : ''"
+                    x-show="!(activeJobType === 'analyze' && (jobState === 'running' || jobState === 'paused'))">
+              <span x-text="running === 'analyze' ? 'Starting...' : 'Run'"></span>
+            </button>
+            <button class="btn btn-outline btn-sm" @click="pauseJob()"
+                    x-show="activeJobType === 'analyze' && jobState === 'running'">Pause</button>
+            <button class="btn btn-primary btn-sm" @click="resumeJob()"
+                    x-show="activeJobType === 'analyze' && jobState === 'paused'">Resume</button>
+            <button class="btn btn-danger btn-sm" @click="cancelJob()"
+                    x-show="activeJobType === 'analyze' && (jobState === 'running' || jobState === 'paused')">Cancel</button>
+          </div>
         </div>
         <div class="pipeline-step">
           <div class="step-num" :class="{ active: running === 'propose' }">5</div>
@@ -619,11 +653,21 @@
             <span x-text="running === 'propose' ? 'Proposing...' : 'Run'"></span>
           </button>
         </div>
+        <div class="pipeline-step">
+          <div class="step-num" :class="{ active: running === 'organize' }">6</div>
+          <div class="step-info">
+            <div class="step-name">Organize</div>
+            <div class="step-desc">AI suggests folder reorganization based on file analysis</div>
+          </div>
+          <button class="btn btn-primary btn-sm" :disabled="running" @click="runStep('organize')">
+            <span x-text="running === 'organize' ? 'Organizing...' : 'Run'"></span>
+          </button>
+        </div>
 
         <div class="sidebar-sep" style="margin:4px 0"></div>
 
         <div class="pipeline-step">
-          <div class="step-num">6</div>
+          <div class="step-num">7</div>
           <div class="step-info">
             <div class="step-name">Execute</div>
             <div class="step-desc">Apply approved proposals to disk</div>
@@ -712,6 +756,22 @@
           <input type="number" class="input" x-model.number="selectedWorkers" @change="saveSettings()" min="1" max="8" style="width:80px">
           <div></div>
           <p class="text-dim text-sm">Parallel threads for AI analysis (1-8). Higher = faster but uses more RAM.</p>
+          <label class="text-sm">Ollama Parallel</label>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <input type="number" class="input" x-model.number="numParallel" @change="saveSettings()" min="1" max="8" style="width:80px">
+            <button class="btn btn-outline btn-sm" @click="restartOllama()" x-show="ollamaStatus && ollamaStatus.running"
+                    title="Restart Ollama to apply parallel setting">Apply</button>
+          </div>
+          <div></div>
+          <p class="text-dim text-sm">Ollama concurrent requests (OLLAMA_NUM_PARALLEL). Requires Ollama restart. Uses more VRAM.</p>
+          <label class="text-sm">Filename Language</label>
+          <select class="input" x-model="preferredLanguage" @change="saveSettings()">
+            <option value="leave_as_is">Leave as-is</option>
+            <option value="english">Translate to English</option>
+            <option value="hebrew">Translate to Hebrew</option>
+          </select>
+          <div></div>
+          <p class="text-dim text-sm">Optionally translate proposed filenames during the Propose step. Helps unify language across mixed-language collections.</p>
         </div>
       </div>
 

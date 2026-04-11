@@ -45,6 +45,7 @@ class UserSession(Base):
     backend: Mapped[str] = mapped_column(String, default="ollama")
     model: Mapped[str] = mapped_column(String, default="llama3.2:3b")
     workers: Mapped[int] = mapped_column(Integer, default=1)
+    preferred_language: Mapped[str] = mapped_column(String, default="leave_as_is")
 
     status: Mapped[SessionStatus] = mapped_column(
         Enum(SessionStatus), default=SessionStatus.NEW
@@ -90,6 +91,7 @@ class FileStatus(str, enum.Enum):
 
 class ProposalType(str, enum.Enum):
     RENAME           = "rename"
+    RENAME_FOLDER    = "rename_folder"
     MOVE             = "move"
     ADD_TAGS         = "add_tags"
     UPDATE_METADATA  = "update_metadata"
