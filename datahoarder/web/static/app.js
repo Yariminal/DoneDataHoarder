@@ -11,7 +11,7 @@ document.addEventListener('alpine:init', () => {
     tab: 'home',
     toasts: [],
     loading: false,
-    version: '0.2.0',
+    version: '0.3.0',
 
     toast(msg, type = 'info') {
       const id = Date.now();
