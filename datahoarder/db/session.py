@@ -37,7 +37,7 @@ def init_db(db_path: Path) -> Engine:
     db_url = f"sqlite:///{db_path.resolve()}"
     _engine = create_engine(
         db_url,
-        connect_args={"check_same_thread": False},
+        connect_args={"check_same_thread": False, "timeout": 15},
         echo=False,
     )
 
@@ -59,11 +59,6 @@ def init_db(db_path: Path) -> Engine:
     return _engine
 
 
-def get_session() -> Session:
-    """Return a new session. Caller is responsible for commit/close."""
-    if _SessionLocal is None:
-        raise RuntimeError("Database not initialised. Call init_db() first.")
-    return _SessionLocal()
 
 
 def get_engine() -> Engine:

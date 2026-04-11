@@ -10,10 +10,8 @@ from __future__ import annotations
 import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
-from typing import Optional
+from pathlib import Path
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from datahoarder.db.models import (
@@ -160,10 +158,11 @@ def _format_tree_for_prompt(
     return "\n".join(lines)
 
 
-def _human_size(n: int) -> str:
+def _human_size(num_bytes: int) -> str:
+    n = float(num_bytes)
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024:
-            return f"{n:.1f} {unit}" if n != int(n) else f"{n} {unit}"
+            return f"{n:.1f} {unit}" if n != int(n) else f"{int(n)} {unit}"
         n /= 1024
     return f"{n:.1f} PB"
 
@@ -280,7 +279,7 @@ def generate_reorg_proposals(session_id: str) -> dict:
         proposals = result
     elif isinstance(result, dict):
         # Try known keys, including raw_response fallback from generate_json
-        proposals = result.get("proposals", result.get("suggestions", []))
+        proposals = result.get("proposals", result.get("suggestions", [])) or []
         if not proposals and "raw_response" in result:
             # generate_json fell back to raw text — try parsing it ourselves
             import json as _json
@@ -315,9 +314,13 @@ def generate_reorg_proposals(session_id: str) -> dict:
                     continue
 
                 # Safety: LLM sometimes puts a full path in new_name — extract just the name
+                import re
                 new_name = Path(new_name).name
                 # Strip characters that are problematic in folder names
-                new_name = new_name.strip().rstrip(".")
+                new_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", new_name)
+                new_name = re.sub(r"\s+", "_", new_name.strip())
+                new_name = re.sub(r"_+", "_", new_name)
+                new_name = new_name.strip("._")
                 if not new_name:
                     counts["skipped"] += 1
                     continue

@@ -5,7 +5,6 @@ Processes all File records in PENDING status and upgrades them to ENRICHED.
 Safe to re-run; already-enriched files are skipped.
 """
 import hashlib
-import json
 import mimetypes
 import threading
 from datetime import datetime

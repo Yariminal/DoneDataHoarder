@@ -322,7 +322,6 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
             query = query.limit(limit)
         total = query.count()
 
-    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, MofNCompleteColumn, TimeElapsedColumn, TaskProgressColumn
 
     with Progress(
         SpinnerColumn(),

@@ -129,24 +129,3 @@ def detect_sequences(parent_dir: Path, filename: str) -> Optional[SequenceInfo]:
         return None
 
 
-def apply_sequence_pattern(base_filename: str, sequence_info: SequenceInfo, number: int) -> str:
-    """
-    Apply sequence pattern to generate a numbered filename.
-
-    Args:
-        base_filename: The filename with description/base (e.g., "notes_intro_to_python.pdf")
-        sequence_info: The detected sequence pattern
-        number: The number to apply
-
-    Returns:
-        Filename with number inserted in sequence pattern (e.g., "notes_01_intro_to_python.pdf")
-    """
-    stem, ext = Path(base_filename).stem, Path(base_filename).suffix
-
-    # Format the number according to sequence style
-    formatted_number = sequence_info.format_number(number)
-
-    # Insert number at appropriate position
-    new_stem = f"{sequence_info.base_name}{sequence_info.separator}{formatted_number}_{stem}"
-
-    return new_stem + ext

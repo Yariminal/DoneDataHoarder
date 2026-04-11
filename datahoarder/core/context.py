@@ -6,7 +6,6 @@ even when the filename itself is useless (e.g. "IMG_0042.jpg" or "FINAL2.docx").
 """
 import re
 from pathlib import Path
-from typing import Optional
 
 from datahoarder.db.models import File
 
@@ -125,16 +124,3 @@ def build_context(file_rec: File, db_siblings: list[File] | None = None) -> str:
     return "\n".join(lines)
 
 
-def build_context_for_path(path: Path) -> str:
-    """Lightweight context build from path alone (no DB record needed)."""
-
-    class _FakeRec:
-        def __init__(self, p: Path):
-            self.path = str(p)
-            self.mime_type = None
-            self.size_bytes = None
-            self.date_best = None
-            self.date_modified = None
-            self.ai_description = None
-
-    return build_context(_FakeRec(path))  # type: ignore[arg-type]
