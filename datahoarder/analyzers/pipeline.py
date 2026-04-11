@@ -6,6 +6,7 @@ Supports batched parallel processing via ThreadPoolExecutor.
 """
 import threading
 import traceback
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Callable, Optional
@@ -275,7 +276,20 @@ def analyze_with_progress(
                     yield {"cancelled": True, **counts}
                     return
 
-                fid, status, error = future.result()
+                try:
+                    # Add timeout to prevent blocking indefinitely on stuck file analysis
+                    fid, status, error = future.result(timeout=120)
+                except concurrent.futures.TimeoutError:
+                    # File analysis took too long (120+ seconds), mark as error and continue
+                    # This allows cancel checks to run periodically instead of blocking forever
+                    fid = futures.get(future, "unknown")
+                    status = "errors"
+                    error = "Analysis timeout (>120s)"
+                    if db_session and fid != "unknown":
+                        f = db_session.query(File).filter(File.id == fid).first()
+                        if f:
+                            f.error_message = error
+
                 counts[status if status in counts else "errors"] += 1
                 processed += 1
                 yield {"current": processed, "total": total, **counts}
