@@ -329,6 +329,10 @@ def mark_session_dirty(session_id: str):
 @router.delete("/sessions/{session_id}")
 def delete_session(session_id: str):
     """Delete a session and all its associated data."""
+    # Force-cancel any running jobs for this session first
+    from datahoarder.core.jobs import job_manager
+    job_manager.cancel_session_jobs(session_id)
+
     engine = get_engine()
     with Session(engine) as session:
         user_session = session.get(UserSession, session_id)
@@ -1015,11 +1019,17 @@ def resume_job(job_id: str):
 
 @router.post("/pipeline/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):
-    """Cancel a running or paused job."""
+    """Cancel a running or paused job.
+
+    Sets the cooperative cancel flag first, then immediately force-finishes
+    the job so the UI reflects the cancellation and new jobs can start.
+    The worker thread (if stuck on an Ollama call) will eventually exit
+    on its own since it's a daemon thread.
+    """
     from datahoarder.core.jobs import job_manager
     try:
-        job_manager.cancel(job_id)
-        return {"status": "cancelling", "job_id": job_id}
+        job_manager.force_cancel(job_id)
+        return {"status": "cancelled", "job_id": job_id}
     except (KeyError, RuntimeError) as exc:
         raise HTTPException(400, str(exc))
 

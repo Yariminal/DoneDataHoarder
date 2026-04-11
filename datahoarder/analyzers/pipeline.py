@@ -225,6 +225,10 @@ def analyze_with_progress(
     yield {"current": 0, "total": total, **counts}
 
     def process_file_inner(file_id: int) -> tuple[int, str, Optional[str]]:
+        # Check cancel BEFORE starting expensive work
+        if cancel_check and cancel_check():
+            return file_id, "skipped", "Cancelled"
+
         with Session(engine) as session:
             file_rec = session.get(File, file_id)
             if not file_rec:
@@ -262,10 +266,15 @@ def analyze_with_progress(
     processed = 0
 
     while True:
-        with Session(engine) as session:
+        # Check cancel at top of each batch
+        if cancel_check and cancel_check():
+            yield {"cancelled": True, **counts}
+            return
+
+        with Session(engine) as db:
             # Always query from offset 0: processed files change status
             # and no longer match the ENRICHED filter.
-            awp_q = session.query(File.id).filter(File.status == FileStatus.ENRICHED)
+            awp_q = db.query(File.id).filter(File.status == FileStatus.ENRICHED)
             if session_id:
                 awp_q = awp_q.filter(File.session_id == session_id)
             batch = awp_q.limit(QUERY_BATCH).all()
@@ -276,42 +285,51 @@ def analyze_with_progress(
 
         with ThreadPoolExecutor(max_workers=max(workers, 1)) as pool:
             futures = {pool.submit(process_file_inner, fid): fid for fid in file_ids}
-            for future in as_completed(futures):
-                # Check for cancel before processing result
+
+            # Collect results with a short timeout so we can check cancel frequently
+            pending = set(futures.keys())
+            while pending:
+                # Check cancel while waiting for futures
                 if cancel_check and cancel_check():
                     pool.shutdown(wait=False, cancel_futures=True)
                     yield {"cancelled": True, **counts}
                     return
 
-                try:
-                    # Add timeout to prevent blocking indefinitely on stuck file analysis
-                    fid, status, error = future.result(timeout=120)
-                except concurrent.futures.TimeoutError:
-                    # File analysis took too long (120+ seconds), mark as error and continue
-                    # This allows cancel checks to run periodically instead of blocking forever
-                    fid = futures.get(future, "unknown")
-                    status = "errors"
-                    error = "Analysis timeout (>120s)"
-                    if db_session and fid != "unknown":
-                        f = db_session.query(File).filter(File.id == fid).first()
-                        if f:
-                            f.error_message = error
+                # Wait for any future to complete, with a short timeout
+                done, pending = concurrent.futures.wait(
+                    pending, timeout=3.0,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
 
-                counts[status if status in counts else "errors"] += 1
-                processed += 1
-                yield {"current": processed, "total": total, **counts}
+                for future in done:
+                    try:
+                        fid, status, error = future.result(timeout=0)
+                    except Exception as exc:
+                        fid = futures.get(future, "unknown")
+                        status = "errors"
+                        error = str(exc)
+                        # Mark file as error in DB
+                        if fid != "unknown":
+                            try:
+                                with Session(engine) as err_db:
+                                    f = err_db.get(File, fid)
+                                    if f:
+                                        f.status = FileStatus.ERROR
+                                        f.error_message = f"Analysis failed: {error}"[:500]
+                                        err_db.commit()
+                            except Exception:
+                                pass
 
-                # Block if paused (between files)
-                if pause_event:
-                    pause_event.wait()
+                    counts[status if status in counts else "errors"] += 1
+                    processed += 1
+                    yield {"current": processed, "total": total, **counts}
 
-                if limit and processed >= limit:
-                    break
+                    # Block if paused (between files)
+                    if pause_event:
+                        pause_event.wait()
 
-        # Check cancel between batches
-        if cancel_check and cancel_check():
-            yield {"cancelled": True, **counts}
-            return
+                    if limit and processed >= limit:
+                        break
 
         if limit and processed >= limit:
             break
