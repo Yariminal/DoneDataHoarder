@@ -144,7 +144,7 @@ def get_info():
         from importlib.metadata import version
         app_version = version("datahoarder")
     except Exception:
-        app_version = "0.2.0"
+        app_version = "0.3.0"
 
     return {
         "name": "DataHoarder",
