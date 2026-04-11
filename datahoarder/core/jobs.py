@@ -135,6 +135,10 @@ class JobManager:
         job.state = state
         job.error = error
         job.finished_at = datetime.utcnow()
+        # Clear active job ID so new jobs can start
+        with self._lock:
+            if self._active_job_id == job.job_id:
+                self._active_job_id = None
         # Push final progress to subscribers
         final = {**job.progress, "done": True, "state": state.value}
         if error:
