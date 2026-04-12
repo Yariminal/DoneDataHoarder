@@ -3,11 +3,14 @@ Sequence detector — identifies numbered/sequential files and preserves their p
 
 For example, "notes_1.pdf", "notes_2.pdf", "notes_10.pdf" are detected as a sequence
 with base name "notes", numbers [1, 2, 10], and separator "_".
+
+Performance note: detect_sequences() caches sibling lists per directory so that
+processing N files in the same folder costs O(N) instead of O(N²).
 """
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -24,6 +27,27 @@ class SequenceInfo:
         if self.is_padded:
             return str(num).zfill(self.padding_width)
         return str(num)
+
+
+# Per-directory sibling cache: avoids repeated iterdir() calls when processing
+# many files from the same folder.  Keyed by resolved directory path.
+_sibling_cache: Dict[Path, List[str]] = {}
+
+
+def _get_siblings(parent_dir: Path) -> List[str]:
+    """Return cached sibling filenames for parent_dir."""
+    key = parent_dir.resolve()
+    if key not in _sibling_cache:
+        try:
+            _sibling_cache[key] = [f.name for f in parent_dir.iterdir() if f.is_file()]
+        except OSError:
+            _sibling_cache[key] = []
+    return _sibling_cache[key]
+
+
+def clear_sibling_cache() -> None:
+    """Clear the directory cache (call between sessions if needed)."""
+    _sibling_cache.clear()
 
 
 def detect_sequences(parent_dir: Path, filename: str) -> Optional[SequenceInfo]:
@@ -44,11 +68,10 @@ def detect_sequences(parent_dir: Path, filename: str) -> Optional[SequenceInfo]:
                         separator="_", is_padded=False, padding_width=0)
     """
     try:
-        # Get all files in parent directory
         if not parent_dir.exists():
             return None
 
-        siblings = [f.name for f in parent_dir.iterdir() if f.is_file()]
+        siblings = _get_siblings(parent_dir)
         if not siblings:
             return None
 

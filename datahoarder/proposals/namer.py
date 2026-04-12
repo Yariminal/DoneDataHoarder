@@ -351,6 +351,15 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
                 if not batch:
                     break
 
+                # Load existing proposals for this whole batch in one query
+                # instead of firing two SELECTs per file (N+1 pattern).
+                batch_ids = {f.id for f in batch}
+                existing_proposals: set[tuple[int, ProposalType]] = {
+                    (p.file_id, p.proposal_type)
+                    for p in session.query(Proposal.file_id, Proposal.proposal_type)
+                    .filter(Proposal.file_id.in_(batch_ids))
+                }
+
                 for file_rec in batch:
                     path = Path(file_rec.path)
                     made_proposal = False
@@ -367,15 +376,7 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
                         )
                         # Add to reserved names so other files in this batch won't collide
                         reserved_names.add(proposed_path)
-                        existing = (
-                            session.query(Proposal)
-                            .filter_by(
-                                file_id=file_rec.id,
-                                proposal_type=ProposalType.RENAME,
-                            )
-                            .first()
-                        )
-                        if not existing:
+                        if (file_rec.id, ProposalType.RENAME) not in existing_proposals:
                             session.add(Proposal(
                                 file_id=file_rec.id,
                                 proposal_type=ProposalType.RENAME,
@@ -393,15 +394,7 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
 
                     # --- ADD_TAGS proposal ---
                     if file_rec.ai_tags:
-                        existing_tag = (
-                            session.query(Proposal)
-                            .filter_by(
-                                file_id=file_rec.id,
-                                proposal_type=ProposalType.ADD_TAGS,
-                            )
-                            .first()
-                        )
-                        if not existing_tag:
+                        if (file_rec.id, ProposalType.ADD_TAGS) not in existing_proposals:
                             session.add(Proposal(
                                 file_id=file_rec.id,
                                 proposal_type=ProposalType.ADD_TAGS,
