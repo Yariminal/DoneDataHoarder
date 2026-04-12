@@ -130,6 +130,10 @@ def _apply_move(proposal: Proposal, dry_run: bool) -> tuple[bool, str]:
     src = Path(proposal.current_value)
     dst = Path(proposal.proposed_value)
 
+    # After folder-rename cascade, src and dst can become identical — skip silently
+    if src.resolve() == dst.resolve():
+        return True, f"No-op (already in place): {src.name}"
+
     if not src.exists():
         return False, f"Source not found: {src}"
     if dst.exists():

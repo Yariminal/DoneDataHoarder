@@ -11,7 +11,9 @@ venv/
 *.db
 *.db-shm
 *.db-wal
+*.db.bak
 .env
 *.log
 .DS_Store
 Thumbs.db
+TEST_REPORT*.md
