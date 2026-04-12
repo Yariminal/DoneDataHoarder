@@ -400,10 +400,51 @@ def execute(
         if not dry_run:
             session.commit()
 
+    # After applying all moves, clean up any empty source directories
+    if not dry_run:
+        _cleanup_empty_dirs(proposals)
+
     con.print(
         f"\n[bold]Done:[/bold] {counts['applied']} applied, "
         f"{counts['failed']} failed, {counts['skipped']} skipped"
     )
     return counts
+
+
+def _cleanup_empty_dirs(proposals: list) -> None:
+    """
+    Remove source directories that are now empty after MOVE proposals were applied.
+    Walks bottom-up so deeply nested empty dirs are cleaned before their parents.
+    Never removes a directory that still contains files or subdirectories.
+    """
+    # Collect all unique source dirs from applied MOVE proposals
+    moved_dirs: set[Path] = set()
+    for prop in proposals:
+        if (
+            prop.proposal_type == ProposalType.MOVE
+            and prop.status == ProposalStatus.APPLIED
+            and prop.current_value
+        ):
+            moved_dirs.add(Path(prop.current_value).parent)
+
+    if not moved_dirs:
+        return
+
+    # Sort deepest first so children are cleaned before parents
+    for dir_path in sorted(moved_dirs, key=lambda p: len(p.parts), reverse=True):
+        try:
+            if dir_path.exists() and dir_path.is_dir():
+                # Only remove if truly empty (no files, no subdirs)
+                contents = list(dir_path.iterdir())
+                if not contents:
+                    dir_path.rmdir()
+                    # Also try to clean the parent if it's now empty
+                    parent = dir_path.parent
+                    if parent.exists() and parent.is_dir():
+                        parent_contents = list(parent.iterdir())
+                        if not parent_contents:
+                            parent.rmdir()
+        except OSError:
+            pass  # Directory might be in use or protected — skip silently
 
 

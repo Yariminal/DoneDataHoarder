@@ -108,6 +108,7 @@ class BaseAnalyzer(ABC):
             if not f:
                 return
             f.ai_description = result.description
+            f.ai_suggested_name = result.suggested_name or None
             f.ai_tags = json.dumps(result.tags)
             f.ai_confidence = result.confidence
             f.ai_model = model_name

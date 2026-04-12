@@ -188,6 +188,9 @@ Rules:
 - For move/merge: specify source folder, destination folder, which files (all or description)
 - For rename_folder: "new_name" must be ONLY the new folder name (e.g. "Brand_Logos"), \
 NOT a full path. The folder stays in its current parent directory, only its name changes.
+- IMPORTANT: Do NOT both rename a folder AND move all its files out of it. \
+If a folder has the right content but just a bad name, use rename_folder. \
+If files need to move to a different location, use move — but then don't also rename the emptied source.
 - Create meaningful folder names based on content themes
 - Folder names should use underscores instead of spaces, and be in English
 - Use relative paths from the root

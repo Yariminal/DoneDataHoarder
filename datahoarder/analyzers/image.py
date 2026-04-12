@@ -76,7 +76,7 @@ Context about the file:
 Return a JSON object with these fields:
 {{
   "description": "2-3 sentence description of what is in the image",
-  "suggested_name": "a concise, meaningful filename stem (no extension, no date prefix, use_underscores, max 50 chars)",
+  "suggested_name": "a concise, meaningful filename stem — MUST preserve specific proper nouns (people, places, events) from the original filename. Translate to English if not already. No extension, no date prefix, use_underscores, max 50 chars",
   "tags": ["tag1", "tag2", ...],
   "category": "one of: photo_person, photo_group, photo_place, photo_event, photo_document, photo_object, screenshot, artwork, other",
   "detected_date": "YYYY-MM-DD if a date is visible or inferable, else null",

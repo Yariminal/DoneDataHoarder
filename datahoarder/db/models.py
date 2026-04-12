@@ -148,6 +148,7 @@ class File(Base):
 
     # --- AI output ---
     ai_description: Mapped[Optional[str]] = mapped_column(Text)
+    ai_suggested_name: Mapped[Optional[str]] = mapped_column(String)  # AI-proposed filename stem
     ai_tags: Mapped[Optional[str]] = mapped_column(Text)        # JSON array string
     ai_transcript: Mapped[Optional[str]] = mapped_column(Text)  # video/audio transcript
     ai_confidence: Mapped[Optional[float]] = mapped_column(Float)
