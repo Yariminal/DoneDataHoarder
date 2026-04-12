@@ -280,6 +280,7 @@ def execute(
     con = _console or console
     engine = get_engine()
     counts = {"applied": 0, "failed": 0, "skipped": 0}
+    move_source_dirs: set[Path] = set()
 
     if dry_run:
         con.print("[bold yellow]DRY RUN -- no files will be changed[/bold yellow]\n")
@@ -397,12 +398,21 @@ def execute(
                 counts["failed"] += 1
                 con.print(f"  [red]ERROR on proposal {prop.id}: {exc}[/red]")
 
+        # Capture source dirs for cleanup BEFORE session closes (objects detach on close)
+        move_source_dirs: set[Path] = set()
         if not dry_run:
+            for prop in proposals:
+                if (
+                    prop.proposal_type == ProposalType.MOVE
+                    and prop.status == ProposalStatus.APPLIED
+                    and prop.current_value
+                ):
+                    move_source_dirs.add(Path(prop.current_value).parent)
             session.commit()
 
-    # After applying all moves, clean up any empty source directories
-    if not dry_run:
-        _cleanup_empty_dirs(proposals)
+    # After applying all moves, clean up any now-empty source directories
+    if not dry_run and move_source_dirs:
+        _cleanup_empty_dirs(move_source_dirs)
 
     con.print(
         f"\n[bold]Done:[/bold] {counts['applied']} applied, "
@@ -411,22 +421,12 @@ def execute(
     return counts
 
 
-def _cleanup_empty_dirs(proposals: list) -> None:
+def _cleanup_empty_dirs(moved_dirs: set[Path]) -> None:
     """
     Remove source directories that are now empty after MOVE proposals were applied.
     Walks bottom-up so deeply nested empty dirs are cleaned before their parents.
     Never removes a directory that still contains files or subdirectories.
     """
-    # Collect all unique source dirs from applied MOVE proposals
-    moved_dirs: set[Path] = set()
-    for prop in proposals:
-        if (
-            prop.proposal_type == ProposalType.MOVE
-            and prop.status == ProposalStatus.APPLIED
-            and prop.current_value
-        ):
-            moved_dirs.add(Path(prop.current_value).parent)
-
     if not moved_dirs:
         return
 

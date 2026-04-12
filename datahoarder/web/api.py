@@ -374,6 +374,29 @@ def _require_session_id(body_session_id: str = "") -> str:
     return sid
 
 
+def _resolve_model(body_model: str, session_id: str, fallback: str = "gemma3:12b") -> str:
+    """
+    Resolve the model to use, with fallback priority:
+      1. body_model (from request) — if non-empty
+      2. session.model (stored in DB)
+      3. fallback default
+    This prevents empty-string model names from reaching Ollama.
+    """
+    if body_model:
+        return body_model
+    if session_id:
+        from datahoarder.db.models import UserSession
+        from sqlalchemy.orm import Session as _Sess
+        try:
+            with _Sess(get_engine()) as db:
+                us = db.get(UserSession, session_id)
+                if us and us.model:
+                    return us.model
+        except Exception:
+            pass
+    return fallback
+
+
 def _mark_session_unsaved(session_id: str, step: str | None = None) -> None:
     """Helper: mark a session as unsaved and optionally record a completed step."""
     engine = get_engine()
@@ -952,10 +975,18 @@ def trigger_analyze(body: PipelineRequest):
 
     try:
         sid = _require_session_id(body.session_id)
+        model = _resolve_model(body.model, sid)
+        # Persist the resolved model back to the session so later steps (Propose, Organize) can use it
+        if model and body.model:
+            with Session(get_engine()) as db:
+                us = db.get(UserSession, sid)
+                if us and not us.model:
+                    us.model = model
+                    db.commit()
         job_id = job_manager.start_analyze(
             session_id=sid,
             backend=body.backend,
-            model=body.model,
+            model=model,
             workers=body.workers,
         )
         return {"job_id": job_id, "status": "started"}
@@ -1079,10 +1110,11 @@ def trigger_organize(body: PipelineRequest = PipelineRequest()):
 
     try:
         sid = _require_session_id(body.session_id)
+        model = _resolve_model(body.model, sid)
         init_ai(
             backend=body.backend,
-            text_model=body.model,
-            vision_model=body.model,
+            text_model=model,
+            vision_model=model,
         )
     except RuntimeError as exc:
         raise HTTPException(503, str(exc))
