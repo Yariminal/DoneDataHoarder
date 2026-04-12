@@ -243,6 +243,27 @@ def generate_reorg_proposals(session_id: str) -> dict:
         root_path = us.root_path
         preferred_language = us.preferred_language or "leave_as_is"
 
+    # Clear any previous PENDING organizer proposals for this session so that
+    # re-running Organize always starts from a clean slate.  Applied/rejected
+    # proposals are preserved — we only discard ones the user hasn't acted on yet.
+    with Session(engine) as db:
+        stale = (
+            db.query(Proposal)
+            .join(File, Proposal.file_id == File.id)
+            .filter(
+                File.session_id == session_id,
+                Proposal.status == ProposalStatus.PENDING,
+                Proposal.proposal_type.in_([
+                    ProposalType.MOVE,
+                    ProposalType.RENAME_FOLDER,
+                ]),
+            )
+            .all()
+        )
+        for p in stale:
+            db.delete(p)
+        db.commit()
+
     # Phase 1: Build folder summary tree
     folder_summaries = build_folder_tree(session_id, root_path)
     if not folder_summaries:

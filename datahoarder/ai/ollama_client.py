@@ -77,14 +77,18 @@ class OllamaClient:
         model: Optional[str] = None,
         system: Optional[str] = None,
         temperature: float = 0.2,
+        seed: Optional[int] = None,
     ) -> str:
         """Send a text prompt, return the response string."""
         model = model or self.text_model
+        options: dict = {"temperature": temperature}
+        if seed is not None:
+            options["seed"] = seed
         payload: dict = {
             "model": model,
             "prompt": prompt,
             "stream": False,
-            "options": {"temperature": temperature},
+            "options": options,
         }
         if system:
             payload["system"] = system
@@ -108,6 +112,7 @@ class OllamaClient:
         model: Optional[str] = None,
         system: Optional[str] = None,
         temperature: float = 0.2,
+        seed: Optional[int] = None,
     ) -> str:
         """Send a prompt + one or more images, return the response string."""
         model = model or self.vision_model
@@ -129,12 +134,15 @@ class OllamaClient:
         if not b64_images:
             raise ValueError("At least one image must be provided")
 
+        options: dict = {"temperature": temperature}
+        if seed is not None:
+            options["seed"] = seed
         payload: dict = {
             "model": model,
             "prompt": prompt,
             "images": b64_images,
             "stream": False,
-            "options": {"temperature": temperature},
+            "options": options,
         }
         if system:
             payload["system"] = system
@@ -157,10 +165,15 @@ class OllamaClient:
         images_list: list[bytes] | None = None,
         model: Optional[str] = None,
         system: Optional[str] = None,
+        temperature: float = 0.0,
+        seed: int = 42,
     ) -> dict:
         """
         Like generate / generate_with_image but instructs the model to return
         valid JSON and parses the result.  Falls back to raw text on parse error.
+
+        Defaults to temperature=0.0 + seed=42 for deterministic structured output.
+        This makes repeated calls with the same input produce the same JSON.
         """
         json_instruction = (
             "\n\nYou MUST respond with valid JSON only. "
@@ -172,9 +185,11 @@ class OllamaClient:
             raw = self.generate_with_image(
                 full_prompt, image_path=image_path, image_bytes=image_bytes,
                 images_list=images_list, model=model, system=system,
+                temperature=temperature, seed=seed,
             )
         else:
-            raw = self.generate(full_prompt, model=model, system=system)
+            raw = self.generate(full_prompt, model=model, system=system,
+                                temperature=temperature, seed=seed)
 
         # Strip any accidental markdown fences
         raw = raw.strip()
