@@ -24,9 +24,11 @@ from rich.progress import (
 )
 from sqlalchemy.orm import Session
 
+from datahoarder.analyzers.archive import ArchiveAnalyzer
 from datahoarder.analyzers.base import BaseAnalyzer, AnalysisResult
 from datahoarder.analyzers.document import DocumentAnalyzer
 from datahoarder.analyzers.image import ImageAnalyzer
+from datahoarder.analyzers.threedmodel import ThreeDModelAnalyzer
 from datahoarder.analyzers.video import VideoAnalyzer
 from datahoarder.core.context import build_context
 from datahoarder.db.models import File, FileStatus
@@ -130,6 +132,8 @@ def analyze(
         ImageAnalyzer(client),
         VideoAnalyzer(client),
         DocumentAnalyzer(client),
+        ArchiveAnalyzer(client),
+        ThreeDModelAnalyzer(client),
     ]
 
     engine = get_engine()
@@ -226,6 +230,8 @@ def analyze_with_progress(
         ImageAnalyzer(client),
         VideoAnalyzer(client),
         DocumentAnalyzer(client),
+        ArchiveAnalyzer(client),
+        ThreeDModelAnalyzer(client),
     ]
 
     engine = get_engine()

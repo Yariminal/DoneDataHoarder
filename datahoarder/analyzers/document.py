@@ -20,6 +20,8 @@ DOC_EXTENSIONS = {
     ".txt", ".md", ".rtf",
     ".json", ".xml", ".yaml", ".yml",
     ".html", ".htm",
+    ".ai",   # Adobe Illustrator (PDF-based — text extraction often works)
+    ".mtl",  # Wavefront material library — plain text
 }
 DOC_MIMES = {
     "application/pdf",
