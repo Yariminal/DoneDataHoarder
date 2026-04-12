@@ -10,12 +10,20 @@ Ollama API docs: https://github.com/ollama/ollama/blob/main/docs/api.md
 import base64
 import json
 import re
+import threading
 from pathlib import Path
 from typing import Optional
 
 import httpx
 
 DEFAULT_HOST = "http://localhost:11434"
+
+# Ollama processes LLM requests serially. This lock prevents multiple threads
+# from sending concurrent requests — they'd just queue inside Ollama and the
+# extra connections waste memory. Pre-processing (text extraction, Whisper,
+# image resize) still runs in parallel across worker threads; only the actual
+# HTTP call to Ollama is serialised here.
+_OLLAMA_REQUEST_LOCK = threading.Semaphore(1)
 DEFAULT_TEXT_MODEL = "gemma3:12b"
 DEFAULT_VISION_MODEL = "gemma3:12b"  # gemma3 is multimodal
 TIMEOUT = 120  # seconds — vision inference can be slow
@@ -81,10 +89,11 @@ class OllamaClient:
         if system:
             payload["system"] = system
 
-        with httpx.Client(timeout=TIMEOUT) as client:
-            resp = client.post(f"{self.host}/api/generate", json=payload)
-            resp.raise_for_status()
-            return resp.json().get("response", "").strip()
+        with _OLLAMA_REQUEST_LOCK:
+            with httpx.Client(timeout=TIMEOUT) as client:
+                resp = client.post(f"{self.host}/api/generate", json=payload)
+                resp.raise_for_status()
+                return resp.json().get("response", "").strip()
 
     # ------------------------------------------------------------------
     # Vision generation
@@ -130,10 +139,11 @@ class OllamaClient:
         if system:
             payload["system"] = system
 
-        with httpx.Client(timeout=TIMEOUT) as client:
-            resp = client.post(f"{self.host}/api/generate", json=payload)
-            resp.raise_for_status()
-            return resp.json().get("response", "").strip()
+        with _OLLAMA_REQUEST_LOCK:
+            with httpx.Client(timeout=TIMEOUT) as client:
+                resp = client.post(f"{self.host}/api/generate", json=payload)
+                resp.raise_for_status()
+                return resp.json().get("response", "").strip()
 
     # ------------------------------------------------------------------
     # Structured JSON extraction helper

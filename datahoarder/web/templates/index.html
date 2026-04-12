@@ -755,7 +755,7 @@
           <label class="text-sm">Workers</label>
           <input type="number" class="input" x-model.number="selectedWorkers" @change="saveSettings()" min="1" max="8" style="width:80px">
           <div></div>
-          <p class="text-dim text-sm">Parallel threads for AI analysis (1-8). Higher = faster but uses more RAM.</p>
+          <p class="text-dim text-sm">Parallel worker threads for analysis (1–8). Workers overlap file prep (text extraction, Whisper, image resize) while LLM calls remain serial. Higher values improve throughput for mixed archives, but use more RAM.</p>
           <label class="text-sm">Ollama Parallel</label>
           <div style="display:flex; gap:8px; align-items:center;">
             <input type="number" class="input" x-model.number="numParallel" @change="saveSettings()" min="1" max="8" style="width:80px">

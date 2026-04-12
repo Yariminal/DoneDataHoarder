@@ -3,15 +3,19 @@ Analysis pipeline — orchestrates all analyzers across ENRICHED files.
 
 Picks the right analyzer per file, runs it, saves results.
 
-NOTE on parallelism: Ollama (and most local LLMs) processes requests
-sequentially. Sending multiple concurrent requests causes them to queue
-up, leading to connection timeouts and deadlocks. For this reason, the
-web-facing analyze_with_progress() processes files ONE AT A TIME.
-The CLI analyze() also defaults to sequential processing.
+Parallelism model:
+  - Worker threads run _process_one_file() concurrently.
+  - Pre-processing (text extraction, image resize, Whisper transcription)
+    overlaps freely between workers.
+  - The actual Ollama LLM call is serialised via _OLLAMA_REQUEST_LOCK in
+    ollama_client.py — Ollama is sequential anyway, but the lock prevents
+    connection pool exhaustion when workers > 1.
+  - GPU safety: WhisperModel runs on CPU (fixed), so no GPU contention with Ollama.
 """
 import logging
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
 from rich.progress import (
@@ -204,11 +208,11 @@ def analyze_with_progress(
     cancel_check: Callable[[], bool] | None = None,
 ):
     """
-    Analyze files sequentially, yielding progress dicts for SSE streaming.
+    Analyze files, yielding progress dicts for SSE streaming.
 
-    Processing is sequential (one file at a time) because Ollama and most
-    local LLM backends process requests sequentially. Parallel requests
-    just queue up and cause timeouts/deadlocks.
+    When workers > 1, files are processed in parallel using a ThreadPoolExecutor.
+    Pre-processing (text extraction, image resize, Whisper transcription) overlaps
+    between workers; LLM calls are serialised by _OLLAMA_REQUEST_LOCK in the client.
 
     Yields:
         {"current": N, "total": M, "analyzed": A, "skipped": S, "errors": E}
@@ -227,6 +231,7 @@ def analyze_with_progress(
     engine = get_engine()
     counts = {"analyzed": 0, "skipped": 0, "errors": 0}
     skip_ext = skip_extensions or set()
+    effective_workers = max(1, workers)
 
     with Session(engine) as session:
         query = session.query(File).filter(File.status == FileStatus.ENRICHED)
@@ -259,29 +264,56 @@ def analyze_with_progress(
         if not batch:
             break
 
-        for (file_id,) in batch:
-            # Check cancel before each file
-            if cancel_check and cancel_check():
-                yield {"cancelled": True, **counts}
-                return
+        if effective_workers <= 1:
+            # ----- Sequential path -----
+            for (file_id,) in batch:
+                if cancel_check and cancel_check():
+                    yield {"cancelled": True, **counts}
+                    return
+                if pause_event:
+                    pause_event.wait()
 
-            # Block if paused
+                fid, status, error = _process_one_file(
+                    file_id, engine, analyzer_list, client, skip_ext,
+                )
+                if error:
+                    logger.warning("File %d failed: %s", fid, error)
+                counts[status if status in counts else "errors"] += 1
+                processed += 1
+                yield {"current": processed, "total": total, **counts}
+                if limit and processed >= limit:
+                    break
+        else:
+            # ----- Parallel path -----
+            # Check pause before submitting the batch
             if pause_event:
                 pause_event.wait()
 
-            fid, status, error = _process_one_file(
-                file_id, engine, analyzer_list, client, skip_ext,
-            )
-
-            if error:
-                logger.warning("File %d failed: %s", fid, error)
-
-            counts[status if status in counts else "errors"] += 1
-            processed += 1
-            yield {"current": processed, "total": total, **counts}
-
-            if limit and processed >= limit:
-                break
+            with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+                futures = {
+                    pool.submit(
+                        _process_one_file, file_id, engine, analyzer_list, client, skip_ext,
+                    ): file_id
+                    for (file_id,) in batch
+                }
+                for future in as_completed(futures):
+                    if cancel_check and cancel_check():
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        yield {"cancelled": True, **counts}
+                        return
+                    try:
+                        fid, status, error = future.result()
+                        if error:
+                            logger.warning("File %d failed: %s", fid, error)
+                        counts[status if status in counts else "errors"] += 1
+                    except Exception as exc:
+                        logger.error("Worker raised: %s", exc)
+                        counts["errors"] += 1
+                    processed += 1
+                    yield {"current": processed, "total": total, **counts}
+                    if limit and processed >= limit:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        break
 
         if limit and processed >= limit:
             break
