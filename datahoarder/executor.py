@@ -366,6 +366,20 @@ def execute(
                                 other.current_value = other.current_value.replace(old_prefix, new_prefix, 1)
                             if other.proposed_value and old_prefix in other.proposed_value:
                                 other.proposed_value = other.proposed_value.replace(old_prefix, new_prefix, 1)
+                        # Pre-mark any MOVE proposals that became no-ops after the rename
+                        # (source == destination means the file is already where it should be)
+                        for other in proposals:
+                            if (
+                                other is not prop
+                                and other.proposal_type == ProposalType.MOVE
+                                and other.status not in (ProposalStatus.APPLIED, ProposalStatus.REJECTED)
+                                and other.current_value
+                                and other.current_value == other.proposed_value
+                            ):
+                                other.status = ProposalStatus.APPLIED
+                                other.applied_at = datetime.utcnow()
+                                counts["applied"] += 1
+                                con.print(f"  [dim]Skipped no-op move (folder renamed in-place): {Path(other.current_value).name}[/dim]")
 
                 elif prop.proposal_type == ProposalType.MOVE:
                     ok, msg = _apply_move(prop, dry_run)
@@ -427,28 +441,36 @@ def execute(
 
 def _cleanup_empty_dirs(moved_dirs: set[Path]) -> None:
     """
-    Remove source directories that are now empty after MOVE proposals were applied.
-    Walks bottom-up so deeply nested empty dirs are cleaned before their parents.
+    Remove empty directories left behind after MOVE proposals were applied.
+
+    Expands each source dir to its full ancestor chain (up to 6 levels), then
+    sorts deepest-first so children are always removed before parents. This
+    handles orphan subtrees like Year_2019_Summary/Stone_Sales_Data that were
+    left stranded at the wrong depth after a rename+move cascade.
+
     Never removes a directory that still contains files or subdirectories.
     """
     if not moved_dirs:
         return
 
-    # Sort deepest first so children are cleaned before parents
-    for dir_path in sorted(moved_dirs, key=lambda p: len(p.parts), reverse=True):
+    # Expand each moved dir to include its ancestors so whole orphan trees get cleaned
+    to_check: set[Path] = set()
+    for d in moved_dirs:
+        current = d
+        for _ in range(6):
+            to_check.add(current)
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+
+    # Deepest first — removes children before parents
+    for dir_path in sorted(to_check, key=lambda p: len(p.parts), reverse=True):
         try:
             if dir_path.exists() and dir_path.is_dir():
-                # Only remove if truly empty (no files, no subdirs)
-                contents = list(dir_path.iterdir())
-                if not contents:
+                if not any(dir_path.iterdir()):
                     dir_path.rmdir()
-                    # Also try to clean the parent if it's now empty
-                    parent = dir_path.parent
-                    if parent.exists() and parent.is_dir():
-                        parent_contents = list(parent.iterdir())
-                        if not parent_contents:
-                            parent.rmdir()
         except OSError:
-            pass  # Directory might be in use or protected — skip silently
+            pass  # in use or protected — skip silently
 
 
