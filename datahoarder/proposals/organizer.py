@@ -247,21 +247,24 @@ def generate_reorg_proposals(session_id: str) -> dict:
     # re-running Organize always starts from a clean slate.  Applied/rejected
     # proposals are preserved — we only discard ones the user hasn't acted on yet.
     with Session(engine) as db:
-        stale = (
-            db.query(Proposal)
-            .join(File, Proposal.file_id == File.id)
-            .filter(
-                File.session_id == session_id,
-                Proposal.status == ProposalStatus.PENDING,
-                Proposal.proposal_type.in_([
-                    ProposalType.MOVE,
-                    ProposalType.RENAME_FOLDER,
-                ]),
+        stale_ids = [
+            p_id for (p_id,) in (
+                db.query(Proposal.id)
+                .join(File, Proposal.file_id == File.id)
+                .filter(
+                    File.session_id == session_id,
+                    Proposal.status == ProposalStatus.PENDING,
+                    Proposal.proposal_type.in_([
+                        ProposalType.MOVE,
+                        ProposalType.RENAME_FOLDER,
+                    ]),
+                )
             )
-            .all()
-        )
-        for p in stale:
-            db.delete(p)
+        ]
+        if stale_ids:
+            db.query(Proposal).filter(
+                Proposal.id.in_(stale_ids)
+            ).delete(synchronize_session=False)
         db.commit()
 
     # Phase 1: Build folder summary tree
