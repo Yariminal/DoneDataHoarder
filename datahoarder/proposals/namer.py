@@ -112,8 +112,13 @@ def build_new_name(file_rec: File) -> Optional[str]:
 
     stem_from_desc = None
 
-    # Try to use tags first (more specific and meaningful)
-    if tags_str:
+    # Try AI's suggested_name first — it's the most specific and preserves proper nouns
+    # (e.g. "liberman_house_final_submission", "greece_partnership_agreement")
+    if file_rec.ai_suggested_name:
+        stem_from_desc = _safe(file_rec.ai_suggested_name)
+
+    # Fallback: try tags (more specific than a free-text description)
+    if not stem_from_desc and tags_str:
         try:
             tags = json.loads(tags_str)
             # Filter out generic/vague tags that don't add meaningful info

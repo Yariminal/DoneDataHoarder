@@ -216,6 +216,8 @@ document.addEventListener('alpine:init', () => {
         localStorage.removeItem('datahoarder_model');
         localStorage.removeItem('datahoarder_folder');
         localStorage.removeItem('datahoarder_workers');
+        // Signal setup component to reset its fields
+        window.dispatchEvent(new CustomEvent('datahoarder:new-session'));
         Alpine.store('app').tab = 'setup';
         Alpine.store('app').toast('New session created. Configure your settings and run the pipeline.', 'success');
       } catch (e) {
@@ -657,6 +659,11 @@ document.addEventListener('alpine:init', () => {
     async init() {
       await this.loadOllamaStatus();
       await this.loadInstalledModels();
+      // Reset folder/model fields when a new session is created
+      window.addEventListener('datahoarder:new-session', () => {
+        this.selectedFolder = '';
+        this.selectedModel = '';
+      });
       this.$watch('showBrowser', (val) => {
         if (val && !this.currentPath) {
           this.browsePath('');

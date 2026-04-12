@@ -112,21 +112,50 @@ def _extract_frame(path: Path, timestamp: float) -> Optional[bytes]:
         return None
 
 
+_whisper_model_instance = None
+_whisper_lock = None
+
+def _get_whisper_model(model_size: str = WHISPER_MODEL):
+    """Get or create a singleton WhisperModel (avoids reloading on every file)."""
+    global _whisper_model_instance, _whisper_lock
+    import threading
+    if _whisper_lock is None:
+        _whisper_lock = threading.Lock()
+    with _whisper_lock:
+        if _whisper_model_instance is None:
+            _whisper_model_instance = WhisperModel(
+                model_size, device="cpu", compute_type="int8",
+            )
+        return _whisper_model_instance
+
+
 def _transcribe(path: Path, model_size: str = WHISPER_MODEL) -> str:
-    """Transcribe audio/video with faster-whisper, return text excerpt."""
+    """Transcribe audio/video with faster-whisper, return text excerpt.
+
+    Uses CPU to avoid GPU memory conflicts with Ollama.
+    """
     if not _HAS_WHISPER:
         return ""
     try:
-        model = WhisperModel(model_size, device="auto", compute_type="auto")
-        segments, _ = model.transcribe(str(path), beam_size=1, language=None)
-        parts = []
-        chars = 0
-        for seg in segments:
-            parts.append(seg.text.strip())
-            chars += len(seg.text)
-            if chars >= TRANSCRIPT_MAX_CHARS:
-                break
-        return " ".join(parts)[:TRANSCRIPT_MAX_CHARS]
+        import concurrent.futures
+        def _do_transcribe():
+            model = _get_whisper_model(model_size)
+            segments, _ = model.transcribe(str(path), beam_size=1, language=None)
+            parts = []
+            chars = 0
+            for seg in segments:
+                parts.append(seg.text.strip())
+                chars += len(seg.text)
+                if chars >= TRANSCRIPT_MAX_CHARS:
+                    break
+            return " ".join(parts)[:TRANSCRIPT_MAX_CHARS]
+
+        # Timeout transcription to prevent hangs on large files
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_do_transcribe)
+            return future.result(timeout=60)
+    except concurrent.futures.TimeoutError:
+        return ""
     except Exception:
         return ""
 
@@ -144,7 +173,7 @@ I've sampled {frame_count} frames from the video. Describe what you observe acro
 Return a JSON object:
 {{
   "description": "2-3 sentences describing the video content",
-  "suggested_name": "meaningful filename stem (no extension, no date prefix, use_underscores, max 60 chars)",
+  "suggested_name": "meaningful filename stem — MUST preserve specific proper nouns (names, places, events) from the original filename. Translate to English if not already. No extension, no date prefix, use_underscores, max 60 chars",
   "tags": ["tag1", "tag2", ...],
   "video_type": "one of: home_video, event, tutorial, presentation, screen_recording, movie_clip, music_video, other",
   "detected_date": "YYYY-MM-DD if inferable, else null",
@@ -163,7 +192,7 @@ Context about the file:
 Return a JSON object:
 {{
   "description": "1-2 sentences describing the audio content",
-  "suggested_name": "meaningful filename stem (no extension, use_underscores, max 60 chars)",
+  "suggested_name": "meaningful filename stem — MUST preserve specific proper nouns (names, places, events) from the original filename. Translate to English if not already. No extension, use_underscores, max 60 chars",
   "tags": ["tag1", "tag2", ...],
   "audio_type": "one of: music, podcast, voice_memo, lecture, meeting_recording, sound_effect, other",
   "detected_date": "YYYY-MM-DD if inferable, else null",

@@ -31,7 +31,12 @@ class OllamaClient:
         self.host = host.rstrip("/")
         self.text_model = text_model
         self.vision_model = vision_model
-        self._client = httpx.Client(timeout=TIMEOUT)
+        # NOTE: We create a fresh httpx client per request (via _request)
+        # instead of sharing one across threads. A shared httpx.Client
+        # causes connection pool deadlocks when multiple threads hit
+        # Ollama concurrently — Ollama processes requests sequentially,
+        # so queued requests block and the connection pool fills up,
+        # causing all threads to hang indefinitely.
 
     # ------------------------------------------------------------------
     # Connectivity check
@@ -39,16 +44,18 @@ class OllamaClient:
 
     def is_available(self) -> bool:
         try:
-            resp = self._client.get(f"{self.host}/api/tags", timeout=5)
-            return resp.status_code == 200
+            with httpx.Client(timeout=5) as client:
+                resp = client.get(f"{self.host}/api/tags")
+                return resp.status_code == 200
         except Exception:
             return False
 
     def list_models(self) -> list[str]:
         try:
-            resp = self._client.get(f"{self.host}/api/tags")
-            resp.raise_for_status()
-            return [m["name"] for m in resp.json().get("models", [])]
+            with httpx.Client(timeout=10) as client:
+                resp = client.get(f"{self.host}/api/tags")
+                resp.raise_for_status()
+                return [m["name"] for m in resp.json().get("models", [])]
         except Exception:
             return []
 
@@ -74,9 +81,10 @@ class OllamaClient:
         if system:
             payload["system"] = system
 
-        resp = self._client.post(f"{self.host}/api/generate", json=payload)
-        resp.raise_for_status()
-        return resp.json().get("response", "").strip()
+        with httpx.Client(timeout=TIMEOUT) as client:
+            resp = client.post(f"{self.host}/api/generate", json=payload)
+            resp.raise_for_status()
+            return resp.json().get("response", "").strip()
 
     # ------------------------------------------------------------------
     # Vision generation
@@ -122,9 +130,10 @@ class OllamaClient:
         if system:
             payload["system"] = system
 
-        resp = self._client.post(f"{self.host}/api/generate", json=payload)
-        resp.raise_for_status()
-        return resp.json().get("response", "").strip()
+        with httpx.Client(timeout=TIMEOUT) as client:
+            resp = client.post(f"{self.host}/api/generate", json=payload)
+            resp.raise_for_status()
+            return resp.json().get("response", "").strip()
 
     # ------------------------------------------------------------------
     # Structured JSON extraction helper
@@ -196,10 +205,10 @@ class OllamaClient:
         return {"raw_response": raw}
 
     def close(self):
-        self._client.close()
+        pass  # No shared client to close
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_):
-        self.close()
+        pass

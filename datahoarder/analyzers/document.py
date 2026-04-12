@@ -137,7 +137,7 @@ Extracted text (first {max_chars} characters):
 Based on the filename, folder context, and document content, return a JSON object:
 {{
   "description": "1-2 sentences describing what this document is about",
-  "suggested_name": "meaningful filename stem (no extension, no date prefix, use_underscores, max 60 chars)",
+  "suggested_name": "meaningful filename stem — MUST preserve specific proper nouns (names, places, organizations, project titles) from the original filename and content. Translate to English if not already. No extension, no date prefix, use_underscores, max 60 chars",
   "tags": ["tag1", "tag2", ...],
   "document_type": "one of: invoice, receipt, contract, report, letter, cv_resume, photo, presentation, spreadsheet, notes, form, certificate, manual, other",
   "detected_date": "YYYY-MM-DD if a date is clearly present in the content, else null",

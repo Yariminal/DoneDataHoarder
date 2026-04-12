@@ -2,12 +2,16 @@
 Analysis pipeline — orchestrates all analyzers across ENRICHED files.
 
 Picks the right analyzer per file, runs it, saves results.
-Supports batched parallel processing via ThreadPoolExecutor.
+
+NOTE on parallelism: Ollama (and most local LLMs) processes requests
+sequentially. Sending multiple concurrent requests causes them to queue
+up, leading to connection timeouts and deadlocks. For this reason, the
+web-facing analyze_with_progress() processes files ONE AT A TIME.
+The CLI analyze() also defaults to sequential processing.
 """
+import logging
 import threading
 import traceback
-import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
 from rich.progress import (
@@ -23,6 +27,8 @@ from datahoarder.analyzers.video import VideoAnalyzer
 from datahoarder.core.context import build_context
 from datahoarder.db.models import File, FileStatus
 from datahoarder.db.session import get_engine
+
+logger = logging.getLogger(__name__)
 
 QUERY_BATCH = 50
 
@@ -40,20 +46,74 @@ def _get_analyzer(
     return None
 
 
+def _process_one_file(
+    file_id: int,
+    engine,
+    analyzers: list[BaseAnalyzer],
+    client,
+    skip_ext: set[str],
+) -> tuple[int, str, Optional[str]]:
+    """Analyze a single file. Returns (file_id, status, error_msg)."""
+    with Session(engine) as session:
+        file_rec = session.get(File, file_id)
+        if not file_rec:
+            return file_id, "error", "File not found in DB"
+
+        logger.debug("Processing file %d: %s (%s)", file_id, file_rec.filename, file_rec.mime_type)
+
+        ext = file_rec.extension or ""
+        if ext in skip_ext:
+            file_rec.status = FileStatus.SKIPPED
+            session.commit()
+            return file_id, "skipped", None
+
+        analyzer = _get_analyzer(analyzers, file_rec.mime_type, ext)
+        if not analyzer:
+            file_rec.status = FileStatus.SKIPPED
+            mime = file_rec.mime_type or ""
+            if mime.startswith("video/") or ext in (
+                ".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v",
+            ):
+                file_rec.ai_description = (
+                    "Skipped: install ffmpeg to analyze video files"
+                )
+            else:
+                file_rec.ai_description = (
+                    "No analyzer available for this file type"
+                )
+            session.commit()
+            return file_id, "skipped", None
+
+        ctx = build_context(file_rec)
+        try:
+            result: AnalysisResult = analyzer.analyze(file_rec, ctx)
+            analyzer.save_result(
+                file_rec, result, model_name=str(type(client).__name__),
+            )
+            return file_id, "analyzed", None
+        except Exception as exc:
+            tb = traceback.format_exc()
+            logger.warning("File %d failed: %s", file_id, exc)
+            file_rec.status = FileStatus.ERROR
+            file_rec.error_message = f"{exc}\n{tb}"[:1000]
+            session.commit()
+            return file_id, "error", str(exc)
+
+
 def analyze(
-    workers: int = 2,
+    workers: int = 1,
     limit: Optional[int] = None,
     min_size_kb: int = 0,
     skip_extensions: Optional[set[str]] = None,
     session_id: str | None = None,
 ) -> dict:
     """
-    Run AI analysis on all ENRICHED files.
+    Run AI analysis on all ENRICHED files (CLI version with Rich progress).
 
     Args:
-        workers:          Number of parallel threads (keep low to avoid OOM with local models).
+        workers:          Ignored (kept for API compat). Processing is sequential.
         limit:            Process at most this many files.
-        min_size_kb:      Skip files smaller than this (avoids analyzing empty files).
+        min_size_kb:      Skip files smaller than this.
         skip_extensions:  Set of extensions to skip (e.g. {'.db', '.iso'}).
 
     Returns:
@@ -62,7 +122,7 @@ def analyze(
     from datahoarder.ai.router import get_client
 
     client = get_client()
-    analyzers: list[BaseAnalyzer] = [
+    analyzer_list: list[BaseAnalyzer] = [
         ImageAnalyzer(client),
         VideoAnalyzer(client),
         DocumentAnalyzer(client),
@@ -82,42 +142,6 @@ def analyze(
             query = query.limit(limit)
         total = query.count()
 
-    def process_file(file_id: int) -> tuple[int, str, Optional[str]]:
-        """Worker function: analyze one file. Returns (id, status, error)."""
-        with Session(engine) as session:
-            file_rec = session.get(File, file_id)
-            if not file_rec:
-                return file_id, "error", "File not found in DB"
-
-            ext = file_rec.extension or ""
-            if ext in skip_ext:
-                file_rec.status = FileStatus.SKIPPED
-                session.commit()
-                return file_id, "skipped", None
-
-            analyzer = _get_analyzer(analyzers, file_rec.mime_type, ext)
-            if not analyzer:
-                file_rec.status = FileStatus.SKIPPED
-                mime = file_rec.mime_type or ""
-                if mime.startswith("video/") or ext in (".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v"):
-                    file_rec.ai_description = "Skipped: install ffmpeg to analyze video files"
-                else:
-                    file_rec.ai_description = "No analyzer available for this file type"
-                session.commit()
-                return file_id, "skipped", None
-
-            ctx = build_context(file_rec)
-            try:
-                result: AnalysisResult = analyzer.analyze(file_rec, ctx)
-                analyzer.save_result(file_rec, result, model_name=str(type(client).__name__))
-                return file_id, "analyzed", None
-            except Exception as exc:
-                tb = traceback.format_exc()
-                file_rec.status = FileStatus.ERROR
-                file_rec.error_message = f"{exc}\n{tb}"[:1000]
-                session.commit()
-                return file_id, "error", str(exc)
-
     with Progress(
         SpinnerColumn(),
         TextColumn("[bold magenta]{task.description}"),
@@ -127,71 +151,42 @@ def analyze(
         TimeElapsedColumn(),
         refresh_per_second=2,
     ) as progress:
-        task = progress.add_task("Analyzing…", total=total)
-
-        failed_ids: set[int] = set()
-        offset = 0
+        task = progress.add_task("Analyzing...", total=total)
         processed = 0
 
         while True:
             with Session(engine) as session:
-                # Always query from offset 0: processed files change status
-                # and no longer match the ENRICHED filter, so the result set
-                # naturally shrinks each iteration.
-                a_q = session.query(File.id).filter(File.status == FileStatus.ENRICHED)
-                if session_id:
-                    a_q = a_q.filter(File.session_id == session_id)
-                if failed_ids:
-                    a_q = a_q.filter(File.id.notin_(failed_ids))
-                batch = a_q.limit(QUERY_BATCH).all()
+                batch = (
+                    session.query(File.id)
+                    .filter(File.status == FileStatus.ENRICHED)
+                    .filter(File.session_id == session_id)
+                    .limit(QUERY_BATCH)
+                    .all()
+                ) if session_id else (
+                    session.query(File.id)
+                    .filter(File.status == FileStatus.ENRICHED)
+                    .limit(QUERY_BATCH)
+                    .all()
+                )
             if not batch:
                 break
 
-            file_ids = [row[0] for row in batch]
-
-            with ThreadPoolExecutor(max_workers=max(workers, 1)) as pool:
-                futures = {pool.submit(process_file, fid): fid for fid in file_ids}
-                pending = set(futures.keys())
-                while pending:
-                    done, pending = concurrent.futures.wait(
-                        pending, timeout=2.0, return_when=concurrent.futures.FIRST_COMPLETED
-                    )
-                    for future in done:
-                        try:
-                            fid, status, error = future.result()
-                            if fid != "unknown":
-                                failed_ids.add(fid)
-                        except Exception as exc:
-                            fid = futures.get(future, "unknown")
-                            status = "errors"
-                            error = str(exc)
-                            # Mark file as error in DB
-                            if fid != "unknown":
-                                failed_ids.add(fid)
-                                try:
-                                    with Session(engine) as err_db:
-                                        f = err_db.get(File, fid)
-                                        if f:
-                                            f.status = FileStatus.ERROR
-                                            f.error_message = f"Analysis failed: {error}"[:500]
-                                            err_db.commit()
-                                except Exception:
-                                    pass
-
-                        counts[status if status in counts else "errors"] += 1
-                        progress.advance(task)
-                        progress.update(
-                            task,
-                            description=(
-                                f"Analyzing… ✓{counts['analyzed']} "
-                                f"skip:{counts['skipped']} err:{counts['errors']}"
-                            ),
-                        )
-                        processed += 1
-                        if limit and processed >= limit:
-                            break
-                    if limit and processed >= limit:
-                        break
+            for (file_id,) in batch:
+                fid, status, error = _process_one_file(
+                    file_id, engine, analyzer_list, client, skip_ext,
+                )
+                counts[status if status in counts else "errors"] += 1
+                progress.advance(task)
+                progress.update(
+                    task,
+                    description=(
+                        f"Analyzing... done:{counts['analyzed']} "
+                        f"skip:{counts['skipped']} err:{counts['errors']}"
+                    ),
+                )
+                processed += 1
+                if limit and processed >= limit:
+                    break
 
             if limit and processed >= limit:
                 break
@@ -200,7 +195,7 @@ def analyze(
 
 
 def analyze_with_progress(
-    workers: int = 2,
+    workers: int = 1,
     limit: Optional[int] = None,
     min_size_kb: int = 0,
     skip_extensions: Optional[set[str]] = None,
@@ -209,7 +204,11 @@ def analyze_with_progress(
     cancel_check: Callable[[], bool] | None = None,
 ):
     """
-    Same as analyze() but yields progress dicts for SSE streaming.
+    Analyze files sequentially, yielding progress dicts for SSE streaming.
+
+    Processing is sequential (one file at a time) because Ollama and most
+    local LLM backends process requests sequentially. Parallel requests
+    just queue up and cause timeouts/deadlocks.
 
     Yields:
         {"current": N, "total": M, "analyzed": A, "skipped": S, "errors": E}
@@ -219,7 +218,7 @@ def analyze_with_progress(
     from datahoarder.ai.router import get_client
 
     client = get_client()
-    analyzers_list: list[BaseAnalyzer] = [
+    analyzer_list: list[BaseAnalyzer] = [
         ImageAnalyzer(client),
         VideoAnalyzer(client),
         DocumentAnalyzer(client),
@@ -243,123 +242,48 @@ def analyze_with_progress(
         yield {"done": True, **counts}
         return
 
-    # Yield initial state
     yield {"current": 0, "total": total, **counts}
 
-    def process_file_inner(file_id: int) -> tuple[int, str, Optional[str]]:
-        # Check cancel BEFORE starting expensive work
-        if cancel_check and cancel_check():
-            return file_id, "skipped", "Cancelled"
-
-        with Session(engine) as session:
-            file_rec = session.get(File, file_id)
-            if not file_rec:
-                return file_id, "error", "File not found in DB"
-
-            ext = file_rec.extension or ""
-            if ext in skip_ext:
-                file_rec.status = FileStatus.SKIPPED
-                session.commit()
-                return file_id, "skipped", None
-
-            analyzer = _get_analyzer(analyzers_list, file_rec.mime_type, ext)
-            if not analyzer:
-                file_rec.status = FileStatus.SKIPPED
-                mime = file_rec.mime_type or ""
-                if mime.startswith("video/") or ext in (".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v"):
-                    file_rec.ai_description = "Skipped: install ffmpeg to analyze video files"
-                else:
-                    file_rec.ai_description = "No analyzer available for this file type"
-                session.commit()
-                return file_id, "skipped", None
-
-            ctx = build_context(file_rec)
-            try:
-                result: AnalysisResult = analyzer.analyze(file_rec, ctx)
-                analyzer.save_result(file_rec, result, model_name=str(type(client).__name__))
-                return file_id, "analyzed", None
-            except Exception as exc:
-                tb = traceback.format_exc()
-                file_rec.status = FileStatus.ERROR
-                file_rec.error_message = f"{exc}\n{tb}"[:1000]
-                session.commit()
-                return file_id, "error", str(exc)
-
     processed = 0
-    failed_ids: set[int] = set()
 
     while True:
-        # Check cancel at top of each batch
         if cancel_check and cancel_check():
             yield {"cancelled": True, **counts}
             return
 
         with Session(engine) as db:
-            # Always query from offset 0: processed files change status
-            # and no longer match the ENRICHED filter.
             awp_q = db.query(File.id).filter(File.status == FileStatus.ENRICHED)
             if session_id:
                 awp_q = awp_q.filter(File.session_id == session_id)
-            if failed_ids:
-                awp_q = awp_q.filter(File.id.notin_(failed_ids))
             batch = awp_q.limit(QUERY_BATCH).all()
         if not batch:
             break
 
-        file_ids = [row[0] for row in batch]
+        for (file_id,) in batch:
+            # Check cancel before each file
+            if cancel_check and cancel_check():
+                yield {"cancelled": True, **counts}
+                return
 
-        with ThreadPoolExecutor(max_workers=max(workers, 1)) as pool:
-            futures = {pool.submit(process_file_inner, fid): fid for fid in file_ids}
+            # Block if paused
+            if pause_event:
+                pause_event.wait()
 
-            # Collect results with a short timeout so we can check cancel frequently
-            pending = set(futures.keys())
-            while pending:
-                # Check cancel while waiting for futures
-                if cancel_check and cancel_check():
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    yield {"cancelled": True, **counts}
-                    return
+            fid, status, error = _process_one_file(
+                file_id, engine, analyzer_list, client, skip_ext,
+            )
 
-                # Wait for any future to complete, with a short timeout
-                done, pending = concurrent.futures.wait(
-                    pending, timeout=3.0,
-                    return_when=concurrent.futures.FIRST_COMPLETED,
-                )
+            if error:
+                logger.warning("File %d failed: %s", fid, error)
 
-                for future in done:
-                    try:
-                        fid, status, error = future.result(timeout=0)
-                        if fid != "unknown":
-                            failed_ids.add(fid)
-                    except Exception as exc:
-                        fid = futures.get(future, "unknown")
-                        status = "errors"
-                        error = str(exc)
-                        # Mark file as error in DB
-                        if fid != "unknown":
-                            failed_ids.add(fid)
-                            try:
-                                with Session(engine) as err_db:
-                                    f = err_db.get(File, fid)
-                                    if f:
-                                        f.status = FileStatus.ERROR
-                                        f.error_message = f"Analysis failed: {error}"[:500]
-                                        err_db.commit()
-                            except Exception:
-                                pass
-
-                    counts[status if status in counts else "errors"] += 1
-                    processed += 1
-                    yield {"current": processed, "total": total, **counts}
-
-                    # Block if paused (between files)
-                    if pause_event:
-                        pause_event.wait()
-
-                    if limit and processed >= limit:
-                        break
+            counts[status if status in counts else "errors"] += 1
+            processed += 1
+            yield {"current": processed, "total": total, **counts}
 
             if limit and processed >= limit:
                 break
+
+        if limit and processed >= limit:
+            break
 
     yield {"done": True, **counts}

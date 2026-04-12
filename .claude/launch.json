@@ -4,7 +4,7 @@
     {
       "name": "DataHoarder Web UI",
       "runtimeExecutable": ".venv/Scripts/python",
-      "runtimeArgs": ["-m", "uvicorn", "datahoarder.web.app:create_default_app", "--factory", "--host", "127.0.0.1", "--port", "8082"],
+      "runtimeArgs": ["-m", "uvicorn", "datahoarder.web.app:create_default_app", "--factory", "--host", "127.0.0.1", "--port", "8082", "--log-level", "info"],
       "port": 8082,
       "env": {
         "PYTHONIOENCODING": "utf-8"
