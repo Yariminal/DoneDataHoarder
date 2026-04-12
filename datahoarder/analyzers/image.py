@@ -24,6 +24,7 @@ IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif",
     ".webp", ".heic", ".heif", ".avif", ".cr2", ".nef", ".arw",
     ".dng", ".orf", ".rw2",
+    ".hdr",  # High Dynamic Range — RGBE format; Pillow may open it, fallback if not
 }
 
 
@@ -107,14 +108,31 @@ class ImageAnalyzer(BaseAnalyzer):
             )
 
         path = Path(file_rec.path)
+        image_bytes = None
         try:
             with PilImage.open(path) as img:
                 image_bytes = _resize_for_inference(img)
-        except Exception as exc:
-            return AnalysisResult(
-                description=f"Could not open image: {exc}",
-                confidence=0.0,
-            )
+        except Exception:
+            # HDR / exotic formats Pillow can't decode — fall back to text-only LLM call
+            pass
+
+        if image_bytes is None:
+            # No visual content available; ask LLM to infer from filename + context alone
+            text_prompt = VISION_PROMPT.format(context=context, exif_extra="")
+            text_prompt += "\n(Note: image could not be decoded — infer from filename and folder context only.)"
+            try:
+                data = self._client.generate_json(text_prompt, system=SYSTEM_PROMPT)
+            except Exception as exc:
+                return AnalysisResult(
+                    description=f"AI inference failed: {exc}",
+                    confidence=0.0,
+                )
+            result = AnalysisResult.from_ai_response(data)
+            result.confidence = min(result.confidence, 0.4)  # cap confidence for blind guesses
+            category = data.get("category", "")
+            if category and category not in result.tags:
+                result.tags.insert(0, category)
+            return result
 
         exif_extra = _exif_extra(path)
         prompt = VISION_PROMPT.format(context=context, exif_extra=exif_extra)
