@@ -164,6 +164,7 @@ tr:hover td { background: rgba(255,255,255,.02); }
 .badge-error    { background: var(--danger-bg);  color: var(--danger); }
 .badge-exact       { background: #1e3a5f; color: var(--info); }
 .badge-perceptual  { background: #312e81; color: var(--primary); }
+.badge-semantic    { background: #1e3a2e; color: var(--success); }
 
 /* --- Buttons ---------------------------------------------- */
 .btn {
