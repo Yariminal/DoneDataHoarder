@@ -18,6 +18,8 @@ def _migrate_add_columns(engine: Engine, inspector) -> None:
     migrations = [
         ("sessions", "preferred_language", "VARCHAR", "'leave_as_is'"),
         ("files", "ai_suggested_name", "VARCHAR", "NULL"),
+        ("sessions", "analyze_model", "VARCHAR", "NULL"),
+        ("sessions", "propose_model", "VARCHAR", "NULL"),
     ]
 
     for table, column, sql_type, default in migrations:

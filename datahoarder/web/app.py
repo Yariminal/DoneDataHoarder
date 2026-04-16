@@ -47,7 +47,19 @@ def create_app(db_path: Path) -> FastAPI:
 
 
 def create_default_app() -> FastAPI:
-    """Factory for uvicorn CLI usage: reads DB path from env or uses default."""
+    """Factory for uvicorn CLI usage: reads DB path from config, env, or default."""
+    import json
     import os
-    db_path = Path(os.environ.get("DATAHOARDER_DB", "datahoarder.db"))
+
+    # Priority: 1) env var  2) ~/.datahoarder.json  3) default
+    db_path_str = os.environ.get("DATAHOARDER_DB", "")
+    if not db_path_str:
+        config_file = Path.home() / ".datahoarder.json"
+        if config_file.exists():
+            try:
+                cfg = json.loads(config_file.read_text(encoding="utf-8"))
+                db_path_str = cfg.get("db_path", "")
+            except Exception:
+                pass
+    db_path = Path(db_path_str) if db_path_str else Path("datahoarder.db")
     return create_app(db_path)
