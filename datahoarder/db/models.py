@@ -111,6 +111,7 @@ class ProposalStatus(str, enum.Enum):
 class DupeType(str, enum.Enum):
     EXACT       = "exact"        # identical MD5
     PERCEPTUAL  = "perceptual"   # near-identical image (pHash)
+    SEMANTIC    = "semantic"     # similar AI description/tags (same content type)
     CONTENT     = "content"      # similar document content
 
 
