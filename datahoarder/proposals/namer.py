@@ -8,9 +8,9 @@ For every ANALYZED file it creates one or more Proposal records:
 
 Naming conventions:
   Photos/Videos:   YYYY-MM-DD_HH-MM-SS_<description>.<ext>
-                   YYYY-MM-DD_<description>.<ext>  (if no time)
-  Documents:       YYYY-MM_<description>.<ext>
-                   <description>.<ext>  (if no date)
+                   YYYY-MM-DD_<description>.<ext>  (if no time component)
+  Documents:       YYYY-MM-DD_<description>.<ext>
+                   <description>.<ext>  (if no meaningful date)
   Other:           <description>.<ext>
 """
 import json
@@ -156,15 +156,19 @@ def build_new_name(file_rec: File) -> Optional[str]:
     if not stem_from_desc:
         return None
 
-    # Only use date prefix if the date is meaningful (not just a copy/extract timestamp)
+    # Only use date prefix if the date is meaningful (not just a copy/extract timestamp).
+    # Prefer real hardware sources (EXIF > filesystem) over AI-inferred date_best,
+    # because date_best may contain LLM-guessed dates that can be wrong.
     has_good_date = _is_meaningful_date(file_rec)
-    dt = (file_rec.date_best or file_rec.date_exif or file_rec.date_modified) if has_good_date else None
+    dt = (file_rec.date_exif or file_rec.date_modified) if has_good_date else None
 
     if ext in MEDIA_EXTENSIONS:
+        # Photos/videos: full timestamp if available, otherwise date only
         date_part = _date_prefix(dt, include_time=True)
         stem = f"{date_part}_{stem_from_desc}" if date_part else stem_from_desc
     elif ext in DOC_EXTENSIONS:
-        date_part = _month_prefix(dt)
+        # Documents: date only (no time component), consistent with media format
+        date_part = _date_prefix(dt, include_time=False)
         stem = f"{date_part}_{stem_from_desc}" if date_part else stem_from_desc
     else:
         stem = stem_from_desc
