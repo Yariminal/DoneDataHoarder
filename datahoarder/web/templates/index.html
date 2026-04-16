@@ -6,7 +6,7 @@
   <title>DataHoarder</title>
   <link rel="stylesheet" href="/static/style.css">
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=2"></script>
 </head>
 <body x-data x-init="$store.app.tab = 'home'">
 
@@ -518,6 +518,15 @@
         </div>
       </template>
 
+      <!-- Pagination -->
+      <template x-if="totalPages() > 1">
+        <div class="pagination" style="border:1px solid var(--border); border-radius:var(--radius); margin-top:12px;">
+          <button class="btn btn-outline btn-sm" :disabled="page <= 1" @click="prevPage()">&#8592; Prev</button>
+          <span x-text="'Page ' + page + ' of ' + totalPages()"></span>
+          <button class="btn btn-outline btn-sm" :disabled="page >= totalPages()" @click="nextPage()">Next &#8594;</button>
+        </div>
+      </template>
+
       <template x-if="groups.length === 0">
         <p class="text-dim">No duplicate groups found. Run <code>datahoarder dedup</code> or use the Pipeline tab.</p>
       </template>
@@ -532,21 +541,22 @@
         <div class="card-label">Active Settings <span class="text-dim text-sm">(change in Setup tab)</span></div>
         <div class="mt-1 text-sm" style="display:grid; grid-template-columns:100px 1fr; gap:4px 12px;">
           <strong>Folder:</strong> <span class="text-mono" x-text="getSettings().rootPath || '(not set)'"></span>
-          <strong>Model:</strong> <span class="text-mono" :style="!getSettings().model ? 'color:var(--danger)' : ''" x-text="getSettings().model || '(not selected)'"></span>
+          <strong>Analyze Model:</strong> <span class="text-mono" :style="!getSettings().analyzeModel ? 'color:var(--danger)' : ''" x-text="getSettings().analyzeModel || '(not selected)'"></span>
+          <strong>Propose Model:</strong> <span class="text-mono" :style="!getSettings().proposeModel ? 'color:var(--danger)' : ''" x-text="getSettings().proposeModel || '(not selected)'"></span>
           <strong>Backend:</strong> <span x-text="getSettings().backend"></span>
           <strong>Workers:</strong> <span x-text="getSettings().workers"></span>
         </div>
       </div>
 
       <!-- Model selection warning -->
-      <template x-if="!getSettings().model">
+      <template x-if="!getSettings().analyzeModel && !getSettings().proposeModel">
         <div style="background:var(--danger-bg); border:1px solid var(--danger); border-radius:6px; padding:12px; margin-bottom:16px; max-width:600px;">
           <div style="display:flex; gap:8px; align-items:flex-start;">
             <span style="font-size:1.2rem; flex-shrink:0;">⚠</span>
             <div>
-              <div style="color:var(--danger); font-weight:600;">No model selected</div>
+              <div style="color:var(--danger); font-weight:600;">No models selected</div>
               <div class="text-sm" style="color:var(--text-dim); margin-top:4px;">
-                Go to <strong>Setup</strong> tab and select an AI model before running Analyze.
+                Go to <strong>Setup</strong> tab and select AI models before running Analyze or Organize.
               </div>
             </div>
           </div>
@@ -556,7 +566,7 @@
       <!-- Steps -->
       <div class="pipeline-steps">
         <div class="pipeline-step">
-          <div class="step-num" :class="{ active: running === 'scan' }">1</div>
+          <div class="step-num" :class="{ active: running === 'scan', 'step-done': isStepDone('scan') }" x-text="isStepDone('scan') ? '✓' : '1'"></div>
           <div class="step-info">
             <div class="step-name">Scan</div>
             <div class="step-desc">Recursively walk filesystem and index all files and folders</div>
@@ -566,7 +576,7 @@
           </button>
         </div>
         <div class="pipeline-step">
-          <div class="step-num" :class="{ active: running === 'enrich' }">2</div>
+          <div class="step-num" :class="{ active: running === 'enrich', 'step-done': isStepDone('enrich') }" x-text="isStepDone('enrich') ? '✓' : '2'"></div>
           <div class="step-info">
             <div class="step-name">Enrich</div>
             <div class="step-desc">Extract metadata, hashes, EXIF dates</div>
@@ -598,7 +608,7 @@
           </div>
         </div>
         <div class="pipeline-step">
-          <div class="step-num" :class="{ active: running === 'dedup' }">3</div>
+          <div class="step-num" :class="{ active: running === 'dedup', 'step-done': isStepDone('dedup') }" x-text="isStepDone('dedup') ? '✓' : '3'"></div>
           <div class="step-info">
             <div class="step-name">Deduplicate</div>
             <div class="step-desc">Find exact and near-duplicate files</div>
@@ -608,7 +618,7 @@
           </button>
         </div>
         <div class="pipeline-step">
-          <div class="step-num" :class="{ active: running === 'analyze' }">4</div>
+          <div class="step-num" :class="{ active: running === 'analyze', 'step-done': isStepDone('analyze') }" x-text="isStepDone('analyze') ? '✓' : '4'"></div>
           <div class="step-info">
             <div class="step-name">Analyze</div>
             <div class="step-desc">AI analysis (vision + text) of all files</div>
@@ -630,8 +640,8 @@
             </template>
           </div>
           <div class="btn-group">
-            <button class="btn btn-primary btn-sm" :disabled="running || !getSettings().model" @click="runStep('analyze')"
-                    :title="!getSettings().model ? 'Select a model in Setup first' : ''"
+            <button class="btn btn-primary btn-sm" :disabled="running || !getSettings().analyzeModel" @click="runStep('analyze')"
+                    :title="!getSettings().analyzeModel ? 'Select an analysis model in Setup first' : ''"
                     x-show="!(activeJobType === 'analyze' && (jobState === 'running' || jobState === 'paused'))">
               <span x-text="running === 'analyze' ? 'Starting...' : 'Run'"></span>
             </button>
@@ -644,7 +654,7 @@
           </div>
         </div>
         <div class="pipeline-step">
-          <div class="step-num" :class="{ active: running === 'propose' }">5</div>
+          <div class="step-num" :class="{ active: running === 'propose', 'step-done': isStepDone('propose') }" x-text="isStepDone('propose') ? '✓' : '5'"></div>
           <div class="step-info">
             <div class="step-name">Propose</div>
             <div class="step-desc">Generate rename/tag proposals</div>
@@ -654,7 +664,7 @@
           </button>
         </div>
         <div class="pipeline-step">
-          <div class="step-num" :class="{ active: running === 'organize' }">6</div>
+          <div class="step-num" :class="{ active: running === 'organize', 'step-done': isStepDone('organize') }" x-text="isStepDone('organize') ? '✓' : '6'"></div>
           <div class="step-info">
             <div class="step-name">Organize</div>
             <div class="step-desc">AI suggests folder reorganization based on file analysis</div>
@@ -667,7 +677,7 @@
         <div class="sidebar-sep" style="margin:4px 0"></div>
 
         <div class="pipeline-step">
-          <div class="step-num">7</div>
+          <div class="step-num" :class="{ 'step-done': isStepDone('execute') }" x-text="isStepDone('execute') ? '✓' : '7'"></div>
           <div class="step-info">
             <div class="step-name">Execute</div>
             <div class="step-desc">Apply approved proposals to disk</div>
@@ -681,9 +691,27 @@
 
       <!-- Result display -->
       <template x-if="result">
-        <div class="card mt-2" style="max-width:600px">
-          <div class="card-label">Result</div>
-          <pre class="text-sm text-mono mt-1" style="white-space:pre-wrap; color:var(--text-dim)" x-text="JSON.stringify(result, null, 2)"></pre>
+        <div class="mt-2" style="max-width:900px">
+          <!-- Tree visualization for organize results -->
+          <template x-if="result.before_tree || result.after_tree">
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+              <div class="card" x-show="result.before_tree">
+                <div class="card-label">Current Structure</div>
+                <div class="tree-view mt-1" x-html="renderTree(result.before_tree)"></div>
+              </div>
+              <div class="card" x-show="result.after_tree">
+                <div class="card-label">Proposed Structure</div>
+                <div class="tree-view mt-1" x-html="renderTree(result.after_tree)"></div>
+              </div>
+            </div>
+          </template>
+          <!-- JSON fallback for other results -->
+          <template x-if="!result.before_tree && !result.after_tree">
+            <div class="card">
+              <div class="card-label">Result</div>
+              <pre class="text-sm text-mono mt-1" style="white-space:pre-wrap; color:var(--text-dim)" x-text="JSON.stringify(result, null, 2)"></pre>
+            </div>
+          </template>
         </div>
       </template>
     </section>
@@ -700,6 +728,23 @@
           <button class="btn btn-primary btn-sm" @click="showBrowser = true">Browse</button>
         </div>
         <p class="text-dim text-sm mt-1" x-text="selectedFolder ? 'Selected: ' + selectedFolder : 'Click Browse to select a folder to organize'"></p>
+
+        <!-- Subfolder skip selection -->
+        <template x-if="subfolders.length > 0">
+          <div class="mt-2">
+            <div class="text-sm mb-1" style="font-weight:600;">Skip Subfolders:</div>
+            <div style="max-height:200px; overflow-y:auto; border:1px solid var(--border); border-radius:6px; padding:8px;">
+              <template x-for="sf in subfolders" :key="sf.path">
+                <label style="display:flex; align-items:center; gap:8px; padding:4px 0; font-size:.86rem; cursor:pointer;">
+                  <input type="checkbox" :checked="skippedFolders.includes(sf.path)" @change="toggleSkipFolder(sf.path); $store.session.skip_dirs = [...skippedFolders]">
+                  <span x-text="sf.name"></span>
+                  <span class="badge badge-applied" x-show="sf.completed" style="font-size:.65rem;">completed</span>
+                </label>
+              </template>
+            </div>
+            <p class="text-dim text-sm mt-1">Check folders to skip during Scan. Previously completed folders are pre-checked.</p>
+          </div>
+        </template>
       </div>
 
       <!-- Folder Browser Modal -->
@@ -805,26 +850,39 @@
           </template>
         </div>
 
-        <!-- Model Selection -->
+        <!-- Model Selection — Dual -->
         <div class="mt-2">
-          <label class="text-sm mb-1" style="display:block;">Select Model:</label>
+          <label class="text-sm mb-1" style="display:block; font-weight:600;">Analysis Model <span class="text-dim">(vision-capable, for Analyze step)</span>:</label>
           <div style="display:grid; grid-template-columns:1fr 100px; gap:8px;">
-            <select class="input" x-model="selectedModel" @change="saveSettings()">
+            <select class="input" x-model="selectedAnalyzeModel" @change="saveSettings()">
               <option value="">-- Choose a model --</option>
-              <template x-for="m in installedModels" :key="m.name">
+              <template x-for="m in installedModels.filter(m => m.vision)" :key="'a-'+m.name">
+                <option :value="m.name" x-text="m.name + ' (vision)'"></option>
+              </template>
+            </select>
+            <button class="btn btn-outline btn-sm" @click="showCustomModel = 'analyze'">Custom</button>
+          </div>
+        </div>
+        <div class="mt-2">
+          <label class="text-sm mb-1" style="display:block; font-weight:600;">Proposal Model <span class="text-dim">(for Propose & Organize steps)</span>:</label>
+          <div style="display:grid; grid-template-columns:1fr 100px; gap:8px;">
+            <select class="input" x-model="selectedProposeModel" @change="saveSettings()">
+              <option value="">-- Choose a model --</option>
+              <template x-for="m in installedModels" :key="'p-'+m.name">
                 <option :value="m.name" x-text="m.name + (m.vision ? ' (vision)' : '')"></option>
               </template>
             </select>
-            <button class="btn btn-outline btn-sm" @click="showCustomModel = !showCustomModel">Custom</button>
+            <button class="btn btn-outline btn-sm" @click="showCustomModel = 'propose'">Custom</button>
           </div>
-          <template x-if="showCustomModel">
-            <div class="mt-2">
-              <input type="text" class="input" x-model="customModel" placeholder="e.g., gemma4:27b"
-                     @keyup.enter="selectCustomModel()" style="margin-bottom:6px;">
-              <button class="btn btn-primary btn-sm" @click="selectCustomModel()">Use Custom Model</button>
-            </div>
-          </template>
         </div>
+        <template x-if="showCustomModel">
+          <div class="mt-2">
+            <input type="text" class="input" x-model="customModel" :placeholder="showCustomModel === 'propose' ? 'e.g., llama3.2:3b' : 'e.g., gemma4:27b'"
+                   @keyup.enter="selectCustomModel(showCustomModel)" style="margin-bottom:6px;">
+            <button class="btn btn-primary btn-sm" @click="selectCustomModel(showCustomModel)">Use Custom Model</button>
+            <button class="btn btn-ghost btn-sm" @click="showCustomModel = false">Cancel</button>
+          </div>
+        </template>
 
         <!-- Available Models -->
         <div class="mt-2">
@@ -861,6 +919,16 @@
             </template>
           </div>
         </div>
+      </div>
+
+      <!-- Database Path -->
+      <div class="card mt-2">
+        <div class="card-label">Database Path</div>
+        <div class="mt-1" style="display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center; max-width:500px;">
+          <input type="text" class="input" x-model="dbPath" placeholder="datahoarder.db">
+          <button class="btn btn-primary btn-sm" @click="saveDbPath()">Save</button>
+        </div>
+        <p class="text-dim text-sm mt-1">Path to the SQLite database file. Restart the server after changing.</p>
       </div>
     </section>
 
