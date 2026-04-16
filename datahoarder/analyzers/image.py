@@ -77,17 +77,17 @@ Context about the file:
 Return a JSON object with these fields:
 {{
   "description": "2-3 sentence description of what is in the image",
-  "suggested_name": "a concise, meaningful filename stem — MUST preserve specific proper nouns (people, places, events) from the original filename. Translate to English if not already. No extension, no date prefix, use_underscores, max 50 chars",
+  "suggested_name": "a concise, meaningful filename stem. Rules: (1) Describe the actual content, not the folder or project it belongs to — do NOT repeat the containing folder name in the stem. (2) Preserve specific proper nouns (people, places) only if they add meaning beyond the folder context. (3) Translate to English if not already. (4) No extension, no date prefix, use_underscores, max 50 chars",
   "tags": ["tag1", "tag2", ...],
   "category": "one of: photo_person, photo_group, photo_place, photo_event, photo_document, photo_object, screenshot, artwork, other",
-  "detected_date": "YYYY-MM-DD if a date is visible or inferable, else null",
+  "detected_date": "YYYY-MM-DD only if a specific date is clearly visible in the image content itself (e.g. a calendar, dated document, visible timestamp) — NOT inferred from the filename or folder name. Return null if uncertain.",
   "confidence": 0.0-1.0
 }}
 
-For suggested_name: be specific and meaningful. Examples:
-- "birthday_party_garden" not "party"
-- "tax_return_documents_2019" not "documents"
-- "family_holiday_beach_sunset" not "vacation"
+For suggested_name: describe what the image actually shows. Examples:
+- "team_group_photo_outdoor" not "project_name_team_photo"
+- "brick_texture_herringbone_pattern" not "solar_project_texture"
+- "menu_cover_event_branding" not "2018_event_menu"
 """
 
 
