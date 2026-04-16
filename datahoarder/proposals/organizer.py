@@ -30,6 +30,10 @@ class FolderSummary:
     description_keywords: list[str] = field(default_factory=list)
     child_folders: list[str] = field(default_factory=list)
     sample_filenames: list[str] = field(default_factory=list)
+    # Files that don't match the folder's dominant theme — surface these to the
+    # LLM so individual misfits (e.g. a .max file inside a textures folder, or a
+    # sewing-pattern HTML inside a solar-competition folder) can be moved out.
+    outlier_files: list[dict] = field(default_factory=list)
 
 
 def build_folder_tree(session_id: str, root_path: str | None = None) -> list[FolderSummary]:
@@ -41,6 +45,9 @@ def build_folder_tree(session_id: str, root_path: str | None = None) -> list[Fol
     """
     engine = get_engine()
     folders: dict[str, FolderSummary] = {}
+    # Also cache per-folder file records so we can run a second pass for
+    # outlier detection without re-querying the DB.
+    files_by_folder: dict[str, list] = defaultdict(list)
 
     with Session(engine) as db:
         query = db.query(File).filter(
@@ -75,6 +82,7 @@ def build_folder_tree(session_id: str, root_path: str | None = None) -> list[Fol
             fs = folders[parent]
             fs.file_count += 1
             fs.total_size += f.size_bytes or 0
+            files_by_folder[parent].append(f)
 
             # MIME breakdown
             mime = f.mime_type or "unknown"
@@ -116,6 +124,74 @@ def build_folder_tree(session_id: str, root_path: str | None = None) -> list[Fol
             fs.description_keywords = [w for w, _ in desc_words[path].most_common(5)]
             fs.child_folders = sorted(child_map.get(path, set()))
 
+        # Second pass: per-folder outlier detection. A file is an outlier if its
+        # mime group differs from the folder's dominant mime group (>=60%), or
+        # if it has tags but shares none of them with the folder's top tags.
+        # Only run outlier detection on folders with >=4 files (statistical signal).
+        for path, fs in folders.items():
+            folder_files = files_by_folder.get(path, [])
+            if len(folder_files) < 4:
+                continue
+
+            total = fs.file_count or 1
+            dominant_mime = None
+            if fs.mime_breakdown:
+                top_mime, top_count = max(fs.mime_breakdown.items(), key=lambda kv: kv[1])
+                if top_count / total >= 0.6:
+                    dominant_mime = top_mime
+
+            theme_tags = set(fs.top_tags)
+
+            outliers: list[tuple[int, dict]] = []  # (priority, info) for sorting
+            for f in folder_files:
+                mime = f.mime_type or "unknown"
+                mime_group = mime.split("/")[0] if "/" in mime else mime
+
+                file_tags: list[str] = []
+                if f.ai_tags:
+                    try:
+                        parsed = json.loads(f.ai_tags)
+                        if isinstance(parsed, list):
+                            file_tags = [str(t).lower() for t in parsed]
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                is_mime_outlier = bool(
+                    dominant_mime
+                    and mime_group != dominant_mime
+                    and mime_group != "unknown"
+                )
+                # Tag outlier: file has tags, folder has a theme, zero overlap
+                is_tag_outlier = bool(
+                    file_tags
+                    and theme_tags
+                    and not (set(file_tags) & theme_tags)
+                )
+
+                if not (is_mime_outlier or is_tag_outlier):
+                    continue
+
+                # Priority: mime outliers are more reliable signals than tag outliers
+                priority = 0 if is_mime_outlier else 1
+                reason_bits = []
+                if is_mime_outlier:
+                    reason_bits.append(f"type={mime_group} (folder is {dominant_mime})")
+                if is_tag_outlier:
+                    reason_bits.append("tags unrelated to folder theme")
+
+                outliers.append((priority, {
+                    "filename": f.filename or Path(f.path).name,
+                    "mime_group": mime_group,
+                    "size": f.size_bytes or 0,
+                    "tags": file_tags[:5],
+                    "reason": "; ".join(reason_bits),
+                }))
+
+            # Keep the 5 most obvious outliers per folder (mime mismatches first,
+            # then by descending size so big misfits rise to the top).
+            outliers.sort(key=lambda x: (x[0], -x[1]["size"]))
+            fs.outlier_files = [info for _, info in outliers[:5]]
+
     # Sort by path for consistent ordering
     return sorted(folders.values(), key=lambda f: f.path)
 
@@ -155,6 +231,16 @@ def _format_tree_for_prompt(
             line += f"  |  Examples: {', '.join(fs.sample_filenames[:3])}"
         lines.append(line)
 
+        # Surface per-file outliers as indented sub-lines so the LLM can
+        # propose moves for specific misfit files even when the folder's
+        # overall theme is correct.
+        for ol in fs.outlier_files:
+            tag_str = f", tags=[{', '.join(ol['tags'])}]" if ol["tags"] else ""
+            lines.append(
+                f"    OUTLIER: {ol['filename']} ({_human_size(ol['size'])}, "
+                f"{ol['mime_group']}{tag_str}) — {ol['reason']}"
+            )
+
     return "\n".join(lines)
 
 
@@ -172,10 +258,14 @@ a folder structure that makes data discoverable and encourages people to interac
 with their files again rather than forgetting they exist.
 
 You will receive a summary of a folder tree. Each entry shows:
-path, file count, size, content types, semantic tags, and keywords.
+path, file count, size, content types, semantic tags, keywords, and — when \
+present — lines prefixed with "    OUTLIER:" listing individual files whose \
+type or tags do not match the folder's theme.
 
 Suggest reorganizations that improve discoverability and logical grouping. You may suggest:
 - MOVE: Move all files matching a description from one folder to a new or existing folder
+- MOVE_FILES: Move a specific list of named files out of one folder into another (use this \
+  for the OUTLIER entries — move each misfit file to a folder that matches its content)
 - MERGE: Combine two similar folders into one (move files from source to destination)
 - RENAME_FOLDER: Rename a folder IN PLACE to a clearer, more descriptive name
 
@@ -186,6 +276,8 @@ Rules:
 - Rename folders with cryptic, abbreviated, or meaningless names to something descriptive
 - Suggest at most 25 changes
 - For move/merge: specify source folder, destination folder, which files (all or description)
+- For move_files: list the exact filenames (as shown in the OUTLIER entries) that should \
+  leave their current folder. One move_files proposal per (source, destination) pair.
 - For rename_folder: "new_name" must be ONLY the new folder name (e.g. "Brand_Logos"), \
 NOT a full path. The folder stays in its current parent directory, only its name changes.
 - IMPORTANT: Do NOT both rename a folder AND move all its files out of it. \
@@ -194,6 +286,8 @@ If files need to move to a different location, use move — but then don't also 
 - IMPORTANT: Files sitting directly in the root folder (shown as "(root)") are \
 unorganized and MUST be assigned to an appropriate subfolder. Always include move \
 proposals for any files in "(root)".
+- IMPORTANT: For every "    OUTLIER:" line you see, emit a move_files proposal to \
+a folder whose theme matches the outlier's tags/type. Do not leave outliers in place.
 - Create meaningful folder names based on content themes
 - Folder names should use underscores instead of spaces, and be in English
 - Use relative paths from the root
@@ -205,6 +299,16 @@ Respond with a JSON array of objects. For move/merge:
   "destination_folder": "relative/path/to/target",
   "file_filter": "all" or a description like "images tagged beach",
   "reasoning": "why this improves organization",
+  "confidence": 0.0 to 1.0
+}
+
+For move_files (targeted, named-file moves — preferred for outliers):
+{
+  "action": "move_files",
+  "source_folder": "relative/path/from/root",
+  "destination_folder": "relative/path/to/target",
+  "filenames": ["scene_file.max", "another_misfit.obj"],
+  "reasoning": "why these specific files do not belong here",
   "confidence": 0.0 to 1.0
 }
 
@@ -392,6 +496,64 @@ def generate_reorg_proposals(session_id: str) -> dict:
                     status=ProposalStatus.PENDING,
                 ))
                 counts["rename_folder"] += 1
+                continue
+
+            # --- MOVE_FILES action (named-file moves, typically for outliers) ---
+            if action == "move_files":
+                src_folder = prop.get("source_folder", "")
+                dst_folder = prop.get("destination_folder", "")
+                filenames = prop.get("filenames", [])
+                if not src_folder or not dst_folder or not isinstance(filenames, list):
+                    counts["skipped"] += 1
+                    continue
+                # Filter empty / non-string entries
+                filenames = [str(n).strip() for n in filenames if isinstance(n, str) and n.strip()]
+                if not filenames:
+                    counts["skipped"] += 1
+                    continue
+
+                src_abs = str(Path(root_path) / src_folder)
+                dst_abs = str(Path(root_path) / dst_folder)
+
+                # Look up each named file in the source folder
+                for fname in filenames:
+                    file_rec = db.query(File).filter(
+                        File.session_id == session_id,
+                        File.path.like(f"{src_abs}%"),
+                        File.filename == fname,
+                        File.status.in_([
+                            FileStatus.ANALYZED,
+                            FileStatus.PROPOSED,
+                        ]),
+                    ).first()
+                    if not file_rec:
+                        counts["skipped"] += 1
+                        continue
+
+                    src_path = Path(file_rec.path)
+                    dst_path = Path(dst_abs) / src_path.name
+                    if str(src_path) == str(dst_path):
+                        counts["skipped"] += 1
+                        continue
+
+                    existing = db.query(Proposal).filter_by(
+                        file_id=file_rec.id,
+                        proposal_type=ProposalType.MOVE,
+                    ).first()
+                    if existing:
+                        counts["skipped"] += 1
+                        continue
+
+                    db.add(Proposal(
+                        file_id=file_rec.id,
+                        proposal_type=ProposalType.MOVE,
+                        current_value=str(src_path),
+                        proposed_value=str(dst_path),
+                        reasoning=reasoning,
+                        confidence=confidence,
+                        status=ProposalStatus.PENDING,
+                    ))
+                    counts["move"] += 1
                 continue
 
             # --- MOVE / MERGE actions ---
