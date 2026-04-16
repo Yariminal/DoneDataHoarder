@@ -113,9 +113,11 @@ class BaseAnalyzer(ABC):
             f.ai_confidence = result.confidence
             f.ai_model = model_name
             f.ai_transcript = result.transcript or None
-            if result.detected_date and not f.date_exif:
-                f.date_exif = result.detected_date
+            # AI-detected dates are hints only — never overwrite real EXIF dates,
+            # and only use as date_best if no real filesystem date exists either.
+            if result.detected_date and not f.date_exif and not f.date_best:
                 f.date_best = result.detected_date
+                # Do NOT set date_exif — that column is reserved for real EXIF metadata
             f.status = FileStatus.ANALYZED
             f.analyzed_at = datetime.utcnow()
             session.commit()

@@ -113,12 +113,15 @@ class PipelineRequest(BaseModel):
     model: str = "gemma3:12b"
     workers: int = 1
     session_id: str = ""
+    skip_dirs: list[str] = []
 
 
 class CreateSessionRequest(BaseModel):
     root_path: str = ""
     backend: str = "ollama"
     model: str = "gemma3:12b"
+    analyze_model: str = ""
+    propose_model: str = ""
     workers: int = 1
     preferred_language: str = "leave_as_is"
 
@@ -171,6 +174,11 @@ def create_session(body: CreateSessionRequest):
             status=SessionStatus.NEW,
             is_unsaved=False,
         )
+        # Set new fields if ORM supports them (migration may not have run yet)
+        if hasattr(user_session, 'analyze_model'):
+            user_session.analyze_model = body.analyze_model or None
+        if hasattr(user_session, 'propose_model'):
+            user_session.propose_model = body.propose_model or None
         session.add(user_session)
         session.commit()
 
@@ -237,6 +245,8 @@ def list_sessions():
                 "completed_steps": completed_steps,
                 "backend": s.backend,
                 "model": s.model,
+                "analyze_model": getattr(s, 'analyze_model', '') or "",
+                "propose_model": getattr(s, 'propose_model', '') or "",
                 "workers": s.workers,
                 "preferred_language": s.preferred_language,
             })
@@ -282,6 +292,8 @@ def get_session_detail(session_id: str):
             "root_path": user_session.root_path,
             "backend": user_session.backend,
             "model": user_session.model,
+            "analyze_model": getattr(user_session, 'analyze_model', '') or "",
+            "propose_model": getattr(user_session, 'propose_model', '') or "",
             "workers": user_session.workers,
             "preferred_language": user_session.preferred_language,
             "status": user_session.status.value,
@@ -291,6 +303,47 @@ def get_session_detail(session_id: str):
             "proposal_count": proposal_count,
             "duplicate_count": dupe_count,
         }
+
+
+class UpdateSessionSettingsRequest(BaseModel):
+    root_path: Optional[str] = None
+    backend: Optional[str] = None
+    model: Optional[str] = None
+    analyze_model: Optional[str] = None
+    propose_model: Optional[str] = None
+    workers: Optional[int] = None
+    preferred_language: Optional[str] = None
+
+
+@router.patch("/sessions/{session_id}")
+def update_session_settings(session_id: str, body: UpdateSessionSettingsRequest):
+    """Update session settings (models, backend, etc.)."""
+    engine = get_engine()
+    with Session(engine) as session:
+        user_session = session.get(UserSession, session_id)
+        if not user_session:
+            raise HTTPException(404, "Session not found")
+
+        if body.root_path is not None:
+            user_session.root_path = body.root_path
+        if body.backend is not None:
+            user_session.backend = body.backend
+        if body.model is not None:
+            user_session.model = body.model
+        if body.analyze_model is not None and hasattr(user_session, 'analyze_model'):
+            user_session.analyze_model = body.analyze_model or None
+        if body.propose_model is not None and hasattr(user_session, 'propose_model'):
+            user_session.propose_model = body.propose_model or None
+        if body.workers is not None:
+            user_session.workers = body.workers
+        if body.preferred_language is not None:
+            user_session.preferred_language = body.preferred_language
+
+        user_session.is_unsaved = True
+        user_session.updated_at = datetime.utcnow()
+        session.commit()
+
+        return {"status": "ok"}
 
 
 @router.post("/sessions/{session_id}/save")
@@ -374,12 +427,13 @@ def _require_session_id(body_session_id: str = "") -> str:
     return sid
 
 
-def _resolve_model(body_model: str, session_id: str, fallback: str = "gemma3:12b") -> str:
+def _resolve_model(body_model: str, session_id: str, step: str = "analyze", fallback: str = "gemma3:12b") -> str:
     """
     Resolve the model to use, with fallback priority:
       1. body_model (from request) — if non-empty
-      2. session.model (stored in DB)
-      3. fallback default
+      2. session.analyze_model or session.propose_model (based on step)
+      3. session.model (legacy fallback)
+      4. fallback default
     This prevents empty-string model names from reaching Ollama.
     """
     if body_model:
@@ -390,8 +444,15 @@ def _resolve_model(body_model: str, session_id: str, fallback: str = "gemma3:12b
         try:
             with _Sess(get_engine()) as db:
                 us = db.get(UserSession, session_id)
-                if us and us.model:
-                    return us.model
+                if us:
+                    # Step-specific model takes priority
+                    if step == "analyze" and getattr(us, 'analyze_model', None):
+                        return us.analyze_model
+                    elif step == "propose" and getattr(us, 'propose_model', None):
+                        return us.propose_model
+                    # Fall through to legacy model field
+                    if us.model:
+                        return us.model
         except Exception:
             pass
     return fallback
@@ -882,6 +943,44 @@ def execute_proposals(body: ExecuteRequest):
         _console=_make_quiet_console(),
     )
     _mark_session_unsaved(sid, step="execute")
+
+    # Record completed folders after a real (non-dry) execute
+    if not body.dry_run:
+        try:
+            from datahoarder.db.models import CompletedFolder as CF
+            engine = get_engine()
+            with Session(engine) as db:
+                us = db.get(UserSession, sid)
+                root_path = us.root_path if us else ""
+                # Collect unique parent dirs of APPLIED files
+                applied_parents = set(
+                    str(Path(f.path).parent)
+                    for f in db.query(File).filter(
+                        File.session_id == sid,
+                        File.status == FileStatus.APPLIED,
+                    ).all()
+                )
+                # Also include the root itself
+                if root_path:
+                    applied_parents.add(root_path)
+                # Upsert: avoid duplicate entries
+                existing = {
+                    r.folder_path
+                    for r in db.query(CF.folder_path).filter(
+                        CF.session_id == sid
+                    ).all()
+                }
+                for folder_path in sorted(applied_parents):
+                    if folder_path not in existing:
+                        db.add(CF(
+                            folder_path=folder_path,
+                            session_id=sid,
+                            root_path=root_path,
+                        ))
+                db.commit()
+        except Exception:
+            pass  # Non-fatal
+
     return counts
 
 
@@ -917,8 +1016,9 @@ def trigger_scan(body: PipelineRequest):
                 session.commit()
 
         # Suppress stdout to prevent Rich progress bar Unicode errors in web context
+        extra_skip = set(body.skip_dirs) if body.skip_dirs else None
         with contextlib.redirect_stdout(io.StringIO()):
-            counts = do_scan(root, session_id=sid)
+            counts = do_scan(root, session_id=sid, extra_skip_dirs=extra_skip)
 
         _mark_session_unsaved(sid, step="scan")
         return counts
@@ -975,7 +1075,7 @@ def trigger_analyze(body: PipelineRequest):
 
     try:
         sid = _require_session_id(body.session_id)
-        model = _resolve_model(body.model, sid)
+        model = _resolve_model(body.model, sid, step="analyze")
         # Persist the resolved model back to the session so later steps (Propose, Organize) can use it
         if model and body.model:
             with Session(get_engine()) as db:
@@ -1102,6 +1202,87 @@ def trigger_propose(body: PipelineRequest = PipelineRequest()):
         raise HTTPException(500, f"Propose failed: {str(exc)}")
 
 
+def _folder_summaries_to_tree(summaries, root_path: str) -> dict:
+    """Convert a list of FolderSummary objects into a nested dict for the frontend."""
+    from pathlib import PurePosixPath, PureWindowsPath
+    tree: dict = {}
+    root = Path(root_path)
+    for fs in summaries:
+        try:
+            rel = Path(fs.path).relative_to(root)
+        except ValueError:
+            continue
+        parts = rel.parts
+        if not parts:
+            # Root folder itself
+            tree["_files"] = fs.file_count
+            tree["_size"] = fs.total_size
+            continue
+        node = tree
+        for part in parts:
+            if part not in node:
+                node[part] = {}
+            node = node[part]
+        node["_files"] = fs.file_count
+        node["_size"] = fs.total_size
+    return tree
+
+
+def _build_proposed_tree(session_id: str, before_summaries, root_path: str) -> dict:
+    """Build an 'after' tree reflecting pending MOVE and RENAME_FOLDER proposals."""
+    tree = _folder_summaries_to_tree(before_summaries, root_path)
+    root = Path(root_path)
+
+    with Session(get_engine()) as db:
+        proposals = (
+            db.query(Proposal)
+            .join(File, Proposal.file_id == File.id)
+            .filter(
+                File.session_id == session_id,
+                Proposal.status == ProposalStatus.PENDING,
+                Proposal.proposal_type.in_([ProposalType.MOVE, ProposalType.RENAME_FOLDER]),
+            )
+            .all()
+        )
+
+    # Apply folder renames to tree keys
+    for p in proposals:
+        if p.proposal_type == ProposalType.RENAME_FOLDER and p.current_value and p.proposed_value:
+            try:
+                old_rel = Path(p.current_value).relative_to(root)
+                new_rel = Path(p.proposed_value).relative_to(root)
+            except ValueError:
+                continue
+            # Find the node in tree and rename it
+            old_parts = old_rel.parts
+            new_name = new_rel.parts[-1] if new_rel.parts else None
+            if old_parts and new_name:
+                parent_node = tree
+                for part in old_parts[:-1]:
+                    parent_node = parent_node.get(part, {})
+                old_name = old_parts[-1]
+                if old_name in parent_node:
+                    parent_node[new_name] = parent_node.pop(old_name)
+
+    # Apply move proposals — shift file counts between folders
+    for p in proposals:
+        if p.proposal_type == ProposalType.MOVE and p.proposed_value:
+            try:
+                new_parent = Path(p.proposed_value).parent
+                new_rel = new_parent.relative_to(root)
+            except ValueError:
+                continue
+            # Ensure the target folder exists in tree
+            node = tree
+            for part in new_rel.parts:
+                if part not in node:
+                    node[part] = {"_files": 0, "_size": 0}
+                node = node[part]
+            node["_files"] = node.get("_files", 0) + 1
+
+    return tree
+
+
 @router.post("/pipeline/organize")
 def trigger_organize(body: PipelineRequest = PipelineRequest()):
     """Use LLM to suggest folder reorganization based on file analysis."""
@@ -1110,7 +1291,7 @@ def trigger_organize(body: PipelineRequest = PipelineRequest()):
 
     try:
         sid = _require_session_id(body.session_id)
-        model = _resolve_model(body.model, sid)
+        model = _resolve_model(body.model, sid, step="propose")
         init_ai(
             backend=body.backend,
             text_model=model,
@@ -1120,9 +1301,22 @@ def trigger_organize(body: PipelineRequest = PipelineRequest()):
         raise HTTPException(503, str(exc))
 
     try:
+        from datahoarder.proposals.organizer import build_folder_tree
+
+        # Capture current folder structure BEFORE generating proposals
+        with Session(get_engine()) as db:
+            us = db.get(UserSession, sid)
+            root_path = us.root_path if us else ""
+        before_summaries = build_folder_tree(sid, root_path)
+        before_tree = _folder_summaries_to_tree(before_summaries, root_path)
+
         counts = generate_reorg_proposals(session_id=sid)
         _mark_session_unsaved(sid, step="organize")
-        return counts
+
+        # Build proposed "after" tree using the new MOVE/RENAME_FOLDER proposals
+        after_tree = _build_proposed_tree(sid, before_summaries, root_path)
+
+        return {**counts, "before_tree": before_tree, "after_tree": after_tree}
     except HTTPException:
         raise
     except Exception as exc:
@@ -1208,6 +1402,111 @@ def browse_filesystem(path: Optional[str] = None) -> BrowseResponse:
         parent=parent,
         folders=folders,
     )
+
+
+# ---------------------------------------------------------------------------
+# Subfolders — list immediate subdirs, flagging completed ones
+# ---------------------------------------------------------------------------
+
+@router.get("/subfolders")
+def list_subfolders(root_path: str):
+    """Return immediate subdirectories of root_path, marking completed ones."""
+    from datahoarder.db.models import CompletedFolder as CF
+    target = Path(root_path)
+    if not target.exists() or not target.is_dir():
+        raise HTTPException(400, f"Invalid path: {root_path}")
+
+    engine = get_engine()
+    # Get set of completed folder paths for this root
+    completed_paths: set[str] = set()
+    try:
+        with Session(engine) as db:
+            if "completed_folders" in [t.name for t in db.get_bind().dialect.get_table_names(db.get_bind()) if False] or True:
+                rows = db.query(CF.folder_path).filter(CF.root_path == root_path).all()
+                completed_paths = {r.folder_path for r in rows}
+    except Exception:
+        pass
+
+    folders = []
+    try:
+        for entry in sorted(target.iterdir()):
+            if not entry.is_dir():
+                continue
+            name = entry.name
+            if name.startswith(".") or name.startswith("$"):
+                continue
+            folders.append({
+                "name": name,
+                "path": str(entry),
+                "completed": str(entry) in completed_paths,
+            })
+    except PermissionError:
+        raise HTTPException(403, f"Cannot read directory: {root_path}")
+
+    return {"folders": folders}
+
+
+# ---------------------------------------------------------------------------
+# Completed folders log
+# ---------------------------------------------------------------------------
+
+@router.get("/completed-folders")
+def list_completed_folders(root_path: Optional[str] = None):
+    """Return all completed folder records, optionally filtered by root_path."""
+    from datahoarder.db.models import CompletedFolder as CF
+    engine = get_engine()
+    with Session(engine) as db:
+        q = db.query(CF)
+        if root_path:
+            q = q.filter(CF.root_path == root_path)
+        rows = q.order_by(CF.completed_at.desc()).all()
+        return {"items": [
+            {"id": r.id, "folder_path": r.folder_path, "session_id": r.session_id,
+             "completed_at": r.completed_at.isoformat(), "root_path": r.root_path}
+            for r in rows
+        ]}
+
+
+# ---------------------------------------------------------------------------
+# Database config
+# ---------------------------------------------------------------------------
+
+@router.get("/db-info")
+def get_db_info():
+    """Return current DB path."""
+    import json
+    config_file = Path.home() / ".datahoarder.json"
+    db_path = ""
+    if config_file.exists():
+        try:
+            cfg = json.loads(config_file.read_text(encoding="utf-8"))
+            db_path = cfg.get("db_path", "")
+        except Exception:
+            pass
+    if not db_path:
+        import os
+        db_path = os.environ.get("DATAHOARDER_DB", "datahoarder.db")
+    return {"db_path": db_path}
+
+
+class DbInfoRequest(BaseModel):
+    db_path: str
+
+
+@router.post("/db-info")
+def save_db_info(body: DbInfoRequest):
+    """Save DB path to ~/.datahoarder.json. Requires server restart to take effect."""
+    import json
+    config_file = Path.home() / ".datahoarder.json"
+    cfg = {}
+    if config_file.exists():
+        try:
+            cfg = json.loads(config_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    cfg["db_path"] = body.db_path
+    config_file.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    return {"status": "saved", "db_path": body.db_path}
 
 
 # ---------------------------------------------------------------------------

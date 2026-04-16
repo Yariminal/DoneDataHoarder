@@ -44,6 +44,8 @@ class UserSession(Base):
     root_path: Mapped[str] = mapped_column(String, nullable=False, default="")
     backend: Mapped[str] = mapped_column(String, default="ollama")
     model: Mapped[str] = mapped_column(String, default="llama3.2:3b")
+    analyze_model: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    propose_model: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     workers: Mapped[int] = mapped_column(Integer, default=1)
     preferred_language: Mapped[str] = mapped_column(String, default="leave_as_is")
 
@@ -109,6 +111,7 @@ class ProposalStatus(str, enum.Enum):
 class DupeType(str, enum.Enum):
     EXACT       = "exact"        # identical MD5
     PERCEPTUAL  = "perceptual"   # near-identical image (pHash)
+    SEMANTIC    = "semantic"     # similar AI description/tags (same content type)
     CONTENT     = "content"      # similar document content
 
 
@@ -276,3 +279,20 @@ class ScanSession(Base):
     files_skipped: Mapped[int] = mapped_column(Integer, default=0)
     files_error: Mapped[int] = mapped_column(Integer, default=0)
     completed: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+# ---------------------------------------------------------------------------
+# CompletedFolder — tracks folders that finished the full pipeline
+# ---------------------------------------------------------------------------
+
+class CompletedFolder(Base):
+    __tablename__ = "completed_folders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    folder_path: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    session_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    completed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    root_path: Mapped[str] = mapped_column(String, nullable=False)

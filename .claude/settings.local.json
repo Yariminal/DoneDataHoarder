@@ -137,7 +137,21 @@
       "Bash(curl -s -X POST http://127.0.0.1:8082/api/execute -H \"Content-Type: application/json\" -d \"{\"\"session_id\"\":\"\"$SESSION_ID\"\",\"\"dry_run\"\":true,\"\"min_confidence\"\":0.0}\")",
       "Bash(curl -s -X POST http://127.0.0.1:8082/api/execute -H \"Content-Type: application/json\" -d \"{\"\"session_id\"\":\"\"$SESSION_ID\"\",\"\"dry_run\"\":false,\"\"min_confidence\"\":0.0}\")",
       "Bash(curl -s \"http://127.0.0.1:8082/api/proposals?status=rejected&per_page=50\")",
-      "Bash(python -m py_compile datahoarder/proposals/namer.py datahoarder/proposals/organizer.py datahoarder/proposals/sequence_detector.py datahoarder/executor.py datahoarder/db/models.py datahoarder/web/api.py)"
+      "Bash(python -m py_compile datahoarder/proposals/namer.py datahoarder/proposals/organizer.py datahoarder/proposals/sequence_detector.py datahoarder/executor.py datahoarder/db/models.py datahoarder/web/api.py)",
+      "Bash(/c/Users/yarim/Desktop/Projects/DoneDataHoarder/.venv/Scripts/python -m uvicorn datahoarder.web.app:create_default_app --factory --host 127.0.0.1 --port 8082 --log-level info)",
+      "Bash(curl -s http://127.0.0.1:8082/)",
+      "mcp__Claude_in_Chrome__tabs_context_mcp",
+      "Bash(xargs cat:*)",
+      "Bash(taskkill /F /IM python.exe)",
+      "Bash(/c/Users/yarim/Desktop/Projects/DoneDataHoarder/.venv/Scripts/python.exe -m uvicorn datahoarder.web.app:create_default_app --factory --host 127.0.0.1 --port 8082)",
+      "Bash(taskkill /F /IM python.exe /T)",
+      "Bash(taskkill /PID 27580 /F)",
+      "Bash(taskkill /PID 17560 /F)",
+      "Bash(taskkill //PID 27580 //F)",
+      "Bash(taskkill //PID 17560 //F)",
+      "Bash(curl -s http://127.0.0.1:8082/api/info)",
+      "Bash(/c/Users/yarim/Desktop/Projects/DoneDataHoarder/.venv/Scripts/python -m pip show datahoarder)",
+      "Bash(/c/Users/yarim/Desktop/Projects/DoneDataHoarder/.venv/Scripts/python -m pip install -e . --upgrade --quiet)"
     ]
   }
 }

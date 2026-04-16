@@ -243,7 +243,7 @@ def find_semantic_duplicates(session_id: str | None = None) -> dict:
     with Session(engine) as session:
         # Only consider analyzed files with descriptions or tags
         q = (
-            session.query(File.id, File.ai_description, File.ai_tags)
+            session.query(File.id, File.ai_description, File.ai_tags, File.mime_type)
             .filter(File.status.in_([FileStatus.ANALYZED, FileStatus.PROPOSED]))
             .filter((File.ai_description.isnot(None)) | (File.ai_tags.isnot(None)))
         )
@@ -267,12 +267,14 @@ def find_semantic_duplicates(session_id: str | None = None) -> dict:
     ) as progress:
         task = progress.add_task("Comparing AI descriptions…", total=len(rows))
 
-        for i, (id_a, desc_a, tags_a) in enumerate(rows):
+        for i, (id_a, desc_a, tags_a, mime_a) in enumerate(rows):
             progress.advance(task)
             if id_a in visited:
                 continue
 
             group = [id_a]
+            group_sims = {}  # id_b -> combined_sim
+            mime_group_a = (mime_a or "").split("/")[0]  # e.g. "image", "application"
             tags_a_list = []
             try:
                 if tags_a:
@@ -280,8 +282,14 @@ def find_semantic_duplicates(session_id: str | None = None) -> dict:
             except (json.JSONDecodeError, TypeError):
                 pass
 
-            for id_b, desc_b, tags_b in rows[i + 1:]:
+            for id_b, desc_b, tags_b, mime_b in rows[i + 1:]:
                 if id_b in visited:
+                    continue
+
+                # Only compare files of the same broad MIME type to avoid
+                # cross-type false positives (e.g. image vs PDF)
+                mime_group_b = (mime_b or "").split("/")[0]
+                if mime_group_a and mime_group_b and mime_group_a != mime_group_b:
                     continue
 
                 # Calculate similarity across description and tags
@@ -301,22 +309,24 @@ def find_semantic_duplicates(session_id: str | None = None) -> dict:
 
                 if combined_sim >= AI_SIMILARITY_THRESHOLD:
                     group.append(id_b)
+                    group_sims[id_b] = combined_sim
 
             if len(group) > 1:
                 for gid in group:
                     visited.add(gid)
-                groups.append(group)
+                avg_sim = (sum(group_sims.values()) / len(group_sims)) if group_sims else AI_SIMILARITY_THRESHOLD
+                groups.append((group, round(avg_sim, 2)))
 
     with Session(engine) as session:
-        for group in groups:
+        for group, avg_sim in groups:
             # Use string of sorted IDs as group key
             group_hash = "-".join(str(x) for x in sorted(group))
             _upsert_group(
                 session,
-                DupeType.PERCEPTUAL,  # Use PERCEPTUAL type for semantic duplicates too
+                DupeType.SEMANTIC,
                 group_hash,
                 group,
-                similarity=0.85,
+                similarity=avg_sim,
                 session_id=session_id,
             )
             counts["groups"] += 1

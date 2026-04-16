@@ -16,6 +16,7 @@ document.addEventListener('alpine:init', () => {
     toast(msg, type = 'info') {
       const id = Date.now();
       this.toasts.push({ id, msg, type });
+      setTimeout(() => this.dismissToast(id), type === 'error' ? 6000 : 3000);
     },
     dismissToast(id) {
       this.toasts = this.toasts.filter(t => t.id !== id);
@@ -35,6 +36,9 @@ document.addEventListener('alpine:init', () => {
     root_path: '',
     backend: 'ollama',
     model: '',
+    analyze_model: '',
+    propose_model: '',
+    skip_dirs: [],
     workers: 1,
     preferred_language: 'leave_as_is',
     stats: {},
@@ -80,6 +84,8 @@ document.addEventListener('alpine:init', () => {
       this.root_path = data.root_path || '';
       this.backend = data.backend || 'ollama';
       this.model = data.model || '';
+      this.analyze_model = data.analyze_model || '';
+      this.propose_model = data.propose_model || '';
       this.workers = data.workers || 1;
       this.preferred_language = data.preferred_language || 'leave_as_is';
       this.stats = data.stats || {};
@@ -214,6 +220,8 @@ document.addEventListener('alpine:init', () => {
         Alpine.store('session').loadFrom(data);
         // Clear localStorage so new session doesn't inherit old settings
         localStorage.removeItem('datahoarder_model');
+        localStorage.removeItem('datahoarder_analyze_model');
+        localStorage.removeItem('datahoarder_propose_model');
         localStorage.removeItem('datahoarder_folder');
         localStorage.removeItem('datahoarder_workers');
         // Signal setup component to reset its fields
@@ -232,6 +240,8 @@ document.addEventListener('alpine:init', () => {
         // Restore settings to localStorage for compatibility
         if (data.root_path) localStorage.setItem('datahoarder_folder', data.root_path);
         if (data.model) localStorage.setItem('datahoarder_model', data.model);
+        if (data.analyze_model) localStorage.setItem('datahoarder_analyze_model', data.analyze_model);
+        if (data.propose_model) localStorage.setItem('datahoarder_propose_model', data.propose_model);
         if (data.backend) localStorage.setItem('datahoarder_backend', data.backend);
         if (data.workers) localStorage.setItem('datahoarder_workers', String(data.workers));
         if (data.preferred_language) localStorage.setItem('datahoarder_preferred_language', data.preferred_language);
@@ -630,6 +640,11 @@ document.addEventListener('alpine:init', () => {
       return (b/1024).toFixed(0) + ' KB';
     },
 
+    perPage: 20,
+    totalPages() { return Math.ceil(this.total / this.perPage) || 1; },
+    async prevPage() { if (this.page > 1) { this.page--; await this.load(); } },
+    async nextPage() { if (this.page < this.totalPages()) { this.page++; await this.load(); } },
+
     isImage(f) { return f.mime_type && f.mime_type.startsWith('image/'); },
   }));
 
@@ -638,7 +653,8 @@ document.addEventListener('alpine:init', () => {
    * -------------------------------------------------------- */
   Alpine.data('setup', () => ({
     selectedFolder: localStorage.getItem('datahoarder_folder') || '',
-    selectedModel: localStorage.getItem('datahoarder_model') || '',
+    selectedAnalyzeModel: localStorage.getItem('datahoarder_analyze_model') || localStorage.getItem('datahoarder_model') || '',
+    selectedProposeModel: localStorage.getItem('datahoarder_propose_model') || localStorage.getItem('datahoarder_model') || '',
     selectedBackend: localStorage.getItem('datahoarder_backend') || 'ollama',
     selectedWorkers: parseInt(localStorage.getItem('datahoarder_workers') || '1', 10),
     numParallel: parseInt(localStorage.getItem('datahoarder_num_parallel') || '1', 10),
@@ -655,14 +671,21 @@ document.addEventListener('alpine:init', () => {
     recommendedModels: [],
     pulling: null,
     pullProgress: {},
+    subfolders: [],
+    skippedFolders: [],
+    dbPath: '',
 
     async init() {
       await this.loadOllamaStatus();
       await this.loadInstalledModels();
+      await this.loadDbPath();
       // Reset folder/model fields when a new session is created
       window.addEventListener('datahoarder:new-session', () => {
         this.selectedFolder = '';
-        this.selectedModel = '';
+        this.selectedAnalyzeModel = '';
+        this.selectedProposeModel = '';
+        this.subfolders = [];
+        this.skippedFolders = [];
       });
       this.$watch('showBrowser', (val) => {
         if (val && !this.currentPath) {
@@ -711,36 +734,83 @@ document.addEventListener('alpine:init', () => {
       this.selectedFolder = path;
       this.showBrowser = false;
       this.saveSettings();
+      this.loadSubfolders();
       Alpine.store('app').toast('Folder selected: ' + path, 'success');
     },
 
-    selectCustomModel() {
+    async loadSubfolders() {
+      if (!this.selectedFolder) { this.subfolders = []; return; }
+      try {
+        const data = await api.get(`/subfolders?root_path=${encodeURIComponent(this.selectedFolder)}`);
+        this.subfolders = data.folders || [];
+        this.skippedFolders = this.subfolders.filter(f => f.completed).map(f => f.path);
+      } catch (e) { this.subfolders = []; }
+    },
+
+    toggleSkipFolder(path) {
+      const idx = this.skippedFolders.indexOf(path);
+      if (idx >= 0) this.skippedFolders.splice(idx, 1);
+      else this.skippedFolders.push(path);
+    },
+
+    async loadDbPath() {
+      try {
+        const data = await api.get('/db-info');
+        this.dbPath = data.db_path || '';
+      } catch (e) { /* ignore */ }
+    },
+
+    async saveDbPath() {
+      try {
+        await api.post('/db-info', { db_path: this.dbPath });
+        Alpine.store('app').toast('DB path saved. Restart the server to apply.', 'success');
+      } catch (e) {
+        Alpine.store('app').toast('Failed to save DB path: ' + e.message, 'error');
+      }
+    },
+
+    selectCustomModel(target) {
       if (!this.customModel.trim()) {
         Alpine.store('app').toast('Enter a model name', 'error');
         return;
       }
-      this.selectedModel = this.customModel.trim();
+      const name = this.customModel.trim();
+      if (target === 'propose') this.selectedProposeModel = name;
+      else this.selectedAnalyzeModel = name;
       this.customModel = '';
       this.showCustomModel = false;
       this.saveSettings();
-      Alpine.store('app').toast('Custom model selected: ' + this.selectedModel, 'success');
+      Alpine.store('app').toast('Custom model selected: ' + name, 'success');
     },
 
     saveSettings() {
       localStorage.setItem('datahoarder_folder', this.selectedFolder);
-      localStorage.setItem('datahoarder_model', this.selectedModel);
+      localStorage.setItem('datahoarder_analyze_model', this.selectedAnalyzeModel);
+      localStorage.setItem('datahoarder_propose_model', this.selectedProposeModel);
       localStorage.setItem('datahoarder_backend', this.selectedBackend);
       localStorage.setItem('datahoarder_workers', String(this.selectedWorkers));
       localStorage.setItem('datahoarder_num_parallel', String(this.numParallel));
       localStorage.setItem('datahoarder_preferred_language', this.preferredLanguage);
-      // Sync to session store
+      // Sync to session store and persist to backend
       const session = Alpine.store('session');
       if (session.active) {
         session.root_path = this.selectedFolder;
-        session.model = this.selectedModel;
+        session.model = this.selectedAnalyzeModel;
+        session.analyze_model = this.selectedAnalyzeModel;
+        session.propose_model = this.selectedProposeModel;
         session.backend = this.selectedBackend;
         session.workers = this.selectedWorkers;
         session.preferred_language = this.preferredLanguage;
+        // Persist to DB
+        api.patch(`/sessions/${session.current_session_id}`, {
+          root_path: this.selectedFolder,
+          backend: this.selectedBackend,
+          model: this.selectedAnalyzeModel,
+          analyze_model: this.selectedAnalyzeModel,
+          propose_model: this.selectedProposeModel,
+          workers: this.selectedWorkers,
+          preferred_language: this.preferredLanguage,
+        }).catch(() => {}); // fire-and-forget
       }
     },
 
@@ -946,14 +1016,38 @@ document.addEventListener('alpine:init', () => {
 
     getSettings() {
       const session = Alpine.store('session');
+      const analyzeModel = session.analyze_model || localStorage.getItem('datahoarder_analyze_model') || session.model || localStorage.getItem('datahoarder_model') || '';
+      const proposeModel = session.propose_model || localStorage.getItem('datahoarder_propose_model') || session.model || localStorage.getItem('datahoarder_model') || '';
       return {
         rootPath: session.root_path || localStorage.getItem('datahoarder_folder') || '',
-        model: session.model || localStorage.getItem('datahoarder_model') || '',
+        analyzeModel,
+        proposeModel,
+        model: analyzeModel,  // backward compat
         backend: session.backend || localStorage.getItem('datahoarder_backend') || 'ollama',
         workers: session.workers || parseInt(localStorage.getItem('datahoarder_workers') || '1', 10),
         preferredLanguage: session.preferred_language || localStorage.getItem('datahoarder_preferred_language') || 'leave_as_is',
         session_id: session.current_session_id || '',
       };
+    },
+
+    isStepDone(step) {
+      const steps = Alpine.store('session').stats?.completed_steps || [];
+      return steps.includes(step);
+    },
+
+    renderTree(node, depth = 0) {
+      if (!node || typeof node !== 'object') return '';
+      let html = '';
+      const indent = '  '.repeat(depth);
+      for (const [key, val] of Object.entries(node)) {
+        if (key.startsWith('_')) continue;
+        const files = val._files || 0;
+        const size = val._size || 0;
+        const sizeStr = size > 1024*1024 ? (size/1024/1024).toFixed(1) + ' MB' : size > 1024 ? (size/1024).toFixed(0) + ' KB' : size + ' B';
+        html += `${indent}<span class="tree-folder">📁 ${key}/</span> <span class="tree-meta">(${files} files, ${sizeStr})</span>\n`;
+        html += this.renderTree(val, depth + 1);
+      }
+      return html;
     },
 
     async runStep(step) {
@@ -983,7 +1077,8 @@ document.addEventListener('alpine:init', () => {
               Alpine.store('app').loading = false;
               return;
             }
-            data = await api.post('/pipeline/scan', { root_path: settings.rootPath, session_id: settings.session_id });
+            const skipDirs = Alpine.store('session').skip_dirs || [];
+            data = await api.post('/pipeline/scan', { root_path: settings.rootPath, session_id: settings.session_id, skip_dirs: skipDirs });
             Alpine.store('app').toast(`Scan complete: ${data.new || 0} new files, ${data.skipped || 0} skipped`, 'success');
             break;
           case 'enrich':
@@ -996,8 +1091,8 @@ document.addEventListener('alpine:init', () => {
             Alpine.store('app').toast(`Dedup complete: ${exactGroups} exact + ${percGroups} perceptual groups`, 'success');
             break;
           case 'analyze':
-            if (!settings.model || settings.model === '') {
-              Alpine.store('app').toast('Please select a model in the Setup tab before analyzing', 'error');
+            if (!settings.analyzeModel || settings.analyzeModel === '') {
+              Alpine.store('app').toast('Please select an analysis model in the Setup tab before analyzing', 'error');
               this.running = null;
               Alpine.store('app').loading = false;
               return;
@@ -1009,8 +1104,8 @@ document.addEventListener('alpine:init', () => {
             Alpine.store('app').toast(`Propose complete: ${data.rename || 0} renames + ${data.tags || 0} tags`, 'success');
             break;
           case 'organize':
-            if (!settings.model || settings.model === '') {
-              Alpine.store('app').toast('Please select a model in the Setup tab before organizing', 'error');
+            if (!settings.proposeModel || settings.proposeModel === '') {
+              Alpine.store('app').toast('Please select a proposal model in the Setup tab before organizing', 'error');
               this.running = null;
               Alpine.store('app').loading = false;
               return;
@@ -1018,7 +1113,7 @@ document.addEventListener('alpine:init', () => {
             data = await api.post('/pipeline/organize', {
               session_id: settings.session_id,
               backend: settings.backend,
-              model: settings.model,
+              model: settings.proposeModel,
             });
             Alpine.store('app').toast(`Organize complete: ${data.move || 0} move proposals generated`, 'success');
             break;
@@ -1054,7 +1149,7 @@ document.addEventListener('alpine:init', () => {
       const body = { session_id: settings.session_id || '' };
       if (type === 'analyze') {
         body.backend = settings.backend;
-        body.model = settings.model;
+        body.model = settings.analyzeModel || settings.model;
         body.workers = settings.workers;
       }
       const res = await api.post(`/pipeline/${type}`, body);

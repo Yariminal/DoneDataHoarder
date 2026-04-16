@@ -5,6 +5,7 @@ ALWAYS run with dry_run=True first to preview changes.
 All applied changes are logged to the database.
 """
 import json
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -432,11 +433,43 @@ def execute(
     if not dry_run and move_source_dirs:
         _cleanup_empty_dirs(move_source_dirs)
 
+    # Also sweep the session root for any pre-existing empty directories
+    if not dry_run and session_id:
+        from datahoarder.db.models import UserSession
+        from sqlalchemy.orm import Session as _OrmSession
+        try:
+            with _OrmSession(engine) as _s:
+                us = _s.get(UserSession, session_id)
+                if us and us.root_path:
+                    _cleanup_empty_dirs_recursive(Path(us.root_path))
+        except Exception:
+            pass
+
     con.print(
         f"\n[bold]Done:[/bold] {counts['applied']} applied, "
         f"{counts['failed']} failed, {counts['skipped']} skipped"
     )
     return counts
+
+
+def _cleanup_empty_dirs_recursive(root: Path) -> None:
+    """
+    Walk the entire root tree and remove any empty directories (bottom-up).
+    This catches pre-existing empty dirs that were never touched by MOVE proposals.
+    Never removes the root itself.
+    """
+    if not root.exists() or not root.is_dir():
+        return
+    # Walk bottom-up so children are removed before parents
+    for dirpath, dirnames, filenames in os.walk(str(root), topdown=False):
+        p = Path(dirpath)
+        if p == root:
+            continue
+        try:
+            if not any(p.iterdir()):
+                p.rmdir()
+        except OSError:
+            pass
 
 
 def _cleanup_empty_dirs(moved_dirs: set[Path]) -> None:

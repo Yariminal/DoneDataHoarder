@@ -139,10 +139,10 @@ Extracted text (first {max_chars} characters):
 Based on the filename, folder context, and document content, return a JSON object:
 {{
   "description": "1-2 sentences describing what this document is about",
-  "suggested_name": "meaningful filename stem — MUST preserve specific proper nouns (names, places, organizations, project titles) from the original filename and content. Translate to English if not already. No extension, no date prefix, use_underscores, max 60 chars",
+  "suggested_name": "meaningful filename stem. Rules: (1) Describe the document's actual content/purpose — do NOT repeat the containing folder name. (2) Preserve specific proper nouns (client names, organizations) only if they uniquely identify this document. (3) Translate to English if not already. (4) No extension, no date prefix, use_underscores, max 60 chars",
   "tags": ["tag1", "tag2", ...],
   "document_type": "one of: invoice, receipt, contract, report, letter, cv_resume, photo, presentation, spreadsheet, notes, form, certificate, manual, other",
-  "detected_date": "YYYY-MM-DD if a date is clearly present in the content, else null",
+  "detected_date": "YYYY-MM-DD only if a specific date is explicitly written in the document text (e.g. '14 March 2021', 'Date: 2021-03-14') — NOT inferred from the folder name or filename. Return null if no explicit date is found.",
   "language": "ISO 639-1 language code (e.g. en, he, fr)",
   "confidence": 0.0-1.0
 }}
