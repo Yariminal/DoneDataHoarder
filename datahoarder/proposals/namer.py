@@ -34,6 +34,71 @@ DOC_EXTENSIONS = {
     ".pptx", ".ppt", ".txt", ".md", ".rtf",
 }
 
+# Stems that carry no information about the file's content. When a file has one
+# of these, it is always worth proposing a rename — even with weak AI signal
+# the result is unambiguously more useful than "1", "15.12", "IMG_1234", etc.
+# Patterns are matched case-insensitively against the lowercased stem.
+_USELESS_STEM_PATTERNS = [
+    re.compile(r"^\d+$"),                    # 1, 2, 99
+    re.compile(r"^\d+([._-]\d+)+$"),         # 15.12, 2018-01, 1_2_3
+    re.compile(r"^[a-z]$"),                  # a, b, c (single char)
+    re.compile(r"^untitled[\s_-]*\d*$"),     # untitled, untitled1, untitled_2
+    re.compile(r"^new[\s_-]*(file|document|image|folder)?[\s_-]*\d*$"),
+    re.compile(r"^document[\s_-]*\d*$"),     # document, document1
+    re.compile(r"^copy([\s_-]*of[\s_-]*)?$"),  # copy, copy of
+    re.compile(r"^scan[\s_-]*\d*$"),         # scan, scan_001
+    re.compile(r"^img[\s_-]*\d*$"),          # img, IMG_1234, img1
+    re.compile(r"^image[\s_-]*\d*$"),        # image1
+    re.compile(r"^dsc[\s_-]*\d*$"),          # DSC_1234, DSC0001 (camera default)
+    re.compile(r"^p\d+$"),                   # P1010234 (Panasonic camera)
+    re.compile(r"^photo[\s_-]*\d*$"),
+    re.compile(r"^picture[\s_-]*\d*$"),
+    re.compile(r"^file[\s_-]*\d*$"),
+    re.compile(r"^pdf[\s_-]*\d*$"),
+    re.compile(r"^doc[\s_-]*\d*$"),
+    re.compile(r"^temp[\s_-]*\d*$"),
+    re.compile(r"^tmp[\s_-]*\d*$"),
+    re.compile(r"^[a-z]{1,3}\d{1,4}$"),      # IMG1234-style 3-letter prefixes
+]
+
+
+def _is_useless_stem(stem: str) -> bool:
+    """
+    True if the file's current stem carries effectively zero information about
+    its content — pure digits, single chars, generic placeholders like
+    'untitled', camera-default IDs like IMG_1234 / DSC0001 / P1010234.
+    """
+    if not stem:
+        return True
+    s = stem.strip().lower()
+    if not s:
+        return True
+    return any(p.match(s) for p in _USELESS_STEM_PATTERNS)
+
+
+def _folder_context_fallback(file_rec: File) -> Optional[str]:
+    """
+    Last-resort name when the stem is useless AND the AI gave us nothing.
+
+    Combines the parent folder name + original stem digits so the file at
+    least gains contextual location info: '1.pdf' inside 'Event_Menus/'
+    becomes 'event_menus_1.pdf'. Better than leaving '1.pdf' to languish.
+
+    Returns the new stem (no extension) or None if even this can't be built.
+    """
+    path = Path(file_rec.path)
+    parent_name = _safe(path.parent.name) if path.parent.name else ""
+    original_stem = _safe(path.stem)
+    if not parent_name and not original_stem:
+        return None
+    if parent_name and original_stem:
+        # Avoid double-prefixing if the original stem already contains the
+        # parent name (rare for useless stems, but cheap to guard against).
+        if original_stem.startswith(parent_name):
+            return original_stem
+        return f"{parent_name}_{original_stem}"
+    return parent_name or original_stem
+
 
 # ---------------------------------------------------------------------------
 # Name building
@@ -97,7 +162,16 @@ def build_new_name(file_rec: File) -> Optional[str]:
     desc = file_rec.ai_description or ""
     tags_str = file_rec.ai_tags or ""
 
+    # If the existing stem is useless (1.pdf, IMG_1234.jpg, untitled.docx),
+    # we want to propose *something* even when AI gave us nothing — falling
+    # back to the parent folder name + original digits as last-resort context.
+    stem_is_useless = _is_useless_stem(path.stem)
+
     if not desc and not tags_str:
+        if stem_is_useless:
+            fallback = _folder_context_fallback(file_rec)
+            if fallback:
+                return fallback + ext
         return None
 
     # Guard: skip if AI description is actually an error message
@@ -541,7 +615,21 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
 
                 session.commit()
 
-    # Post-pass: collapse spelling variants across all proposed names so that
+    # Post-pass 1: rescue files that still have a useless stem (1.pdf,
+    # IMG_1234.jpg, untitled.docx, etc.) and didn't pick up a RENAME proposal
+    # in the main loop — typically because analysis failed or returned nothing.
+    # Generate a low-confidence folder-context fallback so the user at least
+    # sees them in the review UI rather than silently shipping with the
+    # original meaningless name.
+    try:
+        rescued = _generate_fallback_for_useless_stems(session_id)
+        if rescued:
+            counts["fallback_renames"] = rescued
+    except Exception:
+        # Best-effort rescue pass — never break the pipeline if it errors.
+        pass
+
+    # Post-pass 2: collapse spelling variants across all proposed names so that
     # "solar_decathlon" and "solar_dekathlon" don't both appear in the same
     # session output. Runs once after every batch is committed.
     try:
@@ -553,3 +641,106 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
         pass
 
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Fallback rename pass for files with useless stems that the main loop missed
+# ---------------------------------------------------------------------------
+
+def _generate_fallback_for_useless_stems(session_id: str | None) -> int:
+    """
+    For every file in the session whose current stem is useless (1.pdf,
+    IMG_1234.jpg, untitled.docx, etc.) AND has no RENAME proposal yet,
+    emit a low-confidence fallback rename built from the parent folder name +
+    original digits. Better than letting the file ship with a meaningless
+    placeholder stem.
+
+    Confidence is intentionally low (0.3) so that:
+    - The UI surfaces it for human review rather than auto-applying.
+    - If analysis is re-run later and produces a real description, the new
+      proposal will be filtered out by the main loop's existence check, so
+      the fallback wins by default. (Trade-off: a future improvement could
+      replace fallback proposals when better data arrives, but for now the
+      conservative bias is to keep the human-reviewable fallback.)
+
+    Returns the number of fallback proposals created.
+    """
+    if not session_id:
+        return 0
+
+    engine = get_engine()
+    created = 0
+
+    with Session(engine) as session:
+        # Pull every non-applied file in the session — the fallback should
+        # also help files stuck at ENRICHED (analyzer failed) and PENDING.
+        files_q = session.query(File).filter(
+            File.session_id == session_id,
+            File.status.in_([
+                FileStatus.PENDING,
+                FileStatus.ENRICHED,
+                FileStatus.ANALYZED,
+                FileStatus.PROPOSED,
+            ]),
+        )
+        files = files_q.all()
+        if not files:
+            return 0
+
+        # Pre-load existing RENAME proposals so we don't duplicate.
+        existing_renames: set[int] = {
+            file_id
+            for (file_id,) in session.query(Proposal.file_id).filter(
+                Proposal.proposal_type == ProposalType.RENAME,
+                Proposal.file_id.in_([f.id for f in files]),
+            )
+        }
+
+        # Build the set of paths already reserved by RENAME proposals so we
+        # don't generate a fallback that collides with another file's planned
+        # new path.
+        reserved_paths: set[Path] = set()
+        for (proposed_value,) in session.query(Proposal.proposed_value).filter(
+            Proposal.proposal_type == ProposalType.RENAME,
+            Proposal.file_id.in_([f.id for f in files]),
+        ):
+            if proposed_value:
+                reserved_paths.add(Path(proposed_value))
+
+        for f in files:
+            if f.id in existing_renames:
+                continue
+            path = Path(f.path)
+            if not _is_useless_stem(path.stem):
+                continue
+            fallback_stem = _folder_context_fallback(f)
+            if not fallback_stem:
+                continue
+            ext = path.suffix.lower()
+            new_name = fallback_stem + ext
+            if new_name == path.name:
+                continue
+            proposed_path = _resolve_collision(
+                path.parent / new_name, path, reserved_names=reserved_paths
+            )
+            reserved_paths.add(proposed_path)
+            session.add(Proposal(
+                file_id=f.id,
+                proposal_type=ProposalType.RENAME,
+                current_value=str(path),
+                proposed_value=str(proposed_path),
+                reasoning=(
+                    f"Fallback rename — original stem '{path.stem}' carries no "
+                    "information; using parent folder name as context. "
+                    "Re-run analysis if you want a content-derived name."
+                ),
+                confidence=0.3,
+                status=ProposalStatus.PENDING,
+            ))
+            existing_renames.add(f.id)
+            created += 1
+
+        if created:
+            session.commit()
+
+    return created
