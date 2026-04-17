@@ -307,9 +307,12 @@ def _normalize_spelling_in_proposals(session_id: str | None) -> int:
 
     Algorithm:
     - Tokenise every proposed filename (stem only) into alphabetic runs >= 5 chars
-    - Bucket tokens by their first 3 characters (cheap prefix gate so unrelated
-      short edits never cluster)
-    - Inside each bucket, cluster tokens whose SequenceMatcher ratio is >= 0.85
+    - Bucket tokens by their first 2 characters (cheap prefix gate so unrelated
+      short edits never cluster). 2 chars instead of 3 so that single-letter
+      substitutions at index 2 — e.g. de(c)athlon vs de(k)athlon, re(c)ieve vs
+      re(c)eive — still land in the same bucket and get compared.
+    - Inside each bucket, run a fast SequenceMatcher.quick_ratio() pre-filter
+      to skip obviously dissimilar pairs, then full ratio() >= 0.85 clusters.
     - Pick the most-frequent token in each cluster as canonical
     - Substitute non-canonical occurrences in proposed_value, preserving everything
       else (date prefix, sequence number, extension)
@@ -351,10 +354,12 @@ def _normalize_spelling_in_proposals(session_id: str | None) -> int:
         if not token_counter:
             return 0
 
-        # Bucket by first 3 chars; within each bucket, find similarity clusters
+        # Bucket by first 2 chars; within each bucket, find similarity clusters.
+        # 2 chars (not 3) so that typos at index 2 — decathlon/dekathlon,
+        # recieve/receive — still collide into the same bucket.
         buckets: dict[str, list[str]] = defaultdict(list)
         for tok in token_counter:
-            buckets[tok[:3]].append(tok)
+            buckets[tok[:2]].append(tok)
 
         canonical: dict[str, str] = {}
         for prefix, toks in buckets.items():
@@ -371,7 +376,13 @@ def _normalize_spelling_in_proposals(session_id: str | None) -> int:
                 for t2 in toks_sorted[i + 1:]:
                     if t2 in visited or t1 == t2:
                         continue
-                    if SequenceMatcher(None, t1, t2).ratio() >= 0.85:
+                    # quick_ratio is an upper bound on ratio() — if it's already
+                    # below the threshold, the full ratio cannot exceed 0.85,
+                    # so we save the expensive call.
+                    sm = SequenceMatcher(None, t1, t2)
+                    if sm.quick_ratio() < 0.85:
+                        continue
+                    if sm.ratio() >= 0.85:
                         cluster.append(t2)
                 if len(cluster) > 1:
                     # The first member (highest freq) is canonical.
