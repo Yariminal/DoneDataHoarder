@@ -13,6 +13,18 @@ from datahoarder.db.models import File
 MAX_CHARS = 3000   # max text chars to send to AI
 MAX_PAGES = 3      # max PDF pages to read
 
+# Hard size cap on document extraction. Files larger than this skip text
+# extraction entirely and the analyzer falls back to the filename / folder
+# context (marked content_available=False so the description is prefixed
+# [UNVERIFIED ...] and confidence is capped at 0.4).
+#
+# Why: pdfplumber can take minutes / OOM on very large PDFs (the Solar
+# Dekathlon test had a 452 MB PDF that hung the analyzer entirely),
+# openpyxl / python-docx have similar pathological cases. We'd rather get
+# a degraded analysis than no analysis at all — the file should still
+# move through the pipeline and reach the rename / outlier passes.
+MAX_DOC_SIZE_BYTES = 100 * 1024 * 1024  # 100 MB
+
 DOC_EXTENSIONS = {
     ".pdf", ".docx", ".doc", ".odt",
     ".xlsx", ".xls", ".ods", ".csv",
@@ -41,7 +53,20 @@ DOC_MIMES = {
 # Text extraction helpers
 # ---------------------------------------------------------------------------
 
+def _file_too_big(path: Path) -> bool:
+    """True if extracting this file's contents is likely to OOM / hang."""
+    try:
+        return path.stat().st_size > MAX_DOC_SIZE_BYTES
+    except OSError:
+        return False
+
+
 def _extract_pdf(path: Path) -> str:
+    if _file_too_big(path):
+        # Skip PDFs over 100 MB — pdfplumber's per-page parsing scales badly
+        # on huge files (especially scanned docs and embedded-image-heavy PDFs).
+        # The analyzer will fall back to filename/folder inference.
+        return ""
     try:
         import pdfplumber
         text_parts = []
@@ -59,6 +84,8 @@ def _extract_pdf(path: Path) -> str:
 
 
 def _extract_docx(path: Path) -> str:
+    if _file_too_big(path):
+        return ""
     try:
         from docx import Document
         doc = Document(str(path))
@@ -70,6 +97,8 @@ def _extract_docx(path: Path) -> str:
 
 
 def _extract_xlsx(path: Path) -> str:
+    if _file_too_big(path):
+        return ""
     try:
         import openpyxl
         wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
@@ -91,6 +120,11 @@ def _extract_xlsx(path: Path) -> str:
 
 def _extract_text(path: Path) -> str:
     """Read plain-text files with encoding fallbacks."""
+    if _file_too_big(path):
+        # 1 GB log files / massive CSV exports — skip rather than load into RAM.
+        # We only need MAX_CHARS worth anyway; future improvement would be a
+        # streaming read of the first MAX_CHARS bytes, but for now skip.
+        return ""
     for enc in ("utf-8", "cp1252", "latin-1"):
         try:
             return path.read_text(encoding=enc)
