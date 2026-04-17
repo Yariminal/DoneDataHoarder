@@ -228,12 +228,66 @@ def build_folder_tree(session_id: str, root_path: str | None = None) -> list[Fol
             fs.description_keywords = [w for w, _ in desc_words[path].most_common(5)]
             fs.child_folders = sorted(child_map.get(path, set()))
 
+        # Resolve the root path once for the root special-case below. Using
+        # Path() comparison avoids tripping on trailing-slash / case differences
+        # on Windows (e.g. "D:\Stuff" vs "D:/Stuff/").
+        root_norm: Path | None = None
+        if root_path:
+            try:
+                root_norm = Path(root_path).resolve()
+            except (OSError, ValueError):
+                root_norm = Path(root_path)
+
         # Second pass: per-folder outlier detection. A file is an outlier if its
         # mime group differs from the folder's dominant mime group (>=60%), or
         # if it has tags but shares none of them with the folder's top tags.
         # Only run outlier detection on folders with >=4 files (statistical signal).
         for path, fs in folders.items():
             folder_files = files_by_folder.get(path, [])
+
+            # --- Root-folder special case --------------------------------
+            # Files sitting directly at the archive root are categorically
+            # "outliers": the system prompt mandates they be assigned to a
+            # subfolder, but the LLM only acts on filenames it actually sees.
+            # Without this branch, the root only appears as percentage
+            # breakdowns ("30% document, 25% image, …") and the LLM never gets
+            # individual filenames to MOVE. The normal outlier logic below
+            # would also miss root files because (a) the dominant-category
+            # gate rarely fires for genuinely-mixed roots, and (b) we still
+            # want this even when the root has fewer than 4 files.
+            try:
+                path_norm = Path(path).resolve()
+            except (OSError, ValueError):
+                path_norm = Path(path)
+            is_root = root_norm is not None and path_norm == root_norm
+            if is_root and folder_files:
+                root_outliers: list[dict] = []
+                for f in folder_files:
+                    cat = _file_category(f.mime_type, f.extension)
+                    file_tags: list[str] = []
+                    if f.ai_tags:
+                        try:
+                            parsed = json.loads(f.ai_tags)
+                            if isinstance(parsed, list):
+                                file_tags = [str(t).lower() for t in parsed]
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    root_outliers.append({
+                        "filename": f.filename or Path(f.path).name,
+                        "mime_group": cat,
+                        "size": f.size_bytes or 0,
+                        "tags": file_tags[:5],
+                        "reason": "loose file at archive root — needs subfolder assignment",
+                    })
+                # Surface up to 20 (vs the per-folder cap of 5) since root
+                # is exactly where the LLM most needs full visibility. Sort
+                # so files with tags come first (more actionable for the
+                # LLM), then by descending size so big misfits rise.
+                root_outliers.sort(key=lambda o: (0 if o["tags"] else 1, -o["size"]))
+                fs.outlier_files = root_outliers[:20]
+                continue
+            # -------------------------------------------------------------
+
             if len(folder_files) < 4:
                 continue
 
