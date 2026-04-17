@@ -98,4 +98,13 @@ class ArchiveAnalyzer(BaseAnalyzer):
         if archive_type and archive_type not in result.tags:
             result.tags.insert(0, archive_type)
 
+        # If we couldn't read the manifest at all (corrupt zip, IO error,
+        # or empty archive), the LLM was guessing from filename only —
+        # mark it accordingly.
+        if not manifest_lines or total_entries == 0 or (
+            len(manifest_lines) == 1 and manifest_lines[0].startswith("(")
+        ):
+            result.content_available = False
+            result.confidence = min(result.confidence, 0.4)
+
         return result

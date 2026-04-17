@@ -129,6 +129,9 @@ class ImageAnalyzer(BaseAnalyzer):
                 )
             result = AnalysisResult.from_ai_response(data)
             result.confidence = min(result.confidence, 0.4)  # cap confidence for blind guesses
+            # Mark this as a content-unavailable inference so save_result()
+            # prefixes the description with [UNVERIFIED ...] downstream.
+            result.content_available = False
             category = data.get("category", "")
             if category and category not in result.tags:
                 result.tags.insert(0, category)
