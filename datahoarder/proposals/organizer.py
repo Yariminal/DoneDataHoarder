@@ -152,13 +152,23 @@ def build_folder_tree(session_id: str, root_path: str | None = None) -> list[Fol
     files_by_folder: dict[str, list] = defaultdict(list)
 
     with Session(engine) as db:
+        # Include ALL non-skipped files — PENDING and ERROR too. A large PDF
+        # that hit the analyzer's size guard, an HTML whose parser threw, or
+        # anything that never got past scan still deserves to be surfaced in
+        # the folder tree and flagged for moves. Previously these silently
+        # dropped out of the tree and the organizer never got a chance to
+        # propose anything for them (especially painful for root-level loose
+        # files, which my recent root-outlier fix was supposed to rescue but
+        # couldn't because they were never in the query result).
         query = db.query(File).filter(
             File.session_id == session_id,
             File.status.in_([
+                FileStatus.PENDING,
                 FileStatus.ENRICHED,
                 FileStatus.ANALYZED,
                 FileStatus.PROPOSED,
                 FileStatus.APPLIED,
+                FileStatus.ERROR,
             ]),
         )
         files = query.all()

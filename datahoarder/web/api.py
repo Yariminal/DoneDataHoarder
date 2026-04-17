@@ -1216,36 +1216,130 @@ def trigger_propose(body: PipelineRequest = PipelineRequest()):
         raise HTTPException(500, f"Propose failed: {str(exc)}")
 
 
-def _folder_summaries_to_tree(summaries, root_path: str) -> dict:
-    """Convert a list of FolderSummary objects into a nested dict for the frontend."""
-    from pathlib import PurePosixPath, PureWindowsPath
-    tree: dict = {}
+def _fs_walk_skeleton(root_path: str, max_depth: int = 3) -> dict:
+    """
+    Walk the actual filesystem under root_path and produce a skeletal tree
+    that includes *every* folder and (up to N) file names — regardless of
+    whether those files were analyzed / exist in the DB.
+
+    This is what makes empty folders (GIF/, images/, _files/ companions) and
+    un-analyzed / errored / pending root files (the 452 MB PDF, HTMLs) show
+    up in the UI. Without it, the tree only ever reflects ANALYZED files
+    and the user has no idea what's actually on disk.
+
+    Depth is capped so we don't blow up on deep hierarchies; the UI tree
+    only ever shows a few levels anyway.
+    """
     root = Path(root_path)
-    for fs in summaries:
+    tree: dict = {}
+    if not root.exists():
+        return tree
+
+    SAMPLE_CAP = 12  # per-folder cap on listed filenames
+
+    def _walk(fs_path: Path, node: dict, depth: int) -> None:
         try:
-            rel = Path(fs.path).relative_to(root)
-        except ValueError:
-            continue
-        parts = rel.parts
-        if not parts:
-            # Root folder itself
-            tree["_files"] = fs.file_count
-            tree["_size"] = fs.total_size
-            continue
-        node = tree
-        for part in parts:
-            if part not in node:
-                node[part] = {}
-            node = node[part]
-        node["_files"] = fs.file_count
-        node["_size"] = fs.total_size
+            entries = list(fs_path.iterdir())
+        except (OSError, PermissionError):
+            return
+
+        files: list[dict] = []
+        total_size = 0
+        for entry in entries:
+            try:
+                if entry.is_file():
+                    size = 0
+                    try:
+                        size = entry.stat().st_size
+                    except OSError:
+                        pass
+                    total_size += size
+                    files.append({"name": entry.name, "size": size})
+                elif entry.is_dir() and depth < max_depth:
+                    # Recurse into subdirs
+                    sub: dict = {}
+                    node[entry.name] = sub
+                    _walk(entry, sub, depth + 1)
+            except OSError:
+                continue
+
+        # Record file count (own directory, not including subfolders) and sample.
+        # Sort files by size descending so the biggest show first — the 452 MB
+        # PDF jumps to the top of the list where the user can't miss it.
+        files.sort(key=lambda f: -f["size"])
+        node["_files"] = len(files)
+        node["_size"] = total_size
+        if files:
+            node["_sample_files"] = files[:SAMPLE_CAP]
+            if len(files) > SAMPLE_CAP:
+                node["_sample_truncated"] = len(files) - SAMPLE_CAP
+
+    _walk(root, tree, 0)
+    return tree
+
+
+def _folder_summaries_to_tree(summaries, root_path: str) -> dict:
+    """
+    Build a nested dict tree for the frontend visualization.
+
+    Starts from an actual filesystem walk so that *every* folder on disk is
+    represented (even empty / un-analyzed ones like GIF/ or images/), then
+    overlays analyzed-file metadata from the FolderSummary records. Without
+    the fs walk, folders that had no analyzed files would silently disappear
+    from the Current Structure panel, misleading the user about what's on disk.
+
+    The overlay increments counters rather than overwriting them — that way
+    the fs file counts include un-analyzed files too (so the 452 MB PDF at
+    root shows up in the root's total even if it was never analyzed).
+    """
+    root = Path(root_path)
+
+    # Phase 1: skeleton from actual filesystem — guarantees every folder and
+    # file on disk is represented, regardless of analysis status.
+    tree = _fs_walk_skeleton(str(root))
+
+    # Phase 2: no overlay needed — the fs walk already populated _files,
+    # _size, and _sample_files. FolderSummary metadata (tags, descriptions)
+    # isn't used by the frontend tree renderer, so there's nothing to merge.
+    # We keep `summaries` as a parameter for API compatibility and future use
+    # (e.g. overlaying analysis-derived labels).
+    _ = summaries
+
     return tree
 
 
 def _build_proposed_tree(session_id: str, before_summaries, root_path: str) -> dict:
-    """Build an 'after' tree reflecting pending MOVE and RENAME_FOLDER proposals."""
+    """
+    Build an 'after' tree reflecting pending MOVE and RENAME_FOLDER proposals.
+
+    Starts from the filesystem-backed before-tree, then simulates the effect
+    of applying every pending folder rename + file move. Unlike the previous
+    implementation this also:
+
+    - Decrements the source folder's counts (not just increments the target)
+    - Moves the actual filename between source._sample_files and target._sample_files
+      so the UI shows the file in its destination, not both places
+    """
     tree = _folder_summaries_to_tree(before_summaries, root_path)
     root = Path(root_path)
+
+    def _node_at(parts: tuple[str, ...]) -> dict | None:
+        """Traverse the tree by path parts. Returns None if any segment missing."""
+        node: dict = tree
+        for part in parts:
+            if part not in node or not isinstance(node[part], dict):
+                return None
+            node = node[part]
+        return node
+
+    def _ensure_node(parts: tuple[str, ...]) -> dict:
+        """Like _node_at but creates missing segments as empty dicts."""
+        node: dict = tree
+        for part in parts:
+            if part not in node or not isinstance(node[part], dict):
+                node[part] = {"_files": 0, "_size": 0}
+            node = node[part]
+        return node
 
     with Session(get_engine()) as db:
         proposals = (
@@ -1259,7 +1353,8 @@ def _build_proposed_tree(session_id: str, before_summaries, root_path: str) -> d
             .all()
         )
 
-    # Apply folder renames to tree keys
+    # Pass 1: apply folder renames (just a key rename in the parent node).
+    # Done first so subsequent MOVE lookups resolve via post-rename paths.
     for p in proposals:
         if p.proposal_type == ProposalType.RENAME_FOLDER and p.current_value and p.proposed_value:
             try:
@@ -1267,32 +1362,55 @@ def _build_proposed_tree(session_id: str, before_summaries, root_path: str) -> d
                 new_rel = Path(p.proposed_value).relative_to(root)
             except ValueError:
                 continue
-            # Find the node in tree and rename it
             old_parts = old_rel.parts
             new_name = new_rel.parts[-1] if new_rel.parts else None
             if old_parts and new_name:
-                parent_node = tree
-                for part in old_parts[:-1]:
-                    parent_node = parent_node.get(part, {})
+                parent_node = _node_at(old_parts[:-1]) if len(old_parts) > 1 else tree
+                if parent_node is None:
+                    continue
                 old_name = old_parts[-1]
                 if old_name in parent_node:
                     parent_node[new_name] = parent_node.pop(old_name)
 
-    # Apply move proposals — shift file counts between folders
+    # Pass 2: apply file MOVE proposals. Each MOVE updates both source and
+    # target: decrement source counts / remove from source._sample_files,
+    # increment target counts / add to target._sample_files. The file's
+    # size is also transferred so the "Current vs Proposed" totals stay honest.
     for p in proposals:
-        if p.proposal_type == ProposalType.MOVE and p.proposed_value:
-            try:
-                new_parent = Path(p.proposed_value).parent
-                new_rel = new_parent.relative_to(root)
-            except ValueError:
-                continue
-            # Ensure the target folder exists in tree
-            node = tree
-            for part in new_rel.parts:
-                if part not in node:
-                    node[part] = {"_files": 0, "_size": 0}
-                node = node[part]
-            node["_files"] = node.get("_files", 0) + 1
+        if p.proposal_type != ProposalType.MOVE or not p.proposed_value or not p.current_value:
+            continue
+        try:
+            src_path = Path(p.current_value)
+            dst_path = Path(p.proposed_value)
+            src_parent_rel = src_path.parent.relative_to(root).parts
+            dst_parent_rel = dst_path.parent.relative_to(root).parts
+        except ValueError:
+            continue
+
+        src_node = _node_at(src_parent_rel)
+        dst_node = _ensure_node(dst_parent_rel)
+
+        # Find the file in source._sample_files by name (fs walk populated it)
+        src_name = src_path.name
+        moved_entry: dict | None = None
+        if src_node is not None:
+            src_samples = src_node.get("_sample_files") or []
+            for i, entry in enumerate(src_samples):
+                if entry.get("name") == src_name:
+                    moved_entry = src_samples.pop(i)
+                    break
+            if moved_entry is not None:
+                src_node["_files"] = max(0, src_node.get("_files", 1) - 1)
+                src_node["_size"] = max(0, src_node.get("_size", 0) - moved_entry.get("size", 0))
+
+        # Place it into the destination
+        dst_samples = dst_node.setdefault("_sample_files", [])
+        dst_entry = moved_entry or {"name": dst_path.name, "size": 0}
+        # Update the name in case the MOVE also renames (target path differs)
+        dst_entry = {**dst_entry, "name": dst_path.name}
+        dst_samples.append(dst_entry)
+        dst_node["_files"] = dst_node.get("_files", 0) + 1
+        dst_node["_size"] = dst_node.get("_size", 0) + dst_entry.get("size", 0)
 
     return tree
 
