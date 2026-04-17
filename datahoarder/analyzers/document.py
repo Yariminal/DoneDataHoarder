@@ -192,4 +192,11 @@ class DocumentAnalyzer(BaseAnalyzer):
         if lang and lang != "en":
             result.tags.append(f"lang:{lang}")
 
+        # If text extraction yielded nothing meaningful, the LLM was guessing
+        # from filename + folder context only. Mark accordingly so the
+        # description is prefixed [UNVERIFIED ...] and confidence is capped.
+        if not text or len(text.strip()) < 20:
+            result.content_available = False
+            result.confidence = min(result.confidence, 0.4)
+
         return result

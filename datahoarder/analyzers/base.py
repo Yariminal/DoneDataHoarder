@@ -86,6 +86,12 @@ def _clean_tags(tags: list[str], filename: str | None, folder: str | None) -> li
 class AnalysisResult:
     """Structured output from an analyzer."""
 
+    # Sentinel prefix added to descriptions when the analyzer could not actually
+    # read the file's content (binary 3D scenes, encrypted PDFs, .hdr without
+    # Pillow support, etc.) and is inferring from filename/folder context only.
+    UNVERIFIED_PREFIX = "[UNVERIFIED — inferred from filename/folder only] "
+    UNVERIFIED_CONFIDENCE_CAP = 0.4
+
     def __init__(
         self,
         description: str = "",
@@ -95,6 +101,7 @@ class AnalysisResult:
         transcript: str = "",
         detected_date: Optional[datetime] = None,
         raw: dict | None = None,
+        content_available: bool = True,  # set False when only filename/folder seen
     ):
         self.description = description
         self.tags = tags or []
@@ -103,6 +110,7 @@ class AnalysisResult:
         self.transcript = transcript
         self.detected_date = detected_date
         self.raw = raw or {}
+        self.content_available = content_available
 
     def to_dict(self) -> dict:
         return {
@@ -175,14 +183,26 @@ class BaseAnalyzer(ABC):
             f = session.get(File, file_rec.id)
             if not f:
                 return
-            f.ai_description = result.description
+
+            # If the analyzer reported it had no real content access, mark the
+            # description as unverified and cap the confidence so downstream
+            # consumers (UI, organizer, namer) can treat it differently from
+            # descriptions backed by actual content.
+            description = result.description or ""
+            confidence = result.confidence
+            if not result.content_available and description:
+                if not description.startswith(AnalysisResult.UNVERIFIED_PREFIX):
+                    description = AnalysisResult.UNVERIFIED_PREFIX + description
+                confidence = min(confidence, AnalysisResult.UNVERIFIED_CONFIDENCE_CAP)
+
+            f.ai_description = description
             f.ai_suggested_name = result.suggested_name or None
             # Filter LLM-emitted tags through the quality cleaner: drops generic
             # noise, filename/folder echoes, near-duplicates, and overlong text.
             folder_name = _Path(f.path).parent.name if f.path else None
             cleaned_tags = _clean_tags(result.tags, f.filename, folder_name)
             f.ai_tags = json.dumps(cleaned_tags)
-            f.ai_confidence = result.confidence
+            f.ai_confidence = confidence
             f.ai_model = model_name
             f.ai_transcript = result.transcript or None
             # AI-detected dates are hints only — never overwrite real EXIF dates,

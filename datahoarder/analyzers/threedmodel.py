@@ -152,8 +152,11 @@ class ThreeDModelAnalyzer(BaseAnalyzer):
         if software and software not in ("null", "generic", None) and software not in result.tags:
             result.tags.append(software)
 
-        # Cap confidence for binary formats — we're guessing from filename only
+        # Cap confidence for binary formats — we're guessing from filename only.
+        # Also flag content_available=False so save_result() prefixes the
+        # description with [UNVERIFIED ...] and applies the lower confidence cap.
         if not header:
             result.confidence = min(result.confidence, 0.45)
+            result.content_available = False
 
         return result
