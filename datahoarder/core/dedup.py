@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 
 from datahoarder.db.models import (
     DuplicateGroup, DuplicateMember, DupeType, File, FileStatus,
+    Proposal, ProposalStatus, ProposalType,
 )
 from datahoarder.db.session import get_engine
 
@@ -471,6 +472,124 @@ def find_text_near_duplicates(
             )
             counts["groups"] += 1
             counts["duplicates"] += len(group) - 1
+        session.commit()
+
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Stage 5 — Convert duplicate groups into actionable MARK_DUPLICATE proposals
+# ---------------------------------------------------------------------------
+
+def generate_dedup_proposals(session_id: str | None = None) -> dict:
+    """
+    Walk every DuplicateGroup for the session and emit a MARK_DUPLICATE proposal
+    for each member that is NOT the group's keeper.
+
+    This is what makes the four detection stages actionable. Without it, the
+    DB ends up with DuplicateGroup / DuplicateMember rows that the executor
+    already knows how to handle (it moves the file to .datahoarder_trash) but
+    no Proposal row ever surfaces those groups to the UI / approval flow, so
+    no duplicate is ever cleaned up.
+
+    A MARK_DUPLICATE proposal stores:
+      - file_id        : the duplicate to evict
+      - current_value  : its current path (for the UI "from" column)
+      - proposed_value : the keeper's path (for the UI "merge into" column)
+      - reasoning      : human-readable justification including dupe type
+      - confidence     : 1.0 for EXACT, similarity_score for the rest
+
+    Skips files that already have a MARK_DUPLICATE proposal in any state.
+    Re-elects a keeper if the group somehow has none.
+    """
+    engine = get_engine()
+    counts = {"groups": 0, "created": 0, "skipped": 0, "no_keeper": 0}
+
+    type_label = {
+        DupeType.EXACT:      "exact byte-for-byte duplicate",
+        DupeType.PERCEPTUAL: "perceptual near-duplicate (visually identical)",
+        DupeType.SEMANTIC:   "semantic near-duplicate (similar AI tags/description)",
+        DupeType.CONTENT:    "near-identical text content",
+    }
+
+    with Session(engine) as session:
+        q = session.query(DuplicateGroup)
+        if session_id:
+            q = q.filter(DuplicateGroup.session_id == session_id)
+        groups = q.all()
+
+        if not groups:
+            return counts
+
+        # Pre-load every existing MARK_DUPLICATE proposal so we don't double up
+        # when the dedup endpoint is re-run after a partial application.
+        existing_marked: set[int] = {
+            file_id
+            for (file_id,) in session.query(Proposal.file_id).filter(
+                Proposal.proposal_type == ProposalType.MARK_DUPLICATE,
+            )
+        }
+
+        for group in groups:
+            counts["groups"] += 1
+
+            # Make sure we have a keeper. Older rows or aborted runs may have
+            # left keep_file_id NULL — re-elect deterministically rather than
+            # skipping the group (which would silently lose a duplicate
+            # detection).
+            keep_id = group.keep_file_id
+            if keep_id is None:
+                member_files = [
+                    session.get(File, m.file_id) for m in group.members
+                ]
+                member_files = [f for f in member_files if f is not None]
+                if len(member_files) < 2:
+                    counts["no_keeper"] += 1
+                    continue
+                keep_id = _pick_keeper(member_files)
+                group.keep_file_id = keep_id
+
+            keep_file = session.get(File, keep_id)
+            keep_path = keep_file.path if keep_file else "(unknown)"
+            label = type_label.get(group.dupe_type, str(group.dupe_type))
+
+            for m in group.members:
+                if m.file_id == keep_id:
+                    continue
+                if m.file_id in existing_marked:
+                    counts["skipped"] += 1
+                    continue
+                victim = session.get(File, m.file_id)
+                if victim is None:
+                    counts["skipped"] += 1
+                    continue
+
+                similarity = m.similarity_score or 0.0
+                # EXACT is by definition 1.0; for the fuzzier stages use the
+                # actual similarity score but never below 0.5 (so the proposal
+                # doesn't get filtered out by a low-confidence UI gate).
+                if group.dupe_type == DupeType.EXACT:
+                    confidence = 1.0
+                else:
+                    confidence = max(similarity, 0.5)
+
+                reasoning = (
+                    f"{label} (similarity={similarity:.2f}). "
+                    f"Will be moved to .datahoarder_trash. Keeper: {keep_path}"
+                )
+
+                session.add(Proposal(
+                    file_id=victim.id,
+                    proposal_type=ProposalType.MARK_DUPLICATE,
+                    current_value=victim.path,
+                    proposed_value=keep_path,
+                    reasoning=reasoning,
+                    confidence=confidence,
+                    status=ProposalStatus.PENDING,
+                ))
+                existing_marked.add(victim.id)
+                counts["created"] += 1
+
         session.commit()
 
     return counts
