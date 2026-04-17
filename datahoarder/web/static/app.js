@@ -1035,18 +1035,54 @@ document.addEventListener('alpine:init', () => {
       return steps.includes(step);
     },
 
+    formatSize(size) {
+      if (size > 1024 * 1024) return (size / 1024 / 1024).toFixed(1) + ' MB';
+      if (size > 1024) return (size / 1024).toFixed(0) + ' KB';
+      return size + ' B';
+    },
+
+    escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
+      );
+    },
+
     renderTree(node, depth = 0) {
+      // Renders both folders and individual files. Loose files at the root
+      // level (e.g. a 452 MB PDF sitting directly under the session root)
+      // appear at depth 0 alongside top-level folders, so the user can see
+      // at a glance what's unorganized. Folders come first, then their
+      // sample files as indented children, then root-level files last.
       if (!node || typeof node !== 'object') return '';
       let html = '';
       const indent = '  '.repeat(depth);
+
+      // Folders (keys not starting with _) come first
       for (const [key, val] of Object.entries(node)) {
         if (key.startsWith('_')) continue;
+        if (!val || typeof val !== 'object') continue;
         const files = val._files || 0;
         const size = val._size || 0;
-        const sizeStr = size > 1024*1024 ? (size/1024/1024).toFixed(1) + ' MB' : size > 1024 ? (size/1024).toFixed(0) + ' KB' : size + ' B';
-        html += `${indent}<span class="tree-folder">📁 ${key}/</span> <span class="tree-meta">(${files} files, ${sizeStr})</span>\n`;
+        html += `${indent}<span class="tree-folder">📁 ${this.escapeHtml(key)}/</span> <span class="tree-meta">(${files} files, ${this.formatSize(size)})</span>\n`;
         html += this.renderTree(val, depth + 1);
       }
+
+      // Individual files (from _sample_files) rendered at this level as
+      // 📄 entries. At the root level these are the loose files that need
+      // to be moved into a subfolder — surfacing them visually is half the
+      // point of the Organize step.
+      const samples = Array.isArray(node._sample_files) ? node._sample_files : [];
+      for (const entry of samples) {
+        if (!entry || typeof entry !== 'object') continue;
+        const name = entry.name || '';
+        const size = entry.size || 0;
+        html += `${indent}<span class="tree-file">📄 ${this.escapeHtml(name)}</span> <span class="tree-meta">(${this.formatSize(size)})</span>\n`;
+      }
+      const truncated = node._sample_truncated || 0;
+      if (truncated > 0) {
+        html += `${indent}<span class="tree-meta">… +${truncated} more file${truncated === 1 ? '' : 's'}</span>\n`;
+      }
+
       return html;
     },
 

@@ -296,6 +296,7 @@ tr:hover td { background: rgba(255,255,255,.02); }
   white-space: pre;
 }
 .tree-view .tree-folder { color: var(--primary); }
+.tree-view .tree-file { color: var(--text); }
 .tree-view .tree-meta { color: var(--text-dim); font-size: .75rem; }
 
 /* --- Duplicate comparison --------------------------------- */
