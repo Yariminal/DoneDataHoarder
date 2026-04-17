@@ -114,6 +114,60 @@ def _safe(text: str) -> str:
     return text[:60]
 
 
+# Filesystem characters that are either illegal on Windows / macOS / Linux or
+# known to cause friction (shell escaping, URL encoding, cloud-sync choking).
+# `_hygienic_stem` rewrites any occurrence of these to a single underscore.
+_ILLEGAL_FS_CHARS = re.compile(r'[<>:"|?*\\/\x00-\x1f]')
+# Characters that are legal but noisy — parentheses, brackets, hash, ampersand,
+# percent, exclamation, semicolon, comma. Keep dot (for version markers like
+# "v1.2"), hyphen (intentional separator), apostrophe (proper-name possessives).
+_NOISY_FS_CHARS = re.compile(r'[()\[\]{}#&%!;,@$=+`~^]')
+
+
+def _hygienic_stem(stem: str) -> str:
+    """
+    Minimum-hygiene cleanup for a filename stem: fix whitespace, collapse
+    duplicate separators, replace illegal filesystem characters, and strip
+    noisy punctuation — WITHOUT lowercasing or truncating (that's _safe's job
+    for AI-derived stems). Preserves the user's original capitalization and
+    any proper nouns that happen to be in the filename.
+
+    Examples:
+      "My Report (Final Draft).pdf"         -> "My_Report_Final_Draft"
+      "file&with#bad!chars"                 -> "file_with_bad_chars"
+      "too    many   spaces"                -> "too_many_spaces"
+      "normal_file_name"                    -> "normal_file_name"  (no change)
+    """
+    s = stem.strip()
+    # Illegal chars first — must be rewritten, never just stripped.
+    s = _ILLEGAL_FS_CHARS.sub("_", s)
+    # Noisy but legal chars — rewrite to underscore for visual consistency.
+    s = _NOISY_FS_CHARS.sub("_", s)
+    # Whitespace runs -> single underscore.
+    s = re.sub(r"\s+", "_", s)
+    # Collapse duplicate underscores (may have been introduced above).
+    s = re.sub(r"_+", "_", s)
+    # Collapse duplicate hyphens.
+    s = re.sub(r"-+", "-", s)
+    # Strip leading/trailing separators and dots (leading dots make files hidden
+    # on *nix; trailing dots are stripped by Windows anyway).
+    s = s.strip("._- ")
+    return s
+
+
+def _needs_hygiene(stem: str) -> bool:
+    """
+    True if `stem` has cosmetic issues worth fixing even when we have no AI
+    signal: whitespace, illegal/noisy chars, duplicate separators. Used as the
+    last-chance rename trigger so files like "Some File Name (1).pdf" get a
+    proposal even when analysis produced nothing useful.
+    """
+    if not stem:
+        return False
+    hygienic = _hygienic_stem(stem)
+    return bool(hygienic) and hygienic != stem
+
+
 # Tokens we never strip even if they appear in folder/root context — they're
 # either too generic to be a real "echo" or carry meaningful semantics on their
 # own. Without this guard, "_strip_context_echo" would happily turn
@@ -254,6 +308,15 @@ def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str
             fallback = _folder_context_fallback(file_rec)
             if fallback:
                 return fallback + ext
+        # Last-chance hygiene fallback: no AI signal AND the stem isn't
+        # "useless", but it still has whitespace / illegal / noisy chars
+        # worth fixing (e.g. "My Report (Final).pdf" -> "My_Report_Final.pdf").
+        # Cheap, high-precision win — we only rewrite when the result is a
+        # strict improvement.
+        if _needs_hygiene(path.stem):
+            hygienic = _hygienic_stem(path.stem)
+            if hygienic:
+                return hygienic + ext
         return None
 
     # Guard: skip if AI description is actually an error message
@@ -264,6 +327,13 @@ def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str
     }
     desc_lower = desc.lower()
     if any(kw in desc_lower for kw in _error_keywords):
+        # AI output was garbage — still emit a hygiene fix if the original
+        # stem has cosmetic issues. Better than leaving "My File (1).pdf"
+        # unchanged just because vision model hallucinated an error string.
+        if _needs_hygiene(path.stem):
+            hygienic = _hygienic_stem(path.stem)
+            if hygienic:
+                return hygienic + ext
         return None
 
     stem_from_desc = None
@@ -310,6 +380,12 @@ def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str
         stem_from_desc = _safe(stem_from_desc)
 
     if not stem_from_desc:
+        # AI signal was present but produced nothing usable — still emit a
+        # hygiene fix if the original stem has cosmetic issues.
+        if _needs_hygiene(path.stem):
+            hygienic = _hygienic_stem(path.stem)
+            if hygienic:
+                return hygienic + ext
         return None
 
     # Strip echoes of the parent folder name + session root folder name. Without
@@ -731,7 +807,19 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
         # Best-effort rescue pass — never break the pipeline if it errors.
         pass
 
-    # Post-pass 2: collapse spelling variants across all proposed names so that
+    # Post-pass 2: hygiene rescue for files with cosmetic issues (whitespace,
+    # illegal chars, parentheses, etc.) that never got a RENAME proposal.
+    # These are pure mechanical fixes independent of any AI signal, so they
+    # rescue files stuck at ENRICHED / PENDING too. Distinct from pass 1
+    # because the stems aren't "useless" — just ugly.
+    try:
+        hygiene_fixed = _generate_hygiene_fallback(session_id)
+        if hygiene_fixed:
+            counts["hygiene_renames"] = hygiene_fixed
+    except Exception:
+        pass
+
+    # Post-pass 3: collapse spelling variants across all proposed names so that
     # "solar_decathlon" and "solar_dekathlon" don't both appear in the same
     # session output. Runs once after every batch is committed.
     try:
@@ -743,6 +831,96 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
         pass
 
     return counts
+
+
+def _generate_hygiene_fallback(session_id: str | None) -> int:
+    """
+    Post-pass: for every file in the session with cosmetic issues in its stem
+    (whitespace, illegal FS chars, noisy punctuation, duplicate separators)
+    AND no RENAME proposal yet, emit a mechanical hygiene-only rename. No AI
+    signal required — this is a pure string cleanup.
+
+    Confidence 0.5 — higher than the useless-stem fallback (0.3) because the
+    outcome is deterministic and never "guesses" semantic content, just fixes
+    objectively bad characters. Still below typical AI-derived confidences
+    (usually 0.7-0.9) so a later re-analysis that produces a real description
+    can still override via the main-loop existence check if we ever change
+    that behaviour.
+
+    Returns the number of proposals created.
+    """
+    if not session_id:
+        return 0
+
+    engine = get_engine()
+    created = 0
+
+    with Session(engine) as session:
+        files_q = session.query(File).filter(
+            File.session_id == session_id,
+            File.status.in_([
+                FileStatus.PENDING,
+                FileStatus.ENRICHED,
+                FileStatus.ANALYZED,
+                FileStatus.PROPOSED,
+            ]),
+        )
+        files = files_q.all()
+        if not files:
+            return 0
+
+        existing_renames: set[int] = {
+            file_id
+            for (file_id,) in session.query(Proposal.file_id).filter(
+                Proposal.proposal_type == ProposalType.RENAME,
+                Proposal.file_id.in_([f.id for f in files]),
+            )
+        }
+
+        reserved_paths: set[Path] = set()
+        for (proposed_value,) in session.query(Proposal.proposed_value).filter(
+            Proposal.proposal_type == ProposalType.RENAME,
+            Proposal.file_id.in_([f.id for f in files]),
+        ):
+            if proposed_value:
+                reserved_paths.add(Path(proposed_value))
+
+        for f in files:
+            if f.id in existing_renames:
+                continue
+            path = Path(f.path)
+            if not _needs_hygiene(path.stem):
+                continue
+            hygienic = _hygienic_stem(path.stem)
+            if not hygienic or hygienic == path.stem:
+                continue
+            ext = path.suffix.lower()
+            new_name = hygienic + ext
+            if new_name == path.name:
+                continue
+            proposed_path = _resolve_collision(
+                path.parent / new_name, path, reserved_names=reserved_paths
+            )
+            reserved_paths.add(proposed_path)
+            session.add(Proposal(
+                file_id=f.id,
+                proposal_type=ProposalType.RENAME,
+                current_value=str(path),
+                proposed_value=str(proposed_path),
+                reasoning=(
+                    "Hygiene cleanup — removed whitespace / illegal / "
+                    f"noisy characters from stem '{path.stem}'."
+                ),
+                confidence=0.5,
+                status=ProposalStatus.PENDING,
+            ))
+            existing_renames.add(f.id)
+            created += 1
+
+        if created:
+            session.commit()
+
+    return created
 
 
 # ---------------------------------------------------------------------------
