@@ -17,3 +17,4 @@ venv/
 .DS_Store
 Thumbs.db
 TEST_REPORT*.md
+.claude/worktrees/
