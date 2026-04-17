@@ -1,7 +1,9 @@
 """Base class for all file analyzers."""
 import json
+import re
 from abc import ABC, abstractmethod
 from datetime import datetime
+from pathlib import Path as _Path
 from typing import Optional
 
 from datahoarder.db.models import File, FileStatus
@@ -13,6 +15,72 @@ You are a file analysis assistant helping to organize a personal archive.
 Your job is to analyze files and return structured metadata to help rename and categorize them.
 Be concise, factual, and consistent. Always respond in valid JSON.
 """
+
+# Tags the LLM commonly emits that carry no information for organisation.
+# Lower-cased, with spaces normalised to underscores.
+_GENERIC_TAGS = {
+    "file", "files", "document", "documents", "image", "images", "photo", "photos",
+    "picture", "pictures", "media", "content", "data", "stuff", "thing", "object",
+    "item", "items", "misc", "other", "unknown", "n_a", "na", "none", "general",
+    "various", "untitled", "default", "test", "sample",
+    # Compound generics the analyzer prompts already discourage but still leak through:
+    "photo_object", "photo_place", "photo_scene", "image_file", "picture_file",
+}
+
+
+def _clean_tags(tags: list[str], filename: str | None, folder: str | None) -> list[str]:
+    """
+    Filter and deduplicate AI-emitted tags so they actually add information.
+
+    Drops:
+    - empty / non-string entries
+    - tags shorter than 3 chars after normalisation (avoid "a", "of", "x")
+    - generic tags from _GENERIC_TAGS
+    - tags that are substrings of the filename stem (filename-echo tags)
+    - tags that are substrings of the parent folder name (folder-echo tags)
+    - case-insensitive duplicates (preserves first-seen casing/order)
+    - tags longer than 40 chars (likely a description leaked into the tag list)
+    """
+    if not tags:
+        return []
+
+    # Build the echo-blocklist from filename stem and folder name.
+    echo_block: set[str] = set()
+    if filename:
+        stem = _Path(filename).stem.lower()
+        # Tokenise on common separators so "solar_dekathlon_2018" blocks each part
+        for tok in re.split(r"[\s_\-\.]+", stem):
+            if len(tok) >= 3:
+                echo_block.add(tok)
+    if folder:
+        for tok in re.split(r"[\s_\-\.]+", folder.lower()):
+            if len(tok) >= 3:
+                echo_block.add(tok)
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in tags:
+        if not isinstance(raw, str):
+            continue
+        tag = raw.strip()
+        if not tag or len(tag) > 40:
+            continue
+        norm = re.sub(r"\s+", "_", tag.lower())
+        if len(norm) < 3:
+            continue
+        if norm in _GENERIC_TAGS:
+            continue
+        if norm in seen:
+            continue
+        # Echo filter: drop the tag if its normalised form is a token already in
+        # the filename or folder name. Substring check on each block-token avoids
+        # letting "solar_panel" through when the folder is "solar_dekathlon_2018".
+        if any(norm == blk or norm in blk or blk in norm for blk in echo_block if len(blk) >= 4):
+            continue
+        seen.add(norm)
+        cleaned.append(tag)
+
+    return cleaned[:15]  # keep a reasonable cap
 
 
 class AnalysisResult:
@@ -109,7 +177,11 @@ class BaseAnalyzer(ABC):
                 return
             f.ai_description = result.description
             f.ai_suggested_name = result.suggested_name or None
-            f.ai_tags = json.dumps(result.tags)
+            # Filter LLM-emitted tags through the quality cleaner: drops generic
+            # noise, filename/folder echoes, near-duplicates, and overlong text.
+            folder_name = _Path(f.path).parent.name if f.path else None
+            cleaned_tags = _clean_tags(result.tags, f.filename, folder_name)
+            f.ai_tags = json.dumps(cleaned_tags)
             f.ai_confidence = result.confidence
             f.ai_model = model_name
             f.ai_transcript = result.transcript or None
