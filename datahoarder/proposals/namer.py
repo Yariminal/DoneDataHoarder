@@ -296,6 +296,116 @@ def _resolve_collision(
 
 
 # ---------------------------------------------------------------------------
+# Spelling normalisation across a session
+# ---------------------------------------------------------------------------
+
+def _normalize_spelling_in_proposals(session_id: str | None) -> int:
+    """
+    After all RENAME proposals are generated, look for spelling variants of the
+    same word across the session (e.g. solar_decathlon vs solar_dekathlon) and
+    rewrite less-frequent variants to a canonical form.
+
+    Algorithm:
+    - Tokenise every proposed filename (stem only) into alphabetic runs >= 5 chars
+    - Bucket tokens by their first 3 characters (cheap prefix gate so unrelated
+      short edits never cluster)
+    - Inside each bucket, cluster tokens whose SequenceMatcher ratio is >= 0.85
+    - Pick the most-frequent token in each cluster as canonical
+    - Substitute non-canonical occurrences in proposed_value, preserving everything
+      else (date prefix, sequence number, extension)
+
+    Returns the number of proposals rewritten.
+    """
+    from collections import Counter, defaultdict
+    from difflib import SequenceMatcher
+
+    if not session_id:
+        return 0
+
+    engine = get_engine()
+    rewritten = 0
+
+    with Session(engine) as session:
+        proposals = (
+            session.query(Proposal)
+            .join(File, Proposal.file_id == File.id)
+            .filter(
+                File.session_id == session_id,
+                Proposal.proposal_type == ProposalType.RENAME,
+                Proposal.status == ProposalStatus.PENDING,
+            )
+            .all()
+        )
+
+        if len(proposals) < 2:
+            return 0
+
+        token_re = re.compile(r"[a-zA-Z]{5,}")
+
+        # Count token frequencies across all proposed names
+        token_counter: Counter[str] = Counter()
+        for p in proposals:
+            stem = Path(p.proposed_value or "").stem.lower()
+            token_counter.update(token_re.findall(stem))
+
+        if not token_counter:
+            return 0
+
+        # Bucket by first 3 chars; within each bucket, find similarity clusters
+        buckets: dict[str, list[str]] = defaultdict(list)
+        for tok in token_counter:
+            buckets[tok[:3]].append(tok)
+
+        canonical: dict[str, str] = {}
+        for prefix, toks in buckets.items():
+            if len(toks) < 2:
+                continue
+            # Sort by descending frequency so the most-popular spelling tends to
+            # become the cluster anchor and therefore the canonical form.
+            toks_sorted = sorted(toks, key=lambda t: -token_counter[t])
+            visited: set[str] = set()
+            for i, t1 in enumerate(toks_sorted):
+                if t1 in visited:
+                    continue
+                cluster = [t1]
+                for t2 in toks_sorted[i + 1:]:
+                    if t2 in visited or t1 == t2:
+                        continue
+                    if SequenceMatcher(None, t1, t2).ratio() >= 0.85:
+                        cluster.append(t2)
+                if len(cluster) > 1:
+                    # The first member (highest freq) is canonical.
+                    canon = cluster[0]
+                    for tok in cluster:
+                        canonical[tok] = canon
+                        visited.add(tok)
+
+        # Drop self-mappings (token already canonical)
+        canonical = {k: v for k, v in canonical.items() if k != v}
+        if not canonical:
+            return 0
+
+        def _replace(match: re.Match) -> str:
+            word = match.group(0)
+            canon = canonical.get(word.lower())
+            return canon if canon else word
+
+        for p in proposals:
+            old = p.proposed_value or ""
+            path = Path(old)
+            new_stem = token_re.sub(_replace, path.stem)
+            if new_stem != path.stem:
+                # Path.with_stem preserves the extension; use the same parent
+                p.proposed_value = str(path.with_stem(new_stem))
+                rewritten += 1
+
+        if rewritten:
+            session.commit()
+
+    return rewritten
+
+
+# ---------------------------------------------------------------------------
 # Proposal generation
 # ---------------------------------------------------------------------------
 
@@ -419,5 +529,16 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
                     progress.advance(task)
 
                 session.commit()
+
+    # Post-pass: collapse spelling variants across all proposed names so that
+    # "solar_decathlon" and "solar_dekathlon" don't both appear in the same
+    # session output. Runs once after every batch is committed.
+    try:
+        spelling_fixed = _normalize_spelling_in_proposals(session_id)
+        if spelling_fixed:
+            counts["spelling_normalized"] = spelling_fixed
+    except Exception:
+        # Normalisation is best-effort — never break the pipeline if it fails.
+        pass
 
     return counts
