@@ -114,6 +114,79 @@ def _safe(text: str) -> str:
     return text[:60]
 
 
+# Tokens we never strip even if they appear in folder/root context — they're
+# either too generic to be a real "echo" or carry meaningful semantics on their
+# own. Without this guard, "_strip_context_echo" would happily turn
+# "annual_report" into nothing if either word appeared in the folder name.
+_ECHO_STOPWORDS: set[str] = {
+    "the", "and", "for", "with", "from", "into", "onto", "this", "that",
+    "report", "list", "notes", "draft", "final", "copy", "version",
+}
+
+
+def _build_echo_blocklist(file_rec: File, root_path: str | None) -> set[str]:
+    """
+    Tokens to strip from a proposed filename because they're already implied
+    by the file's location: parent folder name and session root folder name.
+
+    Mirrors the analyzers/base.py _clean_tags() echo logic so that what gets
+    blocked from tags also gets blocked from rename proposals.
+
+    Tokens shorter than 4 chars are kept (too risky — would strip year-like
+    fragments and short proper-noun abbreviations like "ibm", "nyc").
+    """
+    block: set[str] = set()
+    parent = Path(file_rec.path).parent.name
+    if parent:
+        for tok in re.split(r"[\s_\-\.]+", parent.lower()):
+            if len(tok) >= 4 and tok not in _ECHO_STOPWORDS:
+                block.add(tok)
+
+    if root_path:
+        root_name = Path(root_path).name
+        if root_name:
+            for tok in re.split(r"[\s_\-\.]+", root_name.lower()):
+                if len(tok) >= 4 and tok not in _ECHO_STOPWORDS:
+                    block.add(tok)
+
+    return block
+
+
+def _strip_context_echo(stem: str, blocklist: set[str]) -> str:
+    """
+    Drop tokens from `stem` that appear in `blocklist` (parent folder name +
+    root folder name). Returns the stripped stem, but only if at least one
+    informative token survives — otherwise returns the original stem so we
+    don't degrade the name into something worse than what we started with.
+
+    Examples (with blocklist = {sponsors, solar, dekathlon, 2018}):
+      sponsors_list_solar_dekathlon_2018  ->  list
+      sponsors_list_2024                  ->  list_2024
+      sponsors                            ->  sponsors          (kept: would otherwise be empty)
+      menu_options_for_event              ->  menu_options_for_event  (no overlap)
+    """
+    if not stem or not blocklist:
+        return stem
+    tokens = stem.split("_")
+    kept: list[str] = []
+    for tok in tokens:
+        if tok and tok.lower() not in blocklist:
+            kept.append(tok)
+
+    # Safety: if stripping leaves nothing, or only tokens that are too short
+    # (< 3 chars) or pure digits, prefer the original stem.
+    if not kept:
+        return stem
+    informative = [t for t in kept if len(t) >= 3 and not t.isdigit()]
+    if not informative:
+        return stem
+
+    new_stem = "_".join(kept)
+    # Final sanity: collapse double-underscores from the strip operation.
+    new_stem = re.sub(r"_+", "_", new_stem).strip("_")
+    return new_stem or stem
+
+
 def _date_prefix(dt: Optional[datetime], include_time: bool = False) -> str:
     if not dt:
         return ""
@@ -148,12 +221,21 @@ def _is_meaningful_date(file_rec) -> bool:
     return False
 
 
-def build_new_name(file_rec: File) -> Optional[str]:
+def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str]:
     """
     Construct a proposed new filename (with extension) for a file.
     Prefers AI tags over description for more specific, meaningful names.
     Preserves sequential/numbered patterns (e.g., "class_1", "class_2") while enhancing with description.
     Returns None if we can't improve on the original name.
+
+    Args:
+        file_rec: The file to propose a new name for.
+        root_path: Optional session root path used to strip project-name echoes
+            from the generated stem (e.g. drop "solar_dekathlon_2018" when the
+            session root is named "SOLAR DEKATHLON 2018"). When None, the
+            session is looked up from the DB by file_rec.session_id; pass
+            explicitly when generating proposals in a tight loop to avoid
+            re-querying for every file.
     """
     from datahoarder.proposals.sequence_detector import detect_sequences
 
@@ -229,6 +311,23 @@ def build_new_name(file_rec: File) -> Optional[str]:
 
     if not stem_from_desc:
         return None
+
+    # Strip echoes of the parent folder name + session root folder name. Without
+    # this, an AI suggestion like "sponsors_list_solar_dekathlon_2018" inside
+    # /SOLAR DEKATHLON 2018/Sponsors/ keeps both the folder name and the project
+    # name in the filename, even though they're already implied by the path.
+    # Mirrors the echo filter applied to tags in analyzers/base.py _clean_tags.
+    if root_path is None:
+        # Look up session root once per file. Cheap because it's keyed by PK.
+        try:
+            engine = get_engine()
+            with Session(engine) as _s:
+                _us = _s.get(UserSession, file_rec.session_id)
+                root_path = _us.root_path if _us else None
+        except Exception:
+            root_path = None
+    echo_block = _build_echo_blocklist(file_rec, root_path)
+    stem_from_desc = _strip_context_echo(stem_from_desc, echo_block)
 
     # Only use date prefix if the date is meaningful (not just a copy/extract timestamp).
     # Prefer real hardware sources (EXIF > filesystem) over AI-inferred date_best,
@@ -510,13 +609,16 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
     engine = get_engine()
     counts = {"rename": 0, "tags": 0, "skipped": 0}
 
-    # Get the session's language preference
+    # Get the session's language preference and root path (latter is passed to
+    # build_new_name so it can strip project-name echoes from generated stems)
     preferred_language = "leave_as_is"
+    session_root_path: str | None = None
     if session_id:
         with Session(engine) as session:
             user_sess = session.get(UserSession, session_id)
             if user_sess:
                 preferred_language = user_sess.preferred_language
+                session_root_path = user_sess.root_path
 
     with Session(engine) as session:
         query = session.query(File).filter(File.status == FileStatus.ANALYZED)
@@ -564,7 +666,7 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
                     made_proposal = False
 
                     # --- RENAME proposal ---
-                    new_name = build_new_name(file_rec)
+                    new_name = build_new_name(file_rec, root_path=session_root_path)
                     if new_name and new_name != path.name:
                         # Apply language translation if preferred
                         if preferred_language != "leave_as_is":
