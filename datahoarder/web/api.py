@@ -1047,7 +1047,10 @@ def trigger_enrich(body: PipelineRequest = PipelineRequest()):
 
 @router.post("/pipeline/dedup")
 def trigger_dedup(body: PipelineRequest = PipelineRequest()):
-    from datahoarder.core.dedup import find_exact_duplicates, find_perceptual_duplicates, find_semantic_duplicates
+    from datahoarder.core.dedup import (
+        find_exact_duplicates, find_perceptual_duplicates,
+        find_semantic_duplicates, find_text_near_duplicates,
+    )
     import io
     import contextlib
 
@@ -1059,9 +1062,15 @@ def trigger_dedup(body: PipelineRequest = PipelineRequest()):
             exact = find_exact_duplicates(session_id=sid)
             perc = find_perceptual_duplicates(session_id=sid)
             semantic = find_semantic_duplicates(session_id=sid)  # Stage 3: AI-based semantic duplicates
+            text_near = find_text_near_duplicates(session_id=sid)  # Stage 4: byte-level fuzzy text match
 
         _mark_session_unsaved(sid, step="dedup")
-        return {"exact": exact, "perceptual": perc, "semantic": semantic}
+        return {
+            "exact": exact,
+            "perceptual": perc,
+            "semantic": semantic,
+            "text_near": text_near,
+        }
     except HTTPException:
         raise
     except Exception as exc:

@@ -33,6 +33,13 @@ except ImportError:
 
 PHASH_THRESHOLD = 8  # max bit-distance to consider "near-duplicate" (lowered from 10 for better sensitivity)
 AI_SIMILARITY_THRESHOLD = 0.55  # min similarity score for AI-based duplicates
+TEXT_NEAR_THRESHOLD = 0.90  # min SequenceMatcher ratio for near-identical text files
+TEXT_DEDUP_SIZE_CAP = 200_000  # skip text files larger than ~200 KB to keep O(n^2) bounded
+TEXT_EXTENSIONS = {
+    ".txt", ".md", ".html", ".htm", ".xml", ".json", ".yaml", ".yml",
+    ".csv", ".tsv", ".log", ".srt", ".vtt", ".rst", ".ini", ".cfg",
+    ".py", ".js", ".ts", ".css", ".scss",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +331,139 @@ def find_semantic_duplicates(session_id: str | None = None) -> dict:
             _upsert_group(
                 session,
                 DupeType.SEMANTIC,
+                group_hash,
+                group,
+                similarity=avg_sim,
+                session_id=session_id,
+            )
+            counts["groups"] += 1
+            counts["duplicates"] += len(group) - 1
+        session.commit()
+
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 — Near-identical text files (byte-level fuzzy match on small text)
+# ---------------------------------------------------------------------------
+
+def find_text_near_duplicates(
+    session_id: str | None = None,
+    threshold: float = TEXT_NEAR_THRESHOLD,
+    size_cap: int = TEXT_DEDUP_SIZE_CAP,
+) -> dict:
+    """
+    Catch near-identical text files (e.g. two HTML files differing by only a
+    few hundred bytes — a comment, an updated link, a timestamp).
+
+    Why this exists: such files have different MD5s (so the exact stage misses),
+    no perceptual hash (so the perceptual stage skips them), and often weak/
+    similar AI tag output (so the semantic stage's 0.55 threshold may miss
+    them too). This stage compares raw text content directly.
+
+    Strategy:
+    - Restrict to text-like files (mime text/* or known text extension)
+    - Skip files larger than size_cap bytes (keeps the pairwise scan bounded)
+    - Group only within the same extension (don't compare .py vs .html)
+    - Pre-filter pairs by length: skip if lengths differ by more than 10%
+    - Use SequenceMatcher ratio; group if >= threshold
+    """
+    from pathlib import Path as _P
+
+    engine = get_engine()
+    counts = {"groups": 0, "duplicates": 0}
+
+    with Session(engine) as session:
+        q = (
+            session.query(File.id, File.path, File.mime_type, File.extension, File.size_bytes)
+            .filter(File.status.in_([
+                FileStatus.ENRICHED, FileStatus.ANALYZED, FileStatus.PROPOSED,
+            ]))
+        )
+        if session_id:
+            q = q.filter(File.session_id == session_id)
+        rows = q.all()
+
+    # Filter to text-like, small enough files
+    candidates = []
+    for fid, fpath, mime, ext, size in rows:
+        if size is None or size > size_cap or size == 0:
+            continue
+        ext_lc = (ext or "").lower()
+        if not ext_lc.startswith("."):
+            ext_lc = "." + ext_lc if ext_lc else ""
+        is_text_mime = bool(mime and mime.startswith("text/"))
+        is_text_ext = ext_lc in TEXT_EXTENSIONS
+        if not (is_text_mime or is_text_ext):
+            continue
+        candidates.append((fid, fpath, ext_lc, size))
+
+    if len(candidates) < 2:
+        return counts
+
+    # Read content (best-effort) — skip files that can't be decoded
+    contents: dict[int, tuple[str, str, int]] = {}  # id -> (text, ext, size)
+    for fid, fpath, ext_lc, size in candidates:
+        try:
+            text = _P(fpath).read_text(encoding="utf-8", errors="replace")
+        except (OSError, UnicodeError):
+            continue
+        contents[fid] = (text, ext_lc, size)
+
+    # Bucket by extension to avoid cross-ext comparisons (.py vs .html etc.)
+    by_ext: dict[str, list[int]] = defaultdict(list)
+    for fid, (_text, ext_lc, _size) in contents.items():
+        by_ext[ext_lc].append(fid)
+
+    visited: set[int] = set()
+    groups: list[tuple[list[int], float]] = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold yellow]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+    ) as progress:
+        task = progress.add_task("Comparing text content…", total=len(contents))
+
+        for ext_lc, ids in by_ext.items():
+            for i, id_a in enumerate(ids):
+                progress.advance(task)
+                if id_a in visited:
+                    continue
+                text_a, _, size_a = contents[id_a]
+                group = [id_a]
+                sims: list[float] = []
+                for id_b in ids[i + 1:]:
+                    if id_b in visited:
+                        continue
+                    text_b, _, size_b = contents[id_b]
+                    # Cheap length pre-filter: if sizes differ by >10%, skip
+                    if size_a == 0 or size_b == 0:
+                        continue
+                    if abs(size_a - size_b) / max(size_a, size_b) > 0.10:
+                        continue
+                    ratio = SequenceMatcher(None, text_a, text_b).quick_ratio()
+                    if ratio < threshold:
+                        # quick_ratio is an upper bound; if even that fails, skip
+                        continue
+                    real_ratio = SequenceMatcher(None, text_a, text_b).ratio()
+                    if real_ratio >= threshold:
+                        group.append(id_b)
+                        sims.append(real_ratio)
+                if len(group) > 1:
+                    for gid in group:
+                        visited.add(gid)
+                    avg_sim = sum(sims) / len(sims) if sims else threshold
+                    groups.append((group, round(avg_sim, 3)))
+
+    with Session(engine) as session:
+        for group, avg_sim in groups:
+            group_hash = "-".join(str(x) for x in sorted(group))
+            _upsert_group(
+                session,
+                DupeType.CONTENT,
                 group_hash,
                 group,
                 similarity=avg_sim,
