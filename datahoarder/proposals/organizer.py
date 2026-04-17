@@ -36,6 +36,108 @@ class FolderSummary:
     outlier_files: list[dict] = field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# Category classification
+# ---------------------------------------------------------------------------
+# mime_type alone is too unreliable for outlier detection — libmagic on
+# Windows often returns vendor-specific labels like "application/CDFV2" for
+# .max files, "application/postscript" for .ai files, and stdlib mimetypes
+# returns None for plenty of common extensions (.max, .3ds, .fbx, .psd, .blend).
+# A coarse extension-based category map gives every file a meaningful bucket
+# so outlier detection can compare apples-to-apples.
+
+_EXT_CATEGORY: dict[str, str] = {
+    # Raster images
+    ".jpg": "image", ".jpeg": "image", ".png": "image", ".gif": "image",
+    ".bmp": "image", ".tiff": "image", ".tif": "image", ".webp": "image",
+    ".heic": "image", ".heif": "image", ".ico": "image", ".jp2": "image",
+    # Designed graphics (raster + vector design files)
+    ".psd": "design", ".ai": "design", ".sketch": "design", ".fig": "design",
+    ".xd": "design", ".afdesign": "design", ".afphoto": "design",
+    ".cdr": "design", ".indd": "design", ".eps": "design",
+    # 3D models / scenes
+    ".max": "3d", ".3ds": "3d", ".3dm": "3d", ".obj": "3d", ".fbx": "3d",
+    ".dae": "3d", ".blend": "3d", ".stl": "3d", ".ply": "3d", ".gltf": "3d",
+    ".glb": "3d", ".usd": "3d", ".usdz": "3d", ".c4d": "3d", ".ma": "3d",
+    ".mb": "3d", ".lwo": "3d", ".lws": "3d", ".skp": "3d",
+    # CAD
+    ".dwg": "cad", ".dxf": "cad", ".step": "cad", ".stp": "cad",
+    ".iges": "cad", ".igs": "cad", ".sat": "cad",
+    # Documents
+    ".pdf": "document", ".docx": "document", ".doc": "document",
+    ".odt": "document", ".rtf": "document", ".txt": "document",
+    ".md": "document", ".rst": "document", ".tex": "document",
+    ".xlsx": "document", ".xls": "document", ".ods": "document",
+    ".pptx": "document", ".ppt": "document", ".odp": "document",
+    ".csv": "document", ".tsv": "document",
+    # Markup / web (kept distinct from "document" so HTML pages don't get
+    # lumped with PDFs when both live in the same folder)
+    ".html": "web", ".htm": "web", ".xml": "web", ".xhtml": "web",
+    ".json": "web", ".yaml": "web", ".yml": "web", ".toml": "web",
+    # Audio
+    ".mp3": "audio", ".m4a": "audio", ".wav": "audio", ".flac": "audio",
+    ".ogg": "audio", ".oga": "audio", ".aac": "audio", ".wma": "audio",
+    ".opus": "audio", ".aiff": "audio", ".aif": "audio",
+    # Video
+    ".mp4": "video", ".mov": "video", ".avi": "video", ".mkv": "video",
+    ".wmv": "video", ".m4v": "video", ".3gp": "video", ".webm": "video",
+    ".flv": "video", ".mpg": "video", ".mpeg": "video",
+    # Archives
+    ".zip": "archive", ".rar": "archive", ".7z": "archive", ".tar": "archive",
+    ".gz": "archive", ".bz2": "archive", ".xz": "archive", ".tgz": "archive",
+    ".tbz": "archive", ".iso": "archive",
+    # Code (kept separate from web markup; outlier detection cares about this)
+    ".py": "code", ".js": "code", ".ts": "code", ".jsx": "code",
+    ".tsx": "code", ".java": "code", ".c": "code", ".cpp": "code",
+    ".h": "code", ".hpp": "code", ".cs": "code", ".go": "code",
+    ".rs": "code", ".rb": "code", ".php": "code", ".swift": "code",
+    ".kt": "code", ".scala": "code", ".sh": "code", ".bat": "code",
+    ".ps1": "code", ".sql": "code",
+    # Fonts
+    ".ttf": "font", ".otf": "font", ".woff": "font", ".woff2": "font",
+    ".eot": "font",
+    # Email / contacts
+    ".eml": "email", ".msg": "email", ".vcf": "contact", ".ics": "calendar",
+}
+
+
+def _file_category(mime_type: str | None, extension: str | None) -> str:
+    """
+    Return a coarse category for a file. Prefers a known extension category
+    over mime_type, because libmagic and stdlib mimetypes both produce a lot
+    of "application/octet-stream" / vendor-specific noise for non-web formats.
+
+    Falls back to mime_type's first segment if no extension match, then "other".
+    """
+    ext = (extension or "").lower()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    if ext in _EXT_CATEGORY:
+        return _EXT_CATEGORY[ext]
+
+    # Mime fallback — but only trust the well-known top-level types
+    mime = (mime_type or "").lower()
+    if "/" in mime:
+        top = mime.split("/", 1)[0]
+        if top in {"image", "video", "audio", "text", "font", "model"}:
+            return top
+        if top == "application":
+            # Some application/* mimes are still informative
+            sub = mime.split("/", 1)[1]
+            if "pdf" in sub:
+                return "document"
+            if "zip" in sub or "compressed" in sub or "tar" in sub:
+                return "archive"
+            if "photoshop" in sub:
+                return "design"
+            if "postscript" in sub:
+                return "design"
+            if "msword" in sub or "officedocument" in sub or "opendocument" in sub:
+                return "document"
+            # Otherwise: don't trust application/octet-stream and friends
+    return "other"
+
+
 def build_folder_tree(session_id: str, root_path: str | None = None) -> list[FolderSummary]:
     """
     Aggregate file-level metadata into per-folder summaries.
@@ -84,10 +186,12 @@ def build_folder_tree(session_id: str, root_path: str | None = None) -> list[Fol
             fs.total_size += f.size_bytes or 0
             files_by_folder[parent].append(f)
 
-            # MIME breakdown
-            mime = f.mime_type or "unknown"
-            mime_group = mime.split("/")[0] if "/" in mime else mime
-            fs.mime_breakdown[mime_group] = fs.mime_breakdown.get(mime_group, 0) + 1
+            # Category breakdown — extension-aware so .max / .psd / .blend etc.
+            # don't all collapse into "application" or "unknown" the way raw
+            # mime_type would. The dict key is still called mime_breakdown for
+            # backward-compat with downstream display code.
+            cat = _file_category(f.mime_type, f.extension)
+            fs.mime_breakdown[cat] = fs.mime_breakdown.get(cat, 0) + 1
 
             # Collect tags
             if f.ai_tags:
@@ -134,18 +238,17 @@ def build_folder_tree(session_id: str, root_path: str | None = None) -> list[Fol
                 continue
 
             total = fs.file_count or 1
-            dominant_mime = None
+            dominant_cat = None
             if fs.mime_breakdown:
-                top_mime, top_count = max(fs.mime_breakdown.items(), key=lambda kv: kv[1])
+                top_cat, top_count = max(fs.mime_breakdown.items(), key=lambda kv: kv[1])
                 if top_count / total >= 0.6:
-                    dominant_mime = top_mime
+                    dominant_cat = top_cat
 
             theme_tags = set(fs.top_tags)
 
             outliers: list[tuple[int, dict]] = []  # (priority, info) for sorting
             for f in folder_files:
-                mime = f.mime_type or "unknown"
-                mime_group = mime.split("/")[0] if "/" in mime else mime
+                cat = _file_category(f.mime_type, f.extension)
 
                 file_tags: list[str] = []
                 if f.ai_tags:
@@ -156,10 +259,13 @@ def build_folder_tree(session_id: str, root_path: str | None = None) -> list[Fol
                     except (json.JSONDecodeError, TypeError):
                         pass
 
-                is_mime_outlier = bool(
-                    dominant_mime
-                    and mime_group != dominant_mime
-                    and mime_group != "unknown"
+                # Category outlier: file's category differs from folder's
+                # dominant category. "other" is excluded because we genuinely
+                # don't know — flagging would create false positives.
+                is_cat_outlier = bool(
+                    dominant_cat
+                    and cat != dominant_cat
+                    and cat != "other"
                 )
                 # Tag outlier: file has tags, folder has a theme, zero overlap
                 is_tag_outlier = bool(
@@ -168,20 +274,20 @@ def build_folder_tree(session_id: str, root_path: str | None = None) -> list[Fol
                     and not (set(file_tags) & theme_tags)
                 )
 
-                if not (is_mime_outlier or is_tag_outlier):
+                if not (is_cat_outlier or is_tag_outlier):
                     continue
 
-                # Priority: mime outliers are more reliable signals than tag outliers
-                priority = 0 if is_mime_outlier else 1
+                # Priority: category outliers are more reliable than tag outliers
+                priority = 0 if is_cat_outlier else 1
                 reason_bits = []
-                if is_mime_outlier:
-                    reason_bits.append(f"type={mime_group} (folder is {dominant_mime})")
+                if is_cat_outlier:
+                    reason_bits.append(f"type={cat} (folder is {dominant_cat})")
                 if is_tag_outlier:
                     reason_bits.append("tags unrelated to folder theme")
 
                 outliers.append((priority, {
                     "filename": f.filename or Path(f.path).name,
-                    "mime_group": mime_group,
+                    "mime_group": cat,  # key kept for prompt-format compat
                     "size": f.size_bytes or 0,
                     "tags": file_tags[:5],
                     "reason": "; ".join(reason_bits),
