@@ -1050,6 +1050,7 @@ def trigger_dedup(body: PipelineRequest = PipelineRequest()):
     from datahoarder.core.dedup import (
         find_exact_duplicates, find_perceptual_duplicates,
         find_semantic_duplicates, find_text_near_duplicates,
+        generate_dedup_proposals,
     )
     import io
     import contextlib
@@ -1063,6 +1064,9 @@ def trigger_dedup(body: PipelineRequest = PipelineRequest()):
             perc = find_perceptual_duplicates(session_id=sid)
             semantic = find_semantic_duplicates(session_id=sid)  # Stage 3: AI-based semantic duplicates
             text_near = find_text_near_duplicates(session_id=sid)  # Stage 4: byte-level fuzzy text match
+            # Stage 5: turn detected groups into actionable MARK_DUPLICATE proposals
+            # so the executor / approval UI actually has something to work with.
+            proposals = generate_dedup_proposals(session_id=sid)
 
         _mark_session_unsaved(sid, step="dedup")
         return {
@@ -1070,6 +1074,7 @@ def trigger_dedup(body: PipelineRequest = PipelineRequest()):
             "perceptual": perc,
             "semantic": semantic,
             "text_near": text_near,
+            "proposals": proposals,
         }
     except HTTPException:
         raise
