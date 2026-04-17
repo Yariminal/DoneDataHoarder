@@ -78,7 +78,7 @@ Return a JSON object with these fields:
 {{
   "description": "2-3 sentence description of what is in the image",
   "suggested_name": "a concise, meaningful filename stem. Rules: (1) Describe the actual content, not the folder or project it belongs to — do NOT repeat the containing folder name in the stem. (2) Preserve specific proper nouns (people, places) only if they add meaning beyond the folder context. (3) Translate to English if not already. (4) No extension, no date prefix, use_underscores, max 50 chars",
-  "tags": ["tag1", "tag2", ...],
+  "tags": ["tag1", "tag2", ...]  // 4-8 specific, lowercase tags. RULES: (a) each tag must add information NOT already implied by the filename or folder name; (b) NO generic words like "image", "photo", "picture", "file", "object", "scene"; (c) prefer concrete nouns/attributes (subject, setting, style, technique, colour, material) over abstract categories; (d) no duplicates or near-duplicates; (e) use_underscores; (f) skip the tag rather than guessing if unsure,
   "category": "one of: photo_person, photo_group, photo_place, photo_event, photo_document, photo_object, screenshot, artwork, other",
   "detected_date": "YYYY-MM-DD only if a specific date is clearly visible in the image content itself (e.g. a calendar, dated document, visible timestamp) — NOT inferred from the filename or folder name. Return null if uncertain.",
   "confidence": 0.0-1.0
