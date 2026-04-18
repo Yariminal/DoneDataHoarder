@@ -819,7 +819,20 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
     except Exception:
         pass
 
-    # Post-pass 3: collapse spelling variants across all proposed names so that
+    # Post-pass 3: propagate renames to same-stem siblings so that pairs like
+    # midul.3dm / midul.3dmbak and 10.8.dwg / 10.8.bak don't get split — if the
+    # analyzable file gets renamed, its non-analyzable companions (.bak,
+    # .3dmbak, .dwg, etc.) follow along. Runs after passes 1 & 2 so it picks
+    # up fallback/hygiene-derived new stems too.
+    try:
+        sibling_propagated = _propagate_renames_to_siblings(session_id)
+        if sibling_propagated:
+            counts["sibling_renames"] = sibling_propagated
+    except Exception:
+        # Best-effort propagation — never break the pipeline if it errors.
+        pass
+
+    # Post-pass 4: collapse spelling variants across all proposed names so that
     # "solar_decathlon" and "solar_dekathlon" don't both appear in the same
     # session output. Runs once after every batch is committed.
     try:
@@ -1015,6 +1028,171 @@ def _generate_fallback_for_useless_stems(session_id: str | None) -> int:
                     "Re-run analysis if you want a content-derived name."
                 ),
                 confidence=0.3,
+                status=ProposalStatus.PENDING,
+            ))
+            existing_renames.add(f.id)
+            created += 1
+
+        if created:
+            session.commit()
+
+    return created
+
+
+# ---------------------------------------------------------------------------
+# Sibling propagation — keep companion files linked to the renamed primary
+# ---------------------------------------------------------------------------
+
+def _propagate_renames_to_siblings(session_id: str | None) -> int:
+    """
+    Post-pass: when a file gets a RENAME proposal, propagate the new stem to
+    every sibling in the same directory that shares its current stem but has
+    a different extension. This preserves the relationship between an
+    analyzable file and its unsupported companions.
+
+    Examples handled:
+      midul.3dm (rename -> kitchen_layout.3dm) pulls
+        midul.3dmbak -> kitchen_layout.3dmbak
+
+      10.8.dwg    (rename -> south_facade_2017.dwg) pulls
+        10.8.bak  -> south_facade_2017.bak
+
+      Event_Menu_1.pdf (rename -> solar_decathlon_menu.pdf) pulls any
+      Event_Menu_1.xmp sidecar under the same directory.
+
+    Stem matching is case-insensitive and uses Path.stem, which already
+    handles compound extensions correctly (Path('midul.3dmbak').stem ==
+    'midul'). If a sibling already has a RENAME proposal, it is left
+    untouched — the earlier pass (main loop, useless-stem, or hygiene)
+    already decided its fate.
+
+    Returns the number of sibling RENAME proposals created.
+    """
+    if not session_id:
+        return 0
+
+    engine = get_engine()
+    created = 0
+
+    with Session(engine) as session:
+        # Pull every rename proposal in the session joined with its source file
+        # so we know the original stem and directory. Only proposals still in
+        # PENDING status are candidates — applied/rejected ones are history.
+        rename_rows = (
+            session.query(Proposal, File)
+            .join(File, Proposal.file_id == File.id)
+            .filter(
+                File.session_id == session_id,
+                Proposal.proposal_type == ProposalType.RENAME,
+                Proposal.status == ProposalStatus.PENDING,
+            )
+            .all()
+        )
+        if not rename_rows:
+            return 0
+
+        # Group primary proposals by (parent_dir, lowercased original_stem) so
+        # that when multiple primaries share the same stem (rare but possible —
+        # e.g. collision-suffixed renames), we apply the first one deterministically.
+        primary_new_stems: dict[tuple[str, str], str] = {}
+        for proposal, file_rec in rename_rows:
+            src_path = Path(proposal.current_value or file_rec.path)
+            dst_path = Path(proposal.proposed_value or "")
+            if not dst_path.name:
+                continue
+            key = (str(src_path.parent), src_path.stem.lower())
+            primary_new_stems.setdefault(key, dst_path.stem)
+
+        if not primary_new_stems:
+            return 0
+
+        # Pull every non-applied file in the session — sibling candidates may
+        # still be in PENDING / ENRICHED if the analyzer skipped them (common
+        # for .dwg/.bak/.3dmbak/.shx/.ctb, which have no analyzer support).
+        files = (
+            session.query(File)
+            .filter(
+                File.session_id == session_id,
+                File.status.in_([
+                    FileStatus.PENDING,
+                    FileStatus.ENRICHED,
+                    FileStatus.ANALYZED,
+                    FileStatus.PROPOSED,
+                ]),
+            )
+            .all()
+        )
+        if not files:
+            return 0
+
+        file_ids = [f.id for f in files]
+
+        # Files already carrying a RENAME proposal — don't overwrite them.
+        existing_renames: set[int] = {
+            file_id
+            for (file_id,) in session.query(Proposal.file_id).filter(
+                Proposal.proposal_type == ProposalType.RENAME,
+                Proposal.file_id.in_(file_ids),
+            )
+        }
+
+        # Paths already reserved by RENAME proposals, so we don't generate a
+        # sibling rename that collides with the primary's new path.
+        reserved_paths: set[Path] = set()
+        for (proposed_value,) in session.query(Proposal.proposed_value).filter(
+            Proposal.proposal_type == ProposalType.RENAME,
+            Proposal.file_id.in_(file_ids),
+        ):
+            if proposed_value:
+                reserved_paths.add(Path(proposed_value))
+
+        for f in files:
+            if f.id in existing_renames:
+                continue
+            path = Path(f.path)
+            # Skip files whose stem is empty (e.g. ".hidden" on unix) — no
+            # meaningful sibling relationship to propagate.
+            if not path.stem:
+                continue
+
+            key = (str(path.parent), path.stem.lower())
+            new_stem = primary_new_stems.get(key)
+            if not new_stem:
+                continue
+
+            # Preserve the sibling's ORIGINAL extension — that's the whole
+            # point of this pass. path.suffix keeps the leading dot and the
+            # original casing, which is what users expect on disk.
+            ext = path.suffix
+            new_name = new_stem + ext
+            if new_name == path.name:
+                # Already matches the primary's new stem (shouldn't happen —
+                # the existing_renames filter would've caught it — but guard
+                # against pathological inputs).
+                continue
+
+            proposed_path = _resolve_collision(
+                path.parent / new_name, path, reserved_names=reserved_paths
+            )
+            reserved_paths.add(proposed_path)
+
+            session.add(Proposal(
+                file_id=f.id,
+                proposal_type=ProposalType.RENAME,
+                current_value=str(path),
+                proposed_value=str(proposed_path),
+                reasoning=(
+                    "Sibling rename — companion file shares stem "
+                    f"'{path.stem}' with a renamed primary in the same "
+                    "folder; propagating the new stem keeps the "
+                    "relationship visible after reorganization."
+                ),
+                # Match the sibling to its primary's confidence floor. 0.6 is
+                # a touch above hygiene (0.5) because the rename is
+                # structurally grounded — the primary already justifies it —
+                # but below AI-derived values so the UI still flags it for
+                # review on low-confidence primaries.
+                confidence=0.6,
                 status=ProposalStatus.PENDING,
             ))
             existing_renames.add(f.id)
