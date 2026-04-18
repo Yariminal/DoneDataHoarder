@@ -1060,18 +1060,26 @@ document.addEventListener('alpine:init', () => {
         ? `<span class="tree-indent">${indentStr}</span>`
         : '';
 
-      // Folders (keys not starting with _) come first
+      // Folders (keys not starting with _) come first. Empty leaf folders
+      // (0 files, 0 B, no child folders) get a dimmed style + "(empty)"
+      // hint so browser-save cruft like "Tunic With Hood – Sewing Pattern
+      // #4742..._files/" is visually obvious as a deletion candidate.
       for (const [key, val] of Object.entries(node)) {
         if (key.startsWith('_')) continue;
         if (!val || typeof val !== 'object') continue;
         const files = val._files || 0;
         const size = val._size || 0;
-        const meta = `(${files} files, ${this.formatSize(size)})`;
+        const hasChildren = Object.keys(val).some(k => !k.startsWith('_'));
+        const isEmpty = files === 0 && size === 0 && !hasChildren;
+        const meta = isEmpty
+          ? '(empty)'
+          : `(${files} files, ${this.formatSize(size)})`;
         const titleAttr = this.escapeHtml(`${key}/  ${meta}`);
+        const folderClass = isEmpty ? 'tree-folder tree-empty' : 'tree-folder';
         html +=
           `<div class="tree-line" title="${titleAttr}">` +
             indentHtml +
-            `<span class="tree-name tree-folder">📁 ${this.escapeHtml(key)}/</span>` +
+            `<span class="tree-name ${folderClass}">📁 ${this.escapeHtml(key)}/</span>` +
             `<span class="tree-meta">${this.escapeHtml(meta)}</span>` +
           `</div>`;
         html += this.renderTree(val, depth + 1);

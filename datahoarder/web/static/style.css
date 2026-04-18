@@ -321,6 +321,13 @@ tr:hover td { background: rgba(255,255,255,.02); }
 }
 .tree-view .tree-folder { color: var(--primary); }
 .tree-view .tree-file { color: var(--text); }
+/* Empty-leaf folders (0 files, 0 B, no children) — dimmed + italic so the
+   user can spot browser-save _files/ cruft at a glance for deletion. */
+.tree-view .tree-empty {
+  color: var(--text-dim);
+  font-style: italic;
+  opacity: .75;
+}
 .tree-view .tree-meta {
   color: var(--text-dim);
   font-size: .75rem;

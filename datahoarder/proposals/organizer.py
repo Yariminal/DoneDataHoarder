@@ -444,6 +444,10 @@ Rules:
 - Group by semantic meaning, not just file type
 - Prioritize highest-impact changes (large unsorted folders, mixed-content folders)
 - Rename folders with cryptic, abbreviated, or meaningless names to something descriptive
+- Correct obvious English spelling errors in folder names (e.g. "Sponsers" -> "Sponsors", \
+"Recieved" -> "Received", "Seperated" -> "Separated"). Use rename_folder for these even \
+when the folder's content is otherwise well-organized — misspelled names still hurt \
+discoverability and look unprofessional.
 - Suggest at most 25 changes
 - For move/merge: specify source folder, destination folder, which files (all or description)
 - For move_files: list the exact filenames (as shown in the OUTLIER entries) that should \
