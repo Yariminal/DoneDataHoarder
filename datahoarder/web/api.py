@@ -1341,9 +1341,14 @@ def _build_proposed_tree(session_id: str, before_summaries, root_path: str) -> d
             node = node[part]
         return node
 
+    # Fetch each Proposal alongside its File's size_bytes so we can use the
+    # DB as the authoritative source for move sizes. Relying on _sample_files
+    # alone was buggy: when the moved file was past SAMPLE_CAP (12 entries
+    # per folder), the destination node would end up with "1 files, 0 B"
+    # because the fallback entry used size=0. DB size_bytes is always right.
     with Session(get_engine()) as db:
-        proposals = (
-            db.query(Proposal)
+        rows = (
+            db.query(Proposal, File.size_bytes)
             .join(File, Proposal.file_id == File.id)
             .filter(
                 File.session_id == session_id,
@@ -1355,7 +1360,7 @@ def _build_proposed_tree(session_id: str, before_summaries, root_path: str) -> d
 
     # Pass 1: apply folder renames (just a key rename in the parent node).
     # Done first so subsequent MOVE lookups resolve via post-rename paths.
-    for p in proposals:
+    for p, _size in rows:
         if p.proposal_type == ProposalType.RENAME_FOLDER and p.current_value and p.proposed_value:
             try:
                 old_rel = Path(p.current_value).relative_to(root)
@@ -1374,9 +1379,10 @@ def _build_proposed_tree(session_id: str, before_summaries, root_path: str) -> d
 
     # Pass 2: apply file MOVE proposals. Each MOVE updates both source and
     # target: decrement source counts / remove from source._sample_files,
-    # increment target counts / add to target._sample_files. The file's
-    # size is also transferred so the "Current vs Proposed" totals stay honest.
-    for p in proposals:
+    # increment target counts / add to target._sample_files. Size comes from
+    # the DB (File.size_bytes) so the bookkeeping works even for files past
+    # the per-folder sample cap.
+    for p, db_size in rows:
         if p.proposal_type != ProposalType.MOVE or not p.proposed_value or not p.current_value:
             continue
         try:
@@ -1387,30 +1393,30 @@ def _build_proposed_tree(session_id: str, before_summaries, root_path: str) -> d
         except ValueError:
             continue
 
+        file_size = int(db_size or 0)
         src_node = _node_at(src_parent_rel)
         dst_node = _ensure_node(dst_parent_rel)
 
-        # Find the file in source._sample_files by name (fs walk populated it)
+        # Pop the entry from source._sample_files if present (so the UI
+        # doesn't show the same file in two places). Absence is fine — the
+        # file just wasn't among the 12 sampled names for that folder.
         src_name = src_path.name
-        moved_entry: dict | None = None
         if src_node is not None:
             src_samples = src_node.get("_sample_files") or []
             for i, entry in enumerate(src_samples):
                 if entry.get("name") == src_name:
-                    moved_entry = src_samples.pop(i)
+                    src_samples.pop(i)
                     break
-            if moved_entry is not None:
-                src_node["_files"] = max(0, src_node.get("_files", 1) - 1)
-                src_node["_size"] = max(0, src_node.get("_size", 0) - moved_entry.get("size", 0))
+            # Always decrement source counts — the file is leaving regardless
+            # of whether it was in the sample list.
+            src_node["_files"] = max(0, src_node.get("_files", 1) - 1)
+            src_node["_size"] = max(0, src_node.get("_size", 0) - file_size)
 
-        # Place it into the destination
+        # Place it into the destination with the authoritative DB size.
         dst_samples = dst_node.setdefault("_sample_files", [])
-        dst_entry = moved_entry or {"name": dst_path.name, "size": 0}
-        # Update the name in case the MOVE also renames (target path differs)
-        dst_entry = {**dst_entry, "name": dst_path.name}
-        dst_samples.append(dst_entry)
+        dst_samples.append({"name": dst_path.name, "size": file_size})
         dst_node["_files"] = dst_node.get("_files", 0) + 1
-        dst_node["_size"] = dst_node.get("_size", 0) + dst_entry.get("size", 0)
+        dst_node["_size"] = dst_node.get("_size", 0) + file_size
 
     return tree
 
