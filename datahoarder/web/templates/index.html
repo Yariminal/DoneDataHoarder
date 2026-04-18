@@ -694,12 +694,12 @@
         <div class="mt-2" style="max-width:900px">
           <!-- Tree visualization for organize results -->
           <template x-if="result.before_tree || result.after_tree">
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
-              <div class="card" x-show="result.before_tree">
+            <div style="display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:16px;">
+              <div class="card" style="min-width:0; overflow:hidden;" x-show="result.before_tree">
                 <div class="card-label">Current Structure</div>
                 <div class="tree-view mt-1" x-html="renderTree(result.before_tree)"></div>
               </div>
-              <div class="card" x-show="result.after_tree">
+              <div class="card" style="min-width:0; overflow:hidden;" x-show="result.after_tree">
                 <div class="card-label">Proposed Structure</div>
                 <div class="tree-view mt-1" x-html="renderTree(result.after_tree)"></div>
               </div>
