@@ -1048,14 +1048,17 @@ document.addEventListener('alpine:init', () => {
     },
 
     renderTree(node, depth = 0) {
-      // Renders both folders and individual files. Loose files at the root
-      // level (e.g. a 452 MB PDF sitting directly under the session root)
-      // appear at depth 0 alongside top-level folders, so the user can see
-      // at a glance what's unorganized. Folders come first, then their
-      // sample files as indented children, then root-level files last.
+      // Renders both folders and individual files as flex rows. Long
+      // filenames are ellipsis-truncated at the box boundary; the native
+      // `title` tooltip shows the full name on hover. Loose files at the
+      // root level (the 452 MB PDF, stray HTMLs) appear at depth 0 so the
+      // user can see unorganized content at a glance.
       if (!node || typeof node !== 'object') return '';
       let html = '';
-      const indent = '  '.repeat(depth);
+      const indentStr = '  '.repeat(depth);
+      const indentHtml = indentStr
+        ? `<span class="tree-indent">${indentStr}</span>`
+        : '';
 
       // Folders (keys not starting with _) come first
       for (const [key, val] of Object.entries(node)) {
@@ -1063,24 +1066,42 @@ document.addEventListener('alpine:init', () => {
         if (!val || typeof val !== 'object') continue;
         const files = val._files || 0;
         const size = val._size || 0;
-        html += `${indent}<span class="tree-folder">📁 ${this.escapeHtml(key)}/</span> <span class="tree-meta">(${files} files, ${this.formatSize(size)})</span>\n`;
+        const meta = `(${files} files, ${this.formatSize(size)})`;
+        const titleAttr = this.escapeHtml(`${key}/  ${meta}`);
+        html +=
+          `<div class="tree-line" title="${titleAttr}">` +
+            indentHtml +
+            `<span class="tree-name tree-folder">📁 ${this.escapeHtml(key)}/</span>` +
+            `<span class="tree-meta">${this.escapeHtml(meta)}</span>` +
+          `</div>`;
         html += this.renderTree(val, depth + 1);
       }
 
-      // Individual files (from _sample_files) rendered at this level as
-      // 📄 entries. At the root level these are the loose files that need
-      // to be moved into a subfolder — surfacing them visually is half the
-      // point of the Organize step.
+      // Individual files from _sample_files. At the root level these are
+      // the loose files that need subfolder assignment — surfacing them is
+      // half the point of the Organize step.
       const samples = Array.isArray(node._sample_files) ? node._sample_files : [];
       for (const entry of samples) {
         if (!entry || typeof entry !== 'object') continue;
         const name = entry.name || '';
         const size = entry.size || 0;
-        html += `${indent}<span class="tree-file">📄 ${this.escapeHtml(name)}</span> <span class="tree-meta">(${this.formatSize(size)})</span>\n`;
+        const meta = `(${this.formatSize(size)})`;
+        const titleAttr = this.escapeHtml(`${name}  ${meta}`);
+        html +=
+          `<div class="tree-line" title="${titleAttr}">` +
+            indentHtml +
+            `<span class="tree-name tree-file">📄 ${this.escapeHtml(name)}</span>` +
+            `<span class="tree-meta">${this.escapeHtml(meta)}</span>` +
+          `</div>`;
       }
       const truncated = node._sample_truncated || 0;
       if (truncated > 0) {
-        html += `${indent}<span class="tree-meta">… +${truncated} more file${truncated === 1 ? '' : 's'}</span>\n`;
+        const more = `… +${truncated} more file${truncated === 1 ? '' : 's'}`;
+        html +=
+          `<div class="tree-line">` +
+            indentHtml +
+            `<span class="tree-meta">${this.escapeHtml(more)}</span>` +
+          `</div>`;
       }
 
       return html;

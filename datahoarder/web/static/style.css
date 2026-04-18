@@ -288,16 +288,44 @@ tr:hover td { background: rgba(255,255,255,.02); }
   font-size: .82rem;
   max-height: 400px;
   overflow-y: auto;
+  /* `min-width: 0` is essential inside a flex/grid container — without it,
+     child grid tracks inflate to fit the longest unbreakable filename
+     (e.g. a Tunic With Hood-... line) and the side-by-side Current vs
+     Proposed Structure panels lose their equal-width layout. */
+  min-width: 0;
   padding: 12px;
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   line-height: 1.6;
-  white-space: pre;
+}
+.tree-view .tree-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  /* Truncate overly-long names with an ellipsis; full name shown in the
+     native tooltip (title attribute emitted by renderTree). */
+  overflow: hidden;
+  white-space: nowrap;
+}
+.tree-view .tree-indent {
+  color: var(--text-dim);
+  white-space: pre;         /* preserve the 2-space indent runs */
+  flex-shrink: 0;
+}
+.tree-view .tree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;              /* same reason as .tree-view: allow shrink */
+  flex: 0 1 auto;
 }
 .tree-view .tree-folder { color: var(--primary); }
 .tree-view .tree-file { color: var(--text); }
-.tree-view .tree-meta { color: var(--text-dim); font-size: .75rem; }
+.tree-view .tree-meta {
+  color: var(--text-dim);
+  font-size: .75rem;
+  flex-shrink: 0;            /* meta stays intact; name truncates instead */
+}
 
 /* --- Duplicate comparison --------------------------------- */
 .dupe-group {
