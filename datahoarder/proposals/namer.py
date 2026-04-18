@@ -793,12 +793,27 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
 
                 session.commit()
 
-    # Post-pass 1: rescue files that still have a useless stem (1.pdf,
+    # Post-pass 1: propagate renames to same-stem siblings so that pairs like
+    # 10.8.pdf / 10.8.dwg / 10.8.bak don't get split — the analyzable file's
+    # AI-derived stem pulls its non-analyzable companions along. MUST run
+    # before the useless-stem and hygiene fallbacks: those would otherwise
+    # emit low-confidence fallback renames for .dwg / .bak files with
+    # digit-like stems ('10.8', '12.9', ...) and the sibling pass would then
+    # see them in existing_renames and skip propagation, stranding the
+    # companions under folder-context names unrelated to their primary.
+    try:
+        sibling_propagated = _propagate_renames_to_siblings(session_id)
+        if sibling_propagated:
+            counts["sibling_renames"] = sibling_propagated
+    except Exception:
+        # Best-effort propagation — never break the pipeline if it errors.
+        pass
+
+    # Post-pass 2: rescue files that still have a useless stem (1.pdf,
     # IMG_1234.jpg, untitled.docx, etc.) and didn't pick up a RENAME proposal
-    # in the main loop — typically because analysis failed or returned nothing.
-    # Generate a low-confidence folder-context fallback so the user at least
-    # sees them in the review UI rather than silently shipping with the
-    # original meaningless name.
+    # in the main loop or sibling pass. Generates a low-confidence folder-
+    # context fallback so the user at least sees them in the review UI rather
+    # than silently shipping with the original meaningless name.
     try:
         rescued = _generate_fallback_for_useless_stems(session_id)
         if rescued:
@@ -807,29 +822,16 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
         # Best-effort rescue pass — never break the pipeline if it errors.
         pass
 
-    # Post-pass 2: hygiene rescue for files with cosmetic issues (whitespace,
+    # Post-pass 3: hygiene rescue for files with cosmetic issues (whitespace,
     # illegal chars, parentheses, etc.) that never got a RENAME proposal.
     # These are pure mechanical fixes independent of any AI signal, so they
-    # rescue files stuck at ENRICHED / PENDING too. Distinct from pass 1
+    # rescue files stuck at ENRICHED / PENDING too. Distinct from pass 2
     # because the stems aren't "useless" — just ugly.
     try:
         hygiene_fixed = _generate_hygiene_fallback(session_id)
         if hygiene_fixed:
             counts["hygiene_renames"] = hygiene_fixed
     except Exception:
-        pass
-
-    # Post-pass 3: propagate renames to same-stem siblings so that pairs like
-    # midul.3dm / midul.3dmbak and 10.8.dwg / 10.8.bak don't get split — if the
-    # analyzable file gets renamed, its non-analyzable companions (.bak,
-    # .3dmbak, .dwg, etc.) follow along. Runs after passes 1 & 2 so it picks
-    # up fallback/hygiene-derived new stems too.
-    try:
-        sibling_propagated = _propagate_renames_to_siblings(session_id)
-        if sibling_propagated:
-            counts["sibling_renames"] = sibling_propagated
-    except Exception:
-        # Best-effort propagation — never break the pipeline if it errors.
         pass
 
     # Post-pass 4: collapse spelling variants across all proposed names so that
