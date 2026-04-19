@@ -39,10 +39,13 @@ logger = logging.getLogger(__name__)
 LLM_CONFIDENCE = 0.8
 BACKSTOP_CONFIDENCE = 0.3
 
-# Cap on filenames sent to the LLM in one call to avoid prompt overruns.
-# Typical architect/photographer dumps stay well under this; large mixed
-# dirs get chunked into multiple calls (see _chunk).
-MAX_FILES_PER_CALL = 200
+# Cap on filenames sent to the LLM in one call to avoid prompt AND response
+# overruns. Smaller dirs get one call; larger dirs get chunked (see _chunk).
+# Empirically: even at 200 input files Ollama responses can hit a default
+# token budget on large clusters (e.g. 339 SHX fonts producing 30+ groups
+# truncates the JSON mid-array). 100 keeps the worst-case response size
+# safely inside a typical 4k-token completion budget.
+MAX_FILES_PER_CALL = 100
 
 # Leading numeric prefix: "10.8", "24.8", "3.9.1", etc. Stops at the first
 # non-digit/non-dot character. Optional trailing "#N" version tag is part
@@ -136,6 +139,108 @@ def _numeric_prefix(stem: str) -> Optional[str]:
     """Return the leading numeric prefix of a stem, or None if no digits lead."""
     m = _PREFIX_RE.match(stem)
     return m.group(1) if m else None
+
+
+def _group_prefix(group: dict) -> Optional[str]:
+    """
+    Return the single shared numeric prefix of a group, or None.
+
+    A group has a "shared prefix" if at least 2 members carry a leading
+    numeric prefix AND they all agree on the same one. Members without
+    any numeric prefix are ignored (they don't block, they don't help).
+    """
+    prefixes: set[str] = set()
+    count = 0
+    for m in group["members"]:
+        stem = Path(m["filename"]).stem
+        pfx = _numeric_prefix(stem)
+        if pfx:
+            prefixes.add(pfx)
+            count += 1
+    if count >= 2 and len(prefixes) == 1:
+        return next(iter(prefixes))
+    return None
+
+
+def _merge_groups_by_prefix(groups: list[dict]) -> list[dict]:
+    """
+    Post-pass on LLM output: merge groups that share a leading numeric prefix.
+
+    The LLM frequently over-segments date-prefixed CAD project clusters,
+    splitting e.g. `10.8.dwg + 10.8.bak` (sources/backup) from
+    `10.8-binoy -1.pdf + 10.8-binoy -2.pdf + 10.8-binoy -3.pdf` (exports)
+    even though both groups belong to project "10.8". This pass detects
+    that and merges them into one group, preserving member roles.
+
+    Primary-group selection (whose label/reason wins): prefer a group with
+    a "source" role member; tie-break by member count.
+
+    Returns a new list. Original groups are not mutated.
+    """
+    if len(groups) < 2:
+        return list(groups)
+
+    by_prefix: dict[str, list[int]] = defaultdict(list)
+    for i, g in enumerate(groups):
+        pfx = _group_prefix(g)
+        if pfx:
+            by_prefix[pfx].append(i)
+
+    # primary_idx -> list of indices to fold into it
+    merge_targets: dict[int, list[int]] = {}
+    consumed: set[int] = set()
+    for pfx, indices in by_prefix.items():
+        if len(indices) < 2:
+            continue
+
+        def _score(i: int) -> tuple[int, int]:
+            g = groups[i]
+            has_source = any(m["role"] == "source" for m in g["members"])
+            return (1 if has_source else 0, len(g["members"]))
+
+        indices_sorted = sorted(indices, key=_score, reverse=True)
+        primary = indices_sorted[0]
+        merge_targets[primary] = indices_sorted[1:]
+        consumed.update(indices_sorted[1:])
+
+    if not merge_targets:
+        return list(groups)
+
+    out: list[dict] = []
+    for i, g in enumerate(groups):
+        if i in consumed:
+            continue
+        if i not in merge_targets:
+            out.append(g)
+            continue
+        merged_members = list(g["members"])
+        seen_fn = {m["filename"] for m in merged_members}
+        extra_reasons: list[str] = []
+        for j in merge_targets[i]:
+            other = groups[j]
+            for m in other["members"]:
+                if m["filename"] in seen_fn:
+                    continue
+                merged_members.append(m)
+                seen_fn.add(m["filename"])
+            if other.get("reason"):
+                extra_reasons.append(other["reason"])
+        merged = {
+            "label": g["label"],
+            "reason": g.get("reason") or "",
+            "members": merged_members,
+            "_confidence": g.get("_confidence", LLM_CONFIDENCE),
+        }
+        if extra_reasons:
+            base = merged["reason"] or ""
+            joined = " | ".join([base] + extra_reasons).strip(" |")
+            merged["reason"] = joined[:500]
+        logger.info(
+            "Relate: merged %d LLM groups sharing prefix into '%s' (%d members)",
+            1 + len(merge_targets[i]), merged["label"], len(merged_members),
+        )
+        out.append(merged)
+    return out
 
 
 def _prefix_cluster_backstop(files: list[File]) -> list[dict]:
@@ -473,6 +578,10 @@ def relate(
                     llm_groups.extend(
                         _call_llm_for_group(client, dir_label, chunk, model=model)
                     )
+
+            # Post-pass: merge groups that share a leading numeric prefix
+            # (LLM tends to over-segment date-stamped CAD project clusters).
+            llm_groups = _merge_groups_by_prefix(llm_groups)
 
             # Deduplicate labels across all groups from this unit
             _deduplicate_labels(llm_groups)
