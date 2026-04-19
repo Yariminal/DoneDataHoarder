@@ -48,6 +48,9 @@ class UserSession(Base):
     propose_model: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     workers: Mapped[int] = mapped_column(Integer, default=1)
     preferred_language: Mapped[str] = mapped_column(String, default="leave_as_is")
+    # Relate step scope — "per_directory" (default, cheap) or "cross_directory"
+    # (whole-tree, catches cross-folder clusters but larger prompts).
+    relate_scope: Mapped[str] = mapped_column(String, default="per_directory")
 
     status: Mapped[SessionStatus] = mapped_column(
         Enum(SessionStatus), default=SessionStatus.NEW
@@ -279,6 +282,68 @@ class ScanSession(Base):
     files_skipped: Mapped[int] = mapped_column(Integer, default=0)
     files_error: Mapped[int] = mapped_column(Integer, default=0)
     completed: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+# ---------------------------------------------------------------------------
+# Relation groups — semantic clusters of related files (shared identity,
+# not identical content). E.g. a .dwg AutoCAD source with its .bak backup
+# and .pdf exports; a .psd with its exported .jpg; a multi-version plan.
+# Produced by the `relate` pipeline step using an LLM on filenames (fast),
+# with a regex prefix-cluster backstop for reliability.
+# ---------------------------------------------------------------------------
+
+class RelationRole(str, enum.Enum):
+    SOURCE  = "source"    # master / canonical file (e.g. .dwg, .psd)
+    EXPORT  = "export"    # derivative output (e.g. PDF exported from CAD)
+    BACKUP  = "backup"    # automatic backup (e.g. .bak, .3dmbak)
+    VERSION = "version"   # revised variant of another member
+    SIBLING = "sibling"   # related but peer (no source/export hierarchy)
+
+
+class RelationGroup(Base):
+    __tablename__ = "relation_groups"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # Short snake_case slug usable as a folder name (≤40 chars).
+    label: Mapped[str] = mapped_column(String, nullable=False)
+    # One-sentence explanation of what binds these files.
+    reason: Mapped[Optional[str]] = mapped_column(Text)
+    # 0.3 = algorithmic backstop, 0.8 = LLM-reasoned group.
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    # "per_directory" or "cross_directory" — how the group was discovered.
+    scope: Mapped[str] = mapped_column(String, default="per_directory")
+    # Parent directory for per_directory groups (null for cross_directory).
+    dir_path: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    members: Mapped[list["RelationMember"]] = relationship(
+        "RelationMember", back_populates="group", cascade="all, delete-orphan"
+    )
+
+
+class RelationMember(Base):
+    __tablename__ = "relation_members"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("relation_groups.id", ondelete="CASCADE"), nullable=False
+    )
+    file_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("files.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    role: Mapped[RelationRole] = mapped_column(
+        Enum(RelationRole), default=RelationRole.SIBLING
+    )
+
+    group: Mapped["RelationGroup"] = relationship("RelationGroup", back_populates="members")
+
+    __table_args__ = (
+        UniqueConstraint("group_id", "file_id", name="uq_relation_member"),
+    )
 
 
 # ---------------------------------------------------------------------------

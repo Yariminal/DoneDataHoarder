@@ -20,6 +20,7 @@ def _migrate_add_columns(engine: Engine, inspector) -> None:
         ("files", "ai_suggested_name", "VARCHAR", "NULL"),
         ("sessions", "analyze_model", "VARCHAR", "NULL"),
         ("sessions", "propose_model", "VARCHAR", "NULL"),
+        ("sessions", "relate_scope", "VARCHAR", "'per_directory'"),
     ]
 
     for table, column, sql_type, default in migrations:

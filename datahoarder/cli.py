@@ -185,6 +185,59 @@ def dedup(
 
 
 # ---------------------------------------------------------------------------
+# relate
+# ---------------------------------------------------------------------------
+
+@app.command()
+def relate(
+    db: Annotated[str, typer.Option("--db", help="SQLite database path.", envvar="DATAHOARDER_DB")] = "datahoarder.db",
+    session_id: Annotated[Optional[str], typer.Option("--session", help="Session ID to process. Defaults to latest.")] = None,
+    scope: Annotated[str, typer.Option("--scope", help="'per_directory' (default) or 'cross_directory'.")] = "per_directory",
+    backend: Annotated[str, typer.Option("--backend", help="'ollama' or 'gemini'.")] = "ollama",
+    model: Annotated[str, typer.Option("--model", "-m", help="LLM model.")] = "gemma3:12b",
+):
+    """[bold cyan]Relate[/bold cyan] — LLM-group files that are conceptually one thing (CAD + backups + exports, etc.)."""
+    _init_db(db)
+    _init_ai(backend=backend, text_model=model, vision_model=model)
+    console.print(Panel("Finding related file groups", style="cyan"))
+
+    from datahoarder.core.relate import relate as do_relate
+    from datahoarder.db.models import UserSession
+    from datahoarder.db.session import get_engine
+    from sqlalchemy.orm import Session as _Session
+
+    # Resolve session
+    if not session_id:
+        with _Session(get_engine()) as s:
+            latest = (
+                s.query(UserSession).order_by(UserSession.updated_at.desc()).first()
+            )
+            if not latest:
+                console.print("[red]No sessions found. Run `datahoarder scan` first.[/red]")
+                raise typer.Exit(1)
+            session_id = latest.id
+            console.print(f"Using latest session: [cyan]{session_id}[/cyan]")
+
+    def _cb(d: dict) -> None:
+        console.print(
+            f"  [dim]{d['done']}/{d['total']}[/dim]  "
+            f"[bold]{d['groups']}[/bold] groups so far "
+            f"([green]{d['llm_groups']} LLM[/green] + "
+            f"[yellow]{d['backstop_groups']} backstop[/yellow])"
+        )
+
+    summary = do_relate(session_id=session_id, scope=scope, progress_cb=_cb)
+    console.print(
+        f"\n[bold green]Relate complete[/bold green] — "
+        f"{summary['directories']} dir(s), "
+        f"[bold]{summary['groups']}[/bold] groups "
+        f"({summary['members']} members, "
+        f"[green]{summary['llm_groups']} LLM[/green] + "
+        f"[yellow]{summary['backstop_groups']} backstop[/yellow])"
+    )
+
+
+# ---------------------------------------------------------------------------
 # propose
 # ---------------------------------------------------------------------------
 
