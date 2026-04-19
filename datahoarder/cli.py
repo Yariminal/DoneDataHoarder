@@ -226,7 +226,9 @@ def relate(
             f"[yellow]{d['backstop_groups']} backstop[/yellow])"
         )
 
-    summary = do_relate(session_id=session_id, scope=scope, progress_cb=_cb)
+    summary = do_relate(
+        session_id=session_id, scope=scope, model=model, progress_cb=_cb,
+    )
     console.print(
         f"\n[bold green]Relate complete[/bold green] — "
         f"{summary['directories']} dir(s), "

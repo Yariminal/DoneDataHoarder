@@ -506,17 +506,51 @@ def translate_filename(filename: str, target_language: str) -> str:
         return filename
 
 
+_ORIGINAL_PREFIX_RE = re.compile(r"^(?P<num>\d+(?:[._]\d+)*)[\s_.\-]")
+
+
+def _extract_distinguishing_prefix(original_stem: str) -> str | None:
+    """
+    Pull a leading numeric prefix off an original filename stem, slugified
+    for use inside a filename. e.g.
+        '10.8-binoy -1'     -> '10_8'
+        '18.9-binoy -1 (2)' -> '18_9'
+        '3.9-elect-1.3'     -> '3_9'
+        'plan_final'        -> None
+    The leading block must be followed by a separator (space, dash, dot,
+    underscore) to count as a "prefix" and not the whole stem.
+    """
+    m = _ORIGINAL_PREFIX_RE.match(original_stem)
+    if not m:
+        return None
+    return m.group("num").replace(".", "_")
+
+
 def _resolve_collision(
     proposed_path: Path,
     original_path: Path,
     reserved_names: set[Path] | None = None,
 ) -> Path:
     """
-    Resolve filename collisions by adding a counter suffix.
+    Resolve filename collisions, preferring an informative discriminator
+    over a blind counter suffix.
 
     Checks against:
     1. Files already on disk
     2. Previously proposed names in this batch (reserved_names)
+
+    Strategy:
+    - If the original filename had a leading numeric prefix (e.g. `18.9-` or
+      `10.8-binoy`), prepend the slugified prefix to the proposed stem
+      before falling back to `_1, _2, …`. This turns
+          architectural_floor_plan_drawing.pdf  (collision)
+      into
+          18_9_architectural_floor_plan_drawing.pdf
+      which is both distinct AND preserves the original's chronological
+      identity — the prefix is usually a date like "18.9" (Sep 18).
+    - If the prefixed candidate ALSO collides (two files share the same
+      date prefix), fall through to `_N` suffixing on that prefixed base.
+    - If the original has no prefix at all, fall back to plain `_N`.
 
     Args:
         proposed_path: The desired target path
@@ -524,7 +558,7 @@ def _resolve_collision(
         reserved_names: Set of paths already proposed in this batch
 
     Returns:
-        A non-conflicting path (with _1, _2, etc. suffix if needed)
+        A non-conflicting path.
     """
     reserved = reserved_names or set()
 
@@ -532,14 +566,23 @@ def _resolve_collision(
     if (not proposed_path.exists() and proposed_path not in reserved) or proposed_path == original_path:
         return proposed_path
 
-    # Add counter suffix to resolve conflicts
     stem = proposed_path.stem
     ext = proposed_path.suffix
     parent = proposed_path.parent
+
+    # Discriminator fallback before counters: use the original's numeric prefix
+    prefix = _extract_distinguishing_prefix(original_path.stem)
+    if prefix and not stem.startswith(f"{prefix}_"):
+        candidate = parent / f"{prefix}_{stem}{ext}"
+        if (not candidate.exists() and candidate not in reserved) or candidate == original_path:
+            return candidate
+        # Prefixed collision too → base future counters on the prefixed stem
+        stem = f"{prefix}_{stem}"
+
     counter = 1
     while True:
         candidate = parent / f"{stem}_{counter}{ext}"
-        if not candidate.exists() and candidate not in reserved:
+        if (not candidate.exists() and candidate not in reserved) or candidate == original_path:
             return candidate
         counter += 1
 
@@ -807,6 +850,20 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
             counts["sibling_renames"] = sibling_propagated
     except Exception:
         # Best-effort propagation — never break the pipeline if it errors.
+        pass
+
+    # Post-pass 1b: cross-stem propagation via RelationGroup. Rescues clusters
+    # where the exact-stem pass couldn't bridge — e.g. 10.8.dwg + 10.8.bak
+    # grouped with 10.8-binoy -1.pdf (stems differ). Runs AFTER stem-matching
+    # so that easier cases ship with their tighter reasoning and higher
+    # confidence, and BEFORE the useless-stem / hygiene fallbacks so that
+    # group-rescued files never get a low-conf folder-context fallback name.
+    try:
+        group_propagated = _propagate_renames_via_relation_groups(session_id)
+        if group_propagated:
+            counts["group_renames"] = group_propagated
+    except Exception:
+        # Best-effort — never break the pipeline if it errors.
         pass
 
     # Post-pass 2: rescue files that still have a useless stem (1.pdf,
@@ -1211,6 +1268,199 @@ def _propagate_renames_to_siblings(session_id: str | None) -> int:
             ))
             existing_renames.add(f.id)
             created += 1
+
+        if created:
+            session.commit()
+
+    return created
+
+
+def _propagate_renames_via_relation_groups(session_id: str | None) -> int:
+    """
+    Post-pass: propagate renames across RelationGroup members so that an
+    LLM-identified cluster doesn't get half its files renamed and the other
+    half stranded.
+
+    Why we need this on top of `_propagate_renames_to_siblings`:
+        The stem-matching pass only rescues files that share an EXACT stem
+        with a renamed primary. It handles `midul.3dm / midul.3dmbak` because
+        both stems are 'midul'. It fails for clusters like
+            10.8.dwg, 10.8.bak, 10.8-binoy -1.pdf, 10.8-binoy -1.1.pdf
+        where the PDFs get renamed (via the analyzer) but the stems differ
+        (`10.8` vs `10.8-binoy -1`) so the .dwg / .bak never get pulled along.
+
+    Algorithm:
+      1. Pull every RelationGroup for this session with confidence >= 0.5.
+         Backstop groups (0.3) are too noisy — we don't want to propagate
+         renames across every numeric-prefix cluster.
+      2. For each group, find members that already have a RENAME proposal.
+         These are the "primaries" that will anchor the group's new name.
+      3. Pick the canonical new stem from the highest-confidence primary's
+         proposed name (strip any trailing `_N` collision suffix so siblings
+         get the clean base).
+      4. For every un-renamed member in the group, emit a RENAME proposal
+         preserving its extension, suffixed with `_<role>` when the role is
+         not 'source' or 'sibling' (keeps the .dwg / .pdf pair distinct on
+         disk: canonical.dwg + canonical_backup.bak + canonical_export.pdf).
+         Collisions within the group fall back to `_1, _2, …`.
+
+    Returns the number of RENAME proposals created.
+    """
+    if not session_id:
+        return 0
+
+    from datahoarder.db.models import RelationGroup, RelationRole
+    engine = get_engine()
+    created = 0
+    # Lower the bar: LLM groups at 0.8 pass; backstop (0.3) does not.
+    _MIN_CONF = 0.5
+
+    with Session(engine) as session:
+        groups = (
+            session.query(RelationGroup)
+            .filter(
+                RelationGroup.session_id == session_id,
+                RelationGroup.confidence >= _MIN_CONF,
+            )
+            .all()
+        )
+        if not groups:
+            return 0
+
+        # Gather every member file up-front in one query
+        all_file_ids: set[int] = set()
+        for g in groups:
+            all_file_ids.update(m.file_id for m in g.members)
+        if not all_file_ids:
+            return 0
+
+        file_by_id: dict[int, File] = {
+            f.id: f
+            for f in session.query(File)
+            .filter(File.id.in_(all_file_ids))
+            .all()
+        }
+
+        # Pull existing rename proposals for these files, prefer highest-conf
+        existing_renames_by_file: dict[int, Proposal] = {}
+        for p in (
+            session.query(Proposal)
+            .filter(
+                Proposal.file_id.in_(all_file_ids),
+                Proposal.proposal_type == ProposalType.RENAME,
+                Proposal.status.in_([
+                    ProposalStatus.PENDING,
+                    ProposalStatus.APPLIED,
+                ]),
+            )
+            .all()
+        ):
+            prev = existing_renames_by_file.get(p.file_id)
+            if prev is None or (p.confidence or 0) > (prev.confidence or 0):
+                existing_renames_by_file[p.file_id] = p
+
+        # Running reservation set across all groups — prevents two groups
+        # from proposing the same destination path.
+        reserved_paths: set[Path] = set()
+        for pv in (
+            session.query(Proposal.proposed_value)
+            .filter(
+                Proposal.proposal_type == ProposalType.RENAME,
+                Proposal.file_id.in_(all_file_ids),
+            )
+        ):
+            if pv[0]:
+                reserved_paths.add(Path(pv[0]))
+
+        # Strip a trailing collision suffix (`_1`, `_2`, …) so propagation
+        # uses the clean canonical stem. Only strips a SINGLE trailing
+        # `_\d+` to avoid eating intentional version numbers like `_v2`.
+        _COLLISION_RE = re.compile(r"^(?P<base>.+)_\d+$")
+
+        def _clean_stem(stem: str) -> str:
+            m = _COLLISION_RE.match(stem)
+            return m.group("base") if m else stem
+
+        for group in groups:
+            # Members with renames → primaries; without → siblings to fill in
+            primaries: list[tuple[Proposal, File, "RelationRole"]] = []
+            orphans: list[tuple[File, "RelationRole"]] = []
+            for mem in group.members:
+                f = file_by_id.get(mem.file_id)
+                if f is None:
+                    continue
+                role = mem.role
+                p = existing_renames_by_file.get(mem.file_id)
+                if p is not None:
+                    primaries.append((p, f, role))
+                else:
+                    orphans.append((f, role))
+
+            if not primaries or not orphans:
+                continue
+
+            # Pick the best primary as the canonical source of the new stem.
+            # Prefer 'source' role > highest confidence > alphabetical.
+            def _rank(pfr):
+                p, f, role = pfr
+                role_score = 0 if role == RelationRole.SOURCE else 1
+                conf = -(p.confidence or 0.0)
+                return (role_score, conf, f.filename)
+            primaries.sort(key=_rank)
+            best_prop, best_file, _best_role = primaries[0]
+            canonical_stem = _clean_stem(Path(best_prop.proposed_value or "").stem)
+            if not canonical_stem:
+                continue
+
+            for f, role in orphans:
+                path = Path(f.path)
+                ext = path.suffix
+                # Role-based suffix so peer files in the same group still
+                # disambiguate on disk. 'source' keeps the bare stem; all
+                # others append their role name.
+                if role in (RelationRole.SOURCE, RelationRole.SIBLING):
+                    role_suffix = ""
+                else:
+                    role_suffix = f"_{role.value}"
+
+                new_stem = canonical_stem + role_suffix
+                new_name = new_stem + ext
+                if new_name == path.name:
+                    continue
+
+                proposed_path = _resolve_collision(
+                    path.parent / new_name, path, reserved_names=reserved_paths,
+                )
+                reserved_paths.add(proposed_path)
+
+                session.add(Proposal(
+                    file_id=f.id,
+                    proposal_type=ProposalType.RENAME,
+                    current_value=str(path),
+                    proposed_value=str(proposed_path),
+                    reasoning=(
+                        f"RelationGroup propagation — file is in the '{group.label}' "
+                        f"cluster (role={role.value}) alongside '{best_file.filename}'. "
+                        "Inheriting the cluster's canonical name keeps the group "
+                        "visible together after reorganization."
+                    ),
+                    # 0.55 sits between hygiene (0.5) and sibling-stem (0.6):
+                    # group propagation is more speculative than exact-stem
+                    # matching but more grounded than cosmetic hygiene.
+                    confidence=0.55,
+                    status=ProposalStatus.PENDING,
+                ))
+                # Mark the file as having a rename now, so later groups
+                # that also contain it won't double-propose. Use a simple
+                # sentinel proposal — only the file_id key matters.
+                existing_renames_by_file[f.id] = Proposal(
+                    file_id=f.id,
+                    proposal_type=ProposalType.RENAME,
+                    current_value=str(path),
+                    proposed_value=str(proposed_path),
+                    confidence=0.55,
+                )
+                created += 1
 
         if created:
             session.commit()

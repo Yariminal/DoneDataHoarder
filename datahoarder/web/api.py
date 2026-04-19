@@ -1097,11 +1097,26 @@ def trigger_relate(body: PipelineRequest = PipelineRequest()):
     with its .bak backup and PDF exports), falling back to numeric-prefix
     regex clustering if the LLM is unavailable. Writes RelationGroups /
     RelationMembers. Idempotent — re-running wipes and rebuilds groups.
+
+    Relate is filename-only reasoning (no vision), so it uses the session's
+    `propose_model` (reasoning model) rather than `analyze_model` (vision).
+    This is a hard init — previously the step inherited whatever model was
+    last initialised by a prior step, which could be a tiny vision-tuned
+    model incapable of producing valid JSON group output.
     """
+    from datahoarder.ai.router import init_ai
     from datahoarder.core.relate import relate
 
     try:
         sid = _require_session_id(body.session_id)
+        # Relate is a reasoning task — use propose_model (fallback chain in
+        # _resolve_model covers empty / legacy cases).
+        model = _resolve_model(body.model, sid, step="propose")
+        init_ai(
+            backend=body.backend,
+            text_model=model,
+            vision_model=model,
+        )
 
         # Pull the session's relate_scope preference
         scope = "per_directory"
@@ -1110,14 +1125,17 @@ def trigger_relate(body: PipelineRequest = PipelineRequest()):
             if us and getattr(us, "relate_scope", None):
                 scope = us.relate_scope
 
-        summary = relate(session_id=sid, scope=scope)
+        summary = relate(session_id=sid, scope=scope, model=model)
         _mark_session_unsaved(sid, step="relate")
         return {
             "scope": scope,
+            "model": model,
             **summary,
         }
     except HTTPException:
         raise
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
     except Exception as exc:
         raise HTTPException(500, f"Relate failed: {str(exc)}")
 
