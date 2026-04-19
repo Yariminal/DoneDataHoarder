@@ -1078,15 +1078,23 @@ def _propagate_renames_to_siblings(session_id: str | None) -> int:
 
     with Session(engine) as session:
         # Pull every rename proposal in the session joined with its source file
-        # so we know the original stem and directory. Only proposals still in
-        # PENDING status are candidates — applied/rejected ones are history.
+        # so we know the original stem and directory. Both PENDING and APPLIED
+        # primaries count: PENDING covers a single propose run that's about to
+        # ship; APPLIED covers the case where the user already executed the
+        # primary (e.g. ran propose -> apply on PDFs in batch 1, then propose
+        # again later) and the .dwg/.bak siblings need to catch up. The
+        # proposal.current_value still holds the ORIGINAL path even after
+        # apply, so the sibling-stem match still works.
         rename_rows = (
             session.query(Proposal, File)
             .join(File, Proposal.file_id == File.id)
             .filter(
                 File.session_id == session_id,
                 Proposal.proposal_type == ProposalType.RENAME,
-                Proposal.status == ProposalStatus.PENDING,
+                Proposal.status.in_([
+                    ProposalStatus.PENDING,
+                    ProposalStatus.APPLIED,
+                ]),
             )
             .all()
         )
@@ -1109,8 +1117,11 @@ def _propagate_renames_to_siblings(session_id: str | None) -> int:
             return 0
 
         # Pull every non-applied file in the session — sibling candidates may
-        # still be in PENDING / ENRICHED if the analyzer skipped them (common
-        # for .dwg/.bak/.3dmbak/.shx/.ctb, which have no analyzer support).
+        # be at any pre-apply status. SKIPPED is the critical one: the
+        # analyzer auto-marks files with no analyzer (.dwg, .bak, .3dmbak,
+        # .shx, .ctb, .zip, .rar, .log) as SKIPPED, NOT as PENDING. Without
+        # SKIPPED in this filter, sibling propagation never sees the very
+        # files it most needs to rescue.
         files = (
             session.query(File)
             .filter(
@@ -1120,6 +1131,7 @@ def _propagate_renames_to_siblings(session_id: str | None) -> int:
                     FileStatus.ENRICHED,
                     FileStatus.ANALYZED,
                     FileStatus.PROPOSED,
+                    FileStatus.SKIPPED,
                 ]),
             )
             .all()
