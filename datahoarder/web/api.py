@@ -124,6 +124,8 @@ class CreateSessionRequest(BaseModel):
     propose_model: str = ""
     workers: int = 1
     preferred_language: str = "leave_as_is"
+    # "per_directory" (default, cheap) or "cross_directory" (whole-tree relate).
+    relate_scope: str = "per_directory"
 
 
 class SaveSessionRequest(BaseModel):
@@ -179,6 +181,8 @@ def create_session(body: CreateSessionRequest):
             user_session.analyze_model = body.analyze_model or None
         if hasattr(user_session, 'propose_model'):
             user_session.propose_model = body.propose_model or None
+        if hasattr(user_session, 'relate_scope') and body.relate_scope:
+            user_session.relate_scope = body.relate_scope
         session.add(user_session)
         session.commit()
 
@@ -296,6 +300,7 @@ def get_session_detail(session_id: str):
             "propose_model": getattr(user_session, 'propose_model', '') or "",
             "workers": user_session.workers,
             "preferred_language": user_session.preferred_language,
+            "relate_scope": getattr(user_session, 'relate_scope', 'per_directory'),
             "status": user_session.status.value,
             "is_unsaved": user_session.is_unsaved,
             "stats": user_session.stats,
@@ -313,6 +318,7 @@ class UpdateSessionSettingsRequest(BaseModel):
     propose_model: Optional[str] = None
     workers: Optional[int] = None
     preferred_language: Optional[str] = None
+    relate_scope: Optional[str] = None
 
 
 @router.patch("/sessions/{session_id}")
@@ -338,6 +344,8 @@ def update_session_settings(session_id: str, body: UpdateSessionSettingsRequest)
             user_session.workers = body.workers
         if body.preferred_language is not None:
             user_session.preferred_language = body.preferred_language
+        if body.relate_scope is not None and hasattr(user_session, 'relate_scope'):
+            user_session.relate_scope = body.relate_scope
 
         user_session.is_unsaved = True
         user_session.updated_at = datetime.utcnow()
@@ -1080,6 +1088,80 @@ def trigger_dedup(body: PipelineRequest = PipelineRequest()):
         raise
     except Exception as exc:
         raise HTTPException(500, f"Dedup failed: {str(exc)}")
+
+
+@router.post("/pipeline/relate")
+def trigger_relate(body: PipelineRequest = PipelineRequest()):
+    """
+    Run the Relate step: LLM groups conceptually-related files (e.g. a .dwg
+    with its .bak backup and PDF exports), falling back to numeric-prefix
+    regex clustering if the LLM is unavailable. Writes RelationGroups /
+    RelationMembers. Idempotent — re-running wipes and rebuilds groups.
+    """
+    from datahoarder.core.relate import relate
+
+    try:
+        sid = _require_session_id(body.session_id)
+
+        # Pull the session's relate_scope preference
+        scope = "per_directory"
+        with Session(get_engine()) as db:
+            us = db.get(UserSession, sid)
+            if us and getattr(us, "relate_scope", None):
+                scope = us.relate_scope
+
+        summary = relate(session_id=sid, scope=scope)
+        _mark_session_unsaved(sid, step="relate")
+        return {
+            "scope": scope,
+            **summary,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"Relate failed: {str(exc)}")
+
+
+@router.get("/sessions/{session_id}/relations")
+def list_relations(session_id: str):
+    """List RelationGroups (with members) for a session — for UI display."""
+    from datahoarder.db.models import RelationGroup
+    engine = get_engine()
+    with Session(engine) as session:
+        groups = (
+            session.query(RelationGroup)
+            .filter(RelationGroup.session_id == session_id)
+            .order_by(RelationGroup.dir_path, RelationGroup.label)
+            .all()
+        )
+        # Prefetch filenames for every file referenced by any member
+        all_file_ids = {m.file_id for g in groups for m in g.members}
+        filename_by_id: dict[int, str] = {}
+        if all_file_ids:
+            for fid, fname in session.query(File.id, File.filename).filter(
+                File.id.in_(all_file_ids)
+            ):
+                filename_by_id[fid] = fname
+
+        out = []
+        for g in groups:
+            out.append({
+                "id": g.id,
+                "label": g.label,
+                "reason": g.reason,
+                "confidence": g.confidence,
+                "scope": g.scope,
+                "dir_path": g.dir_path,
+                "members": [
+                    {
+                        "file_id": m.file_id,
+                        "filename": filename_by_id.get(m.file_id, "?"),
+                        "role": m.role.value,
+                    }
+                    for m in g.members
+                ],
+            })
+        return {"session_id": session_id, "groups": out}
 
 
 @router.post("/pipeline/analyze")

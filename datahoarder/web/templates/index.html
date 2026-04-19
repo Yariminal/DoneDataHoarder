@@ -618,7 +618,18 @@
           </button>
         </div>
         <div class="pipeline-step">
-          <div class="step-num" :class="{ active: running === 'analyze', 'step-done': isStepDone('analyze') }" x-text="isStepDone('analyze') ? '✓' : '4'"></div>
+          <div class="step-num" :class="{ active: running === 'relate', 'step-done': isStepDone('relate') }" x-text="isStepDone('relate') ? '✓' : '4'"></div>
+          <div class="step-info">
+            <div class="step-name">Relate</div>
+            <div class="step-desc">LLM groups conceptually-related files (CAD source + backups + exports, photo sets, font families)</div>
+          </div>
+          <button class="btn btn-primary btn-sm" :disabled="running || !getSettings().analyzeModel" @click="runStep('relate')"
+                  :title="!getSettings().analyzeModel ? 'Select an analysis model in Setup first' : ''">
+            <span x-text="running === 'relate' ? 'Grouping...' : 'Run'"></span>
+          </button>
+        </div>
+        <div class="pipeline-step">
+          <div class="step-num" :class="{ active: running === 'analyze', 'step-done': isStepDone('analyze') }" x-text="isStepDone('analyze') ? '✓' : '5'"></div>
           <div class="step-info">
             <div class="step-name">Analyze</div>
             <div class="step-desc">AI analysis (vision + text) of all files</div>
@@ -654,7 +665,7 @@
           </div>
         </div>
         <div class="pipeline-step">
-          <div class="step-num" :class="{ active: running === 'propose', 'step-done': isStepDone('propose') }" x-text="isStepDone('propose') ? '✓' : '5'"></div>
+          <div class="step-num" :class="{ active: running === 'propose', 'step-done': isStepDone('propose') }" x-text="isStepDone('propose') ? '✓' : '6'"></div>
           <div class="step-info">
             <div class="step-name">Propose</div>
             <div class="step-desc">Generate rename/tag proposals</div>
@@ -664,7 +675,7 @@
           </button>
         </div>
         <div class="pipeline-step">
-          <div class="step-num" :class="{ active: running === 'organize', 'step-done': isStepDone('organize') }" x-text="isStepDone('organize') ? '✓' : '6'"></div>
+          <div class="step-num" :class="{ active: running === 'organize', 'step-done': isStepDone('organize') }" x-text="isStepDone('organize') ? '✓' : '7'"></div>
           <div class="step-info">
             <div class="step-name">Organize</div>
             <div class="step-desc">AI suggests folder reorganization based on file analysis</div>
@@ -677,7 +688,7 @@
         <div class="sidebar-sep" style="margin:4px 0"></div>
 
         <div class="pipeline-step">
-          <div class="step-num" :class="{ 'step-done': isStepDone('execute') }" x-text="isStepDone('execute') ? '✓' : '7'"></div>
+          <div class="step-num" :class="{ 'step-done': isStepDone('execute') }" x-text="isStepDone('execute') ? '✓' : '8'"></div>
           <div class="step-info">
             <div class="step-name">Execute</div>
             <div class="step-desc">Apply approved proposals to disk</div>
@@ -817,6 +828,13 @@
           </select>
           <div></div>
           <p class="text-dim text-sm">Optionally translate proposed filenames during the Propose step. Helps unify language across mixed-language collections.</p>
+          <label class="text-sm">Relate Scope</label>
+          <select class="input" x-model="relateScope" @change="saveSettings()">
+            <option value="per_directory">Per-directory (default)</option>
+            <option value="cross_directory">Cross-directory (whole tree)</option>
+          </select>
+          <div></div>
+          <p class="text-dim text-sm">Per-directory is cheaper and catches most clusters. Cross-directory sends every filename in one LLM call — useful when related files are spread across folders.</p>
         </div>
       </div>
 

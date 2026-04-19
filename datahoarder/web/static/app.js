@@ -41,6 +41,7 @@ document.addEventListener('alpine:init', () => {
     skip_dirs: [],
     workers: 1,
     preferred_language: 'leave_as_is',
+    relate_scope: 'per_directory',
     stats: {},
     file_count: 0,
     proposal_count: 0,
@@ -88,6 +89,7 @@ document.addEventListener('alpine:init', () => {
       this.propose_model = data.propose_model || '';
       this.workers = data.workers || 1;
       this.preferred_language = data.preferred_language || 'leave_as_is';
+      this.relate_scope = data.relate_scope || 'per_directory';
       this.stats = data.stats || {};
       this.file_count = data.file_count || 0;
       this.proposal_count = data.proposal_count || 0;
@@ -216,6 +218,7 @@ document.addEventListener('alpine:init', () => {
           model: '',
           workers: 1,
           preferred_language: localStorage.getItem('datahoarder_preferred_language') || 'leave_as_is',
+          relate_scope: localStorage.getItem('datahoarder_relate_scope') || 'per_directory',
         });
         Alpine.store('session').loadFrom(data);
         // Clear localStorage so new session doesn't inherit old settings
@@ -245,6 +248,7 @@ document.addEventListener('alpine:init', () => {
         if (data.backend) localStorage.setItem('datahoarder_backend', data.backend);
         if (data.workers) localStorage.setItem('datahoarder_workers', String(data.workers));
         if (data.preferred_language) localStorage.setItem('datahoarder_preferred_language', data.preferred_language);
+        if (data.relate_scope) localStorage.setItem('datahoarder_relate_scope', data.relate_scope);
         Alpine.store('app').tab = 'dashboard';
         Alpine.store('app').toast(`Loaded session: ${data.name || 'Unnamed Session'}`, 'success');
         // Refresh all data tabs
@@ -659,6 +663,7 @@ document.addEventListener('alpine:init', () => {
     selectedWorkers: parseInt(localStorage.getItem('datahoarder_workers') || '1', 10),
     numParallel: parseInt(localStorage.getItem('datahoarder_num_parallel') || '1', 10),
     preferredLanguage: localStorage.getItem('datahoarder_preferred_language') || 'leave_as_is',
+    relateScope: localStorage.getItem('datahoarder_relate_scope') || 'per_directory',
     customModel: '',
     showCustomModel: false,
     showBrowser: false,
@@ -791,6 +796,7 @@ document.addEventListener('alpine:init', () => {
       localStorage.setItem('datahoarder_workers', String(this.selectedWorkers));
       localStorage.setItem('datahoarder_num_parallel', String(this.numParallel));
       localStorage.setItem('datahoarder_preferred_language', this.preferredLanguage);
+      localStorage.setItem('datahoarder_relate_scope', this.relateScope);
       // Sync to session store and persist to backend
       const session = Alpine.store('session');
       if (session.active) {
@@ -801,6 +807,7 @@ document.addEventListener('alpine:init', () => {
         session.backend = this.selectedBackend;
         session.workers = this.selectedWorkers;
         session.preferred_language = this.preferredLanguage;
+        session.relate_scope = this.relateScope;
         // Persist to DB
         api.patch(`/sessions/${session.current_session_id}`, {
           root_path: this.selectedFolder,
@@ -810,6 +817,7 @@ document.addEventListener('alpine:init', () => {
           propose_model: this.selectedProposeModel,
           workers: this.selectedWorkers,
           preferred_language: this.preferredLanguage,
+          relate_scope: this.relateScope,
         }).catch(() => {}); // fire-and-forget
       }
     },
@@ -1154,6 +1162,13 @@ document.addEventListener('alpine:init', () => {
             const exactGroups = data.exact?.groups || 0;
             const percGroups = data.perceptual?.groups || 0;
             Alpine.store('app').toast(`Dedup complete: ${exactGroups} exact + ${percGroups} perceptual groups`, 'success');
+            break;
+          case 'relate':
+            data = await api.post('/pipeline/relate', { session_id: settings.session_id });
+            Alpine.store('app').toast(
+              `Relate complete: ${data.groups || 0} groups (${data.llm_groups || 0} LLM + ${data.backstop_groups || 0} backstop) across ${data.directories || 0} dirs`,
+              'success',
+            );
             break;
           case 'analyze':
             if (!settings.analyzeModel || settings.analyzeModel === '') {
