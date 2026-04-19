@@ -1005,6 +1005,20 @@ def generate_reorg_proposals(session_id: str) -> dict:
 
         db.commit()
 
+    # Post-pass: emit per-cluster MOVE proposals for high-confidence
+    # RelationGroups. For each LLM-reasoned group (confidence >= 0.5) we
+    # create a new subfolder `<label>/` inside the group's common parent and
+    # move all members into it. Backstop groups (confidence 0.3) are skipped
+    # — numeric-prefix clusters are too noisy to auto-folder.
+    try:
+        cluster_moves = _emit_relation_group_moves(session_id, root_path)
+        if cluster_moves:
+            counts["cluster_moves"] = cluster_moves
+            counts["move"] = counts.get("move", 0) + cluster_moves
+    except Exception:
+        # Best-effort — never break the pipeline if cluster moves fail.
+        pass
+
     # Deterministic backstop: detect mojibake-encoded folder names and ensure
     # they always get a RENAME_FOLDER proposal, even if the LLM missed them.
     # The LLM only sees the garbled string in its prompt (it can't access the
@@ -1021,6 +1035,164 @@ def generate_reorg_proposals(session_id: str) -> dict:
         pass
 
     return counts
+
+
+def _emit_relation_group_moves(session_id: str, root_path: str) -> int:
+    """
+    For each high-confidence RelationGroup, emit MOVE proposals that place
+    every member into a `<label>/` subfolder under their common parent.
+
+    Rules:
+    - Only groups with confidence >= 0.5 (LLM-reasoned) participate; backstop
+      groups at 0.3 are too noisy (they'd create a subfolder per date prefix).
+    - Group members must share a common parent directory. Cross-directory
+      groups are skipped — we don't want to pull files out of their enclosing
+      project folder just because they're conceptually related.
+    - The target folder name is the group's `label` (already slugified by the
+      Relate step). Collisions with existing folders get `_2`, `_3`, …
+      appended.
+    - Files that already have a MOVE or RENAME_FOLDER proposal are skipped
+      so we don't double-propose.
+    - The destination filename is the CURRENT filename (or the one the Namer
+      proposed, if there's a pending RENAME). This keeps Namer and Organizer
+      proposals composable at execute time.
+
+    Returns the number of MOVE proposals created.
+    """
+    from datahoarder.db.models import RelationGroup, RelationMember
+    engine = get_engine()
+    created = 0
+    _MIN_CONF = 0.5
+
+    with Session(engine) as db:
+        groups = (
+            db.query(RelationGroup)
+            .filter(
+                RelationGroup.session_id == session_id,
+                RelationGroup.confidence >= _MIN_CONF,
+            )
+            .all()
+        )
+        if not groups:
+            return 0
+
+        # Gather every member file up-front
+        all_file_ids: set[int] = set()
+        for g in groups:
+            all_file_ids.update(m.file_id for m in g.members)
+        if not all_file_ids:
+            return 0
+
+        file_by_id: dict[int, File] = {
+            f.id: f
+            for f in db.query(File).filter(File.id.in_(all_file_ids)).all()
+        }
+
+        # Files that already have a MOVE proposal — leave them alone.
+        existing_moves: set[int] = {
+            fid
+            for (fid,) in db.query(Proposal.file_id).filter(
+                Proposal.file_id.in_(all_file_ids),
+                Proposal.proposal_type == ProposalType.MOVE,
+            )
+        }
+
+        # Pending RENAME proposals by file_id so the MOVE target uses the
+        # renamed filename (preserves Namer's work when both apply at execute).
+        rename_by_file: dict[int, str] = {}
+        for p in (
+            db.query(Proposal)
+            .filter(
+                Proposal.file_id.in_(all_file_ids),
+                Proposal.proposal_type == ProposalType.RENAME,
+                Proposal.status.in_([
+                    ProposalStatus.PENDING,
+                    ProposalStatus.APPLIED,
+                ]),
+            )
+        ):
+            if p.proposed_value:
+                rename_by_file[p.file_id] = Path(p.proposed_value).name
+
+        # Reserved dest paths across all groups — avoids two clusters in the
+        # same parent from trying to move a file into colliding subfolders.
+        reserved_dests: set[Path] = set()
+
+        for group in groups:
+            members = [
+                file_by_id[m.file_id]
+                for m in group.members
+                if m.file_id in file_by_id
+            ]
+            if len(members) < 2:
+                continue
+
+            # Require a single common parent — skip cross-directory groups.
+            parents = {str(Path(f.path).parent) for f in members}
+            if len(parents) != 1:
+                continue
+            parent = Path(parents.pop())
+
+            # Pick target subfolder name, avoiding collisions with existing
+            # dirs in this parent. `label` was slugified at Relate time.
+            base_name = group.label or "cluster"
+            target_dir = parent / base_name
+            n = 2
+            while target_dir.exists() and not target_dir.is_dir():
+                target_dir = parent / f"{base_name}_{n}"
+                n += 1
+
+            # At least one member must still be inside `parent` on disk —
+            # if they've all been moved elsewhere by earlier proposals we
+            # skip so we don't resurrect stale paths.
+            for member in members:
+                if member.id in existing_moves:
+                    continue
+                src_path = Path(member.path)
+                if src_path.parent != parent:
+                    # Group spans multiple dirs on disk (e.g. folder-rename
+                    # already reshuffled some members) — leave alone.
+                    continue
+                # Destination filename: prefer pending RENAME's value if any,
+                # otherwise the current basename.
+                dst_filename = rename_by_file.get(member.id, src_path.name)
+                dst_path = target_dir / dst_filename
+                # Resolve dest-level collisions (two members mapped to same
+                # filename after rename) by appending `_2`, `_3`, …
+                if dst_path in reserved_dests:
+                    stem, suffix = dst_path.stem, dst_path.suffix
+                    k = 2
+                    while True:
+                        cand = target_dir / f"{stem}_{k}{suffix}"
+                        if cand not in reserved_dests:
+                            dst_path = cand
+                            break
+                        k += 1
+                reserved_dests.add(dst_path)
+
+                if str(src_path) == str(dst_path):
+                    continue
+
+                db.add(Proposal(
+                    file_id=member.id,
+                    proposal_type=ProposalType.MOVE,
+                    current_value=str(src_path),
+                    proposed_value=str(dst_path),
+                    reasoning=(
+                        f"Cluster move — member of RelationGroup '{group.label}' "
+                        f"(confidence {group.confidence:.2f}): "
+                        f"{(group.reason or '').strip()[:200]}"
+                    ),
+                    confidence=float(group.confidence or 0.5),
+                    status=ProposalStatus.PENDING,
+                ))
+                existing_moves.add(member.id)
+                created += 1
+
+        if created:
+            db.commit()
+
+    return created
 
 
 def _backstop_mojibake_folders(session_id: str, root_path: str) -> int:

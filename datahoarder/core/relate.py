@@ -194,10 +194,15 @@ def _call_llm_for_group(
     client,
     dir_label: str,
     files: list[File],
+    model: Optional[str] = None,
 ) -> list[dict]:
     """
     One LLM call. Returns parsed groups (already validated) or [] on failure.
     Each group dict has keys: label, reason, members:[{filename, role}].
+
+    When `model` is provided, it is passed explicitly to `generate_json` so
+    the Relate step doesn't inherit the last-initialised model (which may be
+    a vision model unsuited for structured-JSON reasoning).
     """
     if len(files) < 2:
         return []
@@ -212,21 +217,37 @@ def _call_llm_for_group(
 
     try:
         # generate_json returns whatever the LLM emitted (array or dict).
-        raw = client.generate_json(
-            user_prompt,
-            system=RELATE_SYSTEM_PROMPT,
-            temperature=0.0,
-            seed=42,
-        )
+        kwargs = {
+            "system": RELATE_SYSTEM_PROMPT,
+            "temperature": 0.0,
+            "seed": 42,
+        }
+        if model:
+            kwargs["model"] = model
+        raw = client.generate_json(user_prompt, **kwargs)
     except Exception as exc:
-        logger.warning("Relate LLM call failed for %s: %s", dir_label, exc)
+        logger.warning("Relate LLM call failed for %s (model=%s): %s",
+                       dir_label, model, exc)
         return []
 
     # Expected: list[dict]. Accept {"groups": [...]} wrapping too.
     if isinstance(raw, dict):
+        # Some clients wrap a fallback raw_response when parsing fails —
+        # log it so the caller can see what the model actually returned.
+        if "raw_response" in raw and not (raw.get("groups") or raw.get("result")):
+            logger.warning(
+                "Relate LLM for %s returned unparseable output (model=%s): %s",
+                dir_label, model, str(raw.get("raw_response"))[:300],
+            )
         raw = raw.get("groups") or raw.get("result") or []
     if not isinstance(raw, list):
+        logger.warning(
+            "Relate LLM for %s returned non-list (%s) — will backstop (model=%s)",
+            dir_label, type(raw).__name__, model,
+        )
         return []
+    if not raw:
+        logger.info("Relate LLM for %s returned empty list (model=%s)", dir_label, model)
 
     # Validate + normalize
     known_filenames = {f.filename: f for f in files}
@@ -356,6 +377,7 @@ def relate(
     session_id: str,
     scope: str = "per_directory",
     client=None,
+    model: Optional[str] = None,
     progress_cb: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     """
@@ -366,6 +388,10 @@ def relate(
         scope: "per_directory" (one LLM call per dir) or "cross_directory"
                (one LLM call for the whole tree).
         client: optional injected LLM client. If None, uses ai.router.get_client().
+        model:  optional explicit model tag (e.g. "gemma3:12b") passed to every
+                LLM call. Overrides the client's default text_model. Use this
+                when the caller needs a reasoning-capable model regardless of
+                which model was last initialised via init_ai().
         progress_cb: optional callback invoked with {"dir": str, "done": N, "total": M}
                      after each directory is processed.
 
@@ -444,7 +470,9 @@ def relate(
                 for chunk in _chunk(dir_files, MAX_FILES_PER_CALL):
                     if len(chunk) < 2:
                         continue
-                    llm_groups.extend(_call_llm_for_group(client, dir_label, chunk))
+                    llm_groups.extend(
+                        _call_llm_for_group(client, dir_label, chunk, model=model)
+                    )
 
             # Deduplicate labels across all groups from this unit
             _deduplicate_labels(llm_groups)
