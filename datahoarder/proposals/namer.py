@@ -76,6 +76,48 @@ def _is_useless_stem(stem: str) -> bool:
     return any(p.match(s) for p in _USELESS_STEM_PATTERNS)
 
 
+# Proposed stems that describe only a content-type with no unique identity.
+# When the vision model looks at a bare architectural floor plan PDF it
+# frequently suggests one of these as the entire stem — which is useless if
+# the same directory contains three more PDFs with the same classification.
+# The disambiguation post-pass force-prefixes every such proposal with the
+# original filename's numeric prefix (date stamp). Tokens are matched on the
+# lowercased proposed stem after stripping any leading digit/underscore run.
+_GENERIC_STEM_TOKENS: frozenset[str] = frozenset({
+    "drawing", "document", "scan", "sheet", "elevation", "layout", "plan",
+    "floor_plan", "site_plan",
+    "section_drawing", "floor_plan_drawing", "floor_plan_layout",
+    "floor_plan_layout_drawing",
+    "architectural_drawing", "architectural_floor_plan",
+    "architectural_floor_plan_drawing", "architectural_floor_plan_layout",
+    "architectural_floor_plan_section_drawing",
+    "architectural_floor_plan_unit_layout",
+    "architectural_floor_plan_ceiling_niches",
+    "architectural_floor_plans_and_elevations",
+    "architectural_roof_plan_drawing",
+    "architectural_section_plan_drawing",
+    "architectural_structural_plan_section",
+    "architectural_installation_plan",
+    "structural_plan_drawing", "structural_section_drawing",
+    "building_floor_plans_and_elevations", "building_floor_plans",
+    "floor_plan_entrance_level",
+    "floor_plan_architectural_drawing",
+})
+
+
+def _stem_generic_signature(stem: str) -> str:
+    """
+    Reduce a stem to a signature useful for same-type detection across files.
+    Strips any leading numeric-run-plus-separator (e.g. the '10_8_' prefix),
+    lowercases, and normalises hyphens to underscores. Two proposals whose
+    signatures match describe the same content type.
+    """
+    s = stem.lower().replace("-", "_")
+    # Strip leading digit-run-plus-underscore groups, e.g. "10_8_" or "3_9_"
+    s = re.sub(r"^(?:\d+(?:[._]\d+)*_)+", "", s)
+    return s
+
+
 def _folder_context_fallback(file_rec: File) -> Optional[str]:
     """
     Last-resort name when the stem is useless AND the AI gave us nothing.
@@ -526,6 +568,40 @@ def _extract_distinguishing_prefix(original_stem: str) -> str | None:
     return m.group("num").replace(".", "_")
 
 
+def _ensure_prefix(stem: str, original_stem: str) -> str:
+    """
+    If the original filename had a distinguishing numeric prefix (e.g. "10.8"),
+    make sure the proposed stem still carries it. The prefix is the single
+    most-reliable identity anchor for date-stamped CAD/submission workflows,
+    and the AI rename layer often drops it in favour of a descriptive stem
+    like "floor_plan_drawing" — which collides with every other floor plan
+    in the same directory.
+
+    Idempotent: safe to call on stems that already start with the prefix
+    (in either dot or underscore form, with `_` or `-` separator).
+
+    Examples:
+        ('floor_plan_drawing', '10.8-binoy -1') -> '10_8_floor_plan_drawing'
+        ('10_8_foo',           '10.8-binoy -1') -> '10_8_foo'        (already)
+        ('10.8-foo',           '10.8-binoy -1') -> '10.8-foo'        (already)
+        ('foo',                'plan_final')    -> 'foo'             (no prefix)
+    """
+    prefix = _extract_distinguishing_prefix(original_stem)
+    if not prefix:
+        return stem
+    dot_form = prefix.replace("_", ".")
+    if (
+        stem.startswith(f"{prefix}_")
+        or stem.startswith(f"{prefix}-")
+        or stem.startswith(f"{dot_form}_")
+        or stem.startswith(f"{dot_form}-")
+        or stem == prefix
+        or stem == dot_form
+    ):
+        return stem
+    return f"{prefix}_{stem}"
+
+
 def _resolve_collision(
     proposed_path: Path,
     original_path: Path,
@@ -791,6 +867,16 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
                         if preferred_language != "leave_as_is":
                             new_name = translate_filename(new_name, preferred_language)
 
+                        # Preserve the original's distinguishing numeric prefix
+                        # (e.g. "10.8" date stamp) even when the AI-proposed
+                        # stem drops it. Without this, every PDF in a
+                        # date-prefixed project folder becomes
+                        # "architectural_floor_plan_drawing.pdf" and collides.
+                        new_stem = Path(new_name).stem
+                        prefixed_stem = _ensure_prefix(new_stem, path.stem)
+                        if prefixed_stem != new_stem:
+                            new_name = f"{prefixed_stem}{Path(new_name).suffix}"
+
                         proposed_path = _resolve_collision(
                             path.parent / new_name, path, reserved_names=reserved_names
                         )
@@ -852,6 +938,20 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
         # Best-effort propagation — never break the pipeline if it errors.
         pass
 
+    # Post-pass 1a: disambiguate generic-typed AI proposals by prepending the
+    # original filename's distinguishing numeric prefix. Catches the case
+    # where the vision model emits "architectural_floor_plan_drawing.pdf" for
+    # every PDF in a date-prefixed CAD project folder. MUST run BEFORE the
+    # RelationGroup propagation pass so group-rescued siblings pick up the
+    # already-disambiguated stem from the group's renamed primary.
+    try:
+        disambiguated = _disambiguate_generic_stems_in_dir(session_id)
+        if disambiguated:
+            counts["disambiguated"] = disambiguated
+    except Exception:
+        # Best-effort pass — never break the pipeline if it errors.
+        pass
+
     # Post-pass 1b: cross-stem propagation via RelationGroup. Rescues clusters
     # where the exact-stem pass couldn't bridge — e.g. 10.8.dwg + 10.8.bak
     # grouped with 10.8-binoy -1.pdf (stems differ). Runs AFTER stem-matching
@@ -900,6 +1000,18 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
             counts["spelling_normalized"] = spelling_fixed
     except Exception:
         # Normalisation is best-effort — never break the pipeline if it fails.
+        pass
+
+    # Post-pass 5: flag near-duplicate pending renames. Catches pairs like
+    # `3.8 binoy -1.pdf` / `3.8-binoy -1.pdf` where exact-hash dedup missed
+    # because bytes differ slightly but filename + extension + size all match.
+    # Runs LAST so the canonical file's final proposed_value is stable.
+    try:
+        nd_flagged = _flag_near_duplicate_proposals(session_id)
+        if nd_flagged:
+            counts["near_duplicates_flagged"] = nd_flagged
+    except Exception:
+        # Best-effort — never break the pipeline if it errors.
         pass
 
     return counts
@@ -1273,6 +1385,235 @@ def _propagate_renames_to_siblings(session_id: str | None) -> int:
             session.commit()
 
     return created
+
+
+def _disambiguate_generic_stems_in_dir(session_id: str | None) -> int:
+    """
+    Post-pass: find PENDING RENAME proposals landing in the same target
+    directory whose proposed stem is a generic content-type token (see
+    `_GENERIC_STEM_TOKENS`), or whose type-signature collides with another
+    proposal's type-signature in the same directory. For each such proposal,
+    force-prepend the distinguishing numeric prefix derived from the ORIGINAL
+    filename stem. Re-runs collision resolution so the final name remains
+    unique on disk and within the session's proposal batch.
+
+    Without this pass, a folder containing `10.8.pdf`, `17.8.pdf`, `18.9.pdf`
+    frequently ends up with three proposals all named
+    `architectural_floor_plan_drawing.pdf` and the user only gets to keep
+    one (the rest collide and get `_1, _2` suffixed — losing the date ID).
+
+    Runs AFTER the main loop so it sees all AI-proposed stems, and BEFORE
+    the RelationGroup post-pass so group-rescued clusters pick up the
+    disambiguated names from their primaries.
+
+    Returns the number of proposals rewritten.
+    """
+    if not session_id:
+        return 0
+
+    engine = get_engine()
+    rewritten = 0
+
+    with Session(engine) as session:
+        # Pull all PENDING RENAME proposals for files in this session
+        proposals = (
+            session.query(Proposal)
+            .join(File, File.id == Proposal.file_id)
+            .filter(
+                File.session_id == session_id,
+                Proposal.status == ProposalStatus.PENDING,
+                Proposal.proposal_type == ProposalType.RENAME,
+            )
+            .all()
+        )
+        if not proposals:
+            return 0
+
+        # Build lookup: proposal -> (original Path, proposed Path)
+        pairs: list[tuple[Proposal, Path, Path]] = []
+        file_by_id: dict[int, File] = {
+            f.id: f for f in session.query(File).filter(
+                File.id.in_({p.file_id for p in proposals})
+            )
+        }
+        for p in proposals:
+            f = file_by_id.get(p.file_id)
+            if not f:
+                continue
+            orig = Path(f.path)
+            proposed = Path(p.proposed_value) if p.proposed_value else None
+            if proposed is None:
+                continue
+            pairs.append((p, orig, proposed))
+
+        # Group by target parent directory
+        by_dir: dict[Path, list[tuple[Proposal, Path, Path]]] = {}
+        for entry in pairs:
+            by_dir.setdefault(entry[2].parent, []).append(entry)
+
+        # Collect existing proposed paths per directory so we can reserve
+        # them when re-running collision resolution.
+        for parent, entries in by_dir.items():
+            # Signature -> list of entries with that signature
+            by_sig: dict[str, list[tuple[Proposal, Path, Path]]] = {}
+            for e in entries:
+                sig = _stem_generic_signature(e[2].stem)
+                by_sig.setdefault(sig, []).append(e)
+
+            # Also collect the set of proposed paths so collision resolution
+            # can avoid stepping on siblings we are NOT rewriting.
+            reserved_in_dir: set[Path] = {e[2] for e in entries}
+
+            for sig, sig_entries in by_sig.items():
+                is_generic = sig in _GENERIC_STEM_TOKENS
+                is_collision = len(sig_entries) >= 2
+                if not (is_generic or is_collision):
+                    continue
+
+                for proposal, orig_path, proposed_path in sig_entries:
+                    prefix = _extract_distinguishing_prefix(orig_path.stem)
+                    if not prefix:
+                        continue  # nothing to prepend
+                    current_stem = proposed_path.stem
+                    new_stem = _ensure_prefix(current_stem, orig_path.stem)
+                    if new_stem == current_stem:
+                        continue  # already prefixed — nothing to do
+
+                    candidate = proposed_path.with_name(
+                        f"{new_stem}{proposed_path.suffix}"
+                    )
+                    # Remove the OLD proposed path from the reserved set so
+                    # re-resolving doesn't see our own previous name.
+                    reserved_in_dir.discard(proposed_path)
+                    final = _resolve_collision(
+                        candidate, orig_path, reserved_names=reserved_in_dir,
+                    )
+                    reserved_in_dir.add(final)
+
+                    proposal.proposed_value = str(final)
+                    rewritten += 1
+
+        if rewritten:
+            session.commit()
+
+    return rewritten
+
+
+def _flag_near_duplicate_proposals(session_id: str | None) -> int:
+    """
+    Post-pass: for PENDING RENAME proposals in the same parent directory
+    whose target stems are highly similar (difflib ratio >= 0.92) AND share
+    extension AND share byte size, reject the later-mtime file's RENAME and
+    emit a MARK_DUPLICATE proposal pointing at the earlier-mtime file. This
+    catches near-duplicates like `3.8 binoy -1.pdf` and `3.8-binoy -1.pdf`
+    (same content, different separators) that the exact-hash dedup step
+    missed because the bytes aren't byte-identical.
+
+    The earlier-mtime file keeps its RENAME — it is treated as canonical.
+    The later-mtime file's RENAME is marked REJECTED with a user note
+    explaining the duplication; a new MARK_DUPLICATE proposal records the
+    link for the review UI.
+
+    Returns the number of files flagged as duplicates.
+    """
+    import difflib
+
+    if not session_id:
+        return 0
+
+    engine = get_engine()
+    flagged = 0
+
+    with Session(engine) as session:
+        proposals = (
+            session.query(Proposal)
+            .join(File, File.id == Proposal.file_id)
+            .filter(
+                File.session_id == session_id,
+                Proposal.status == ProposalStatus.PENDING,
+                Proposal.proposal_type == ProposalType.RENAME,
+            )
+            .all()
+        )
+        if len(proposals) < 2:
+            return 0
+
+        file_by_id: dict[int, File] = {
+            f.id: f for f in session.query(File).filter(
+                File.id.in_({p.file_id for p in proposals})
+            )
+        }
+
+        # Group by (parent_dir, extension, size_bytes) — three exact-match
+        # gates before we spend any similarity work.
+        from collections import defaultdict
+        buckets: dict[tuple[str, str, Optional[int]], list[tuple[Proposal, File]]] = defaultdict(list)
+        for p in proposals:
+            f = file_by_id.get(p.file_id)
+            if not f:
+                continue
+            try:
+                orig = Path(f.path)
+            except Exception:
+                continue
+            key = (str(orig.parent), orig.suffix.lower(), f.size_bytes)
+            buckets[key].append((p, f))
+
+        # Existing MARK_DUPLICATE proposals to avoid double-emitting
+        existing_mark_dup: set[int] = {
+            p.file_id for p in session.query(Proposal)
+            .join(File, File.id == Proposal.file_id)
+            .filter(
+                File.session_id == session_id,
+                Proposal.proposal_type == ProposalType.MARK_DUPLICATE,
+            )
+        }
+
+        for key, bucket in buckets.items():
+            if len(bucket) < 2:
+                continue
+            # Sort by modified_at ascending — earliest file is canonical.
+            # Missing mtime sorts last so a file with unknown mtime never
+            # overrides one with a known mtime.
+            bucket.sort(key=lambda pf: pf[1].modified_at or datetime.max)
+
+            canonical_prop, canonical_file = bucket[0]
+            canonical_stem = Path(canonical_file.path).stem.lower()
+
+            for dup_prop, dup_file in bucket[1:]:
+                if dup_file.id in existing_mark_dup:
+                    continue
+                dup_stem = Path(dup_file.path).stem.lower()
+                ratio = difflib.SequenceMatcher(None, canonical_stem, dup_stem).ratio()
+                if ratio < 0.92:
+                    continue
+
+                dup_prop.status = ProposalStatus.REJECTED
+                dup_prop.user_notes = (
+                    f"Auto-rejected: near-duplicate of "
+                    f"'{canonical_file.filename}' "
+                    f"(stem similarity {ratio:.2f}, same size and extension)."
+                )
+                session.add(Proposal(
+                    file_id=dup_file.id,
+                    proposal_type=ProposalType.MARK_DUPLICATE,
+                    current_value=str(dup_file.path),
+                    proposed_value=str(canonical_file.path),
+                    reasoning=(
+                        f"Near-duplicate stem (ratio {ratio:.2f}) "
+                        f"with identical size and extension. "
+                        f"Canonical: {canonical_file.filename}"
+                    ),
+                    confidence=0.7,
+                    status=ProposalStatus.PENDING,
+                ))
+                existing_mark_dup.add(dup_file.id)
+                flagged += 1
+
+        if flagged:
+            session.commit()
+
+    return flagged
 
 
 def _propagate_renames_via_relation_groups(session_id: str | None) -> int:

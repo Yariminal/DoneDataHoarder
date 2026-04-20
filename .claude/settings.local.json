@@ -151,7 +151,8 @@
       "Bash(taskkill //PID 17560 //F)",
       "Bash(curl -s http://127.0.0.1:8082/api/info)",
       "Bash(/c/Users/yarim/Desktop/Projects/DoneDataHoarder/.venv/Scripts/python -m pip show datahoarder)",
-      "Bash(/c/Users/yarim/Desktop/Projects/DoneDataHoarder/.venv/Scripts/python -m pip install -e . --upgrade --quiet)"
+      "Bash(/c/Users/yarim/Desktop/Projects/DoneDataHoarder/.venv/Scripts/python -m pip install -e . --upgrade --quiet)",
+      "Bash(python -c \"from datahoarder.core import scanner; print\\('ok:', scanner.SKIP_FILENAMES, len\\(scanner.SKIP_EXTENSIONS\\)\\)\")"
     ]
   }
 }

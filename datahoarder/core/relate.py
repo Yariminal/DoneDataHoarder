@@ -243,6 +243,363 @@ def _merge_groups_by_prefix(groups: list[dict]) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Cross-script / canonical-token pass (Hebrew ↔ English and synonyms)
+# ---------------------------------------------------------------------------
+
+# A bilingual LLM prompt asks the model to emit a canonical English token for
+# each filename then cluster by matching tokens. This catches cases no purely
+# lexical method can: `מידול.dwg` and `midul.3dm` both canonicalise to
+# "modeling" and should cluster; `Plans.pdf` and `drawings.pdf` both hit
+# "plan" and cluster. Strict JSON schema, same shape as the primary prompt.
+CROSS_SCRIPT_SYSTEM_PROMPT = """\
+You are a filename clustering assistant for a digital archivist.
+
+Each filename you are shown is a SINGLETON — it is not part of any existing
+group from a previous pass. Your job: identify singletons that describe the
+SAME subject in different languages, scripts, or synonym words, and group
+them together.
+
+For each filename, mentally compute a canonical English "subject token"
+(1–3 words, lowercase, snake_case) — what is this file ABOUT, independent
+of language. Examples:
+    'מידול.dwg'                     -> 'modeling'
+    'midul.3dm'                     -> 'modeling'
+    'Plans_rev3.pdf'                -> 'plans'
+    'drawings_final.pdf'            -> 'plans'
+    'Fonts.rar'                     -> 'fonts'
+    'font_library.zip'              -> 'fonts'
+
+Then group filenames whose canonical tokens MATCH. A group needs ≥2 members.
+Do NOT invent filenames. Do NOT group by file type alone (two PDFs is not a
+group). Group only when the subject MATCHES.
+
+Return STRICT JSON: an array of groups, same schema as the primary pass.
+[
+  {
+    "label": "short_snake_case_slug (<=40 chars)",
+    "reason": "one sentence explaining the canonical token",
+    "members": [
+      {"filename": "exact_filename.ext", "role": "sibling"}
+    ]
+  }
+]
+If no cross-script / synonym clusters exist, return [].
+"""
+
+# Confidence for cross-script groups: between main-LLM (0.8) and backstop
+# (0.3). Lower than main-LLM because the cluster is weaker evidence (single
+# subject-token match), higher than backstop because it came from LLM
+# reasoning not a regex.
+CROSS_SCRIPT_CONFIDENCE = 0.6
+
+# Budget guards for the cross-script pass
+CROSS_SCRIPT_MIN_SINGLETONS = 5
+CROSS_SCRIPT_MAX_SINGLETONS = 2000
+
+
+def _call_llm_cross_script(
+    client,
+    files: list[File],
+    model: Optional[str] = None,
+) -> list[dict]:
+    """One cross-script LLM call on a chunk of singletons."""
+    if len(files) < 2:
+        return []
+
+    user_prompt_lines = [
+        f"Singleton filenames ({len(files)}):",
+    ]
+    user_prompt_lines.extend(_format_file_line(f) for f in files)
+    user_prompt_lines.append("")
+    user_prompt_lines.append(
+        "Group filenames whose canonical English subject tokens match. "
+        "Return JSON array only."
+    )
+    user_prompt = "\n".join(user_prompt_lines)
+
+    try:
+        kwargs = {
+            "system": CROSS_SCRIPT_SYSTEM_PROMPT,
+            "temperature": 0.0,
+            "seed": 42,
+        }
+        if model:
+            kwargs["model"] = model
+        raw = client.generate_json(user_prompt, **kwargs)
+    except Exception as exc:
+        logger.warning("Relate cross-script LLM call failed (model=%s): %s", model, exc)
+        return []
+
+    if isinstance(raw, dict):
+        raw = raw.get("groups") or raw.get("result") or []
+    if not isinstance(raw, list):
+        logger.warning(
+            "Cross-script LLM returned non-list (%s) — skipping",
+            type(raw).__name__,
+        )
+        return []
+
+    known_filenames = {f.filename for f in files}
+    cleaned: list[dict] = []
+    for g in raw:
+        if not isinstance(g, dict):
+            continue
+        raw_members = g.get("members") or []
+        if not isinstance(raw_members, list):
+            continue
+        valid: list[dict] = []
+        seen: set[str] = set()
+        for m in raw_members:
+            if isinstance(m, str):
+                fn, role = m, "sibling"
+            elif isinstance(m, dict):
+                fn = m.get("filename") or m.get("name") or ""
+                role = (m.get("role") or "sibling").lower()
+            else:
+                continue
+            if fn not in known_filenames or fn in seen:
+                continue
+            if role not in _ROLE_BY_STRING:
+                role = "sibling"
+            seen.add(fn)
+            valid.append({"filename": fn, "role": role})
+        if len(valid) < 2:
+            continue
+        label = _slugify(str(g.get("label") or "cross_script"))
+        reason = (g.get("reason") or "").strip()[:500]
+        cleaned.append({
+            "label": label,
+            "reason": reason,
+            "members": valid,
+            "_confidence": CROSS_SCRIPT_CONFIDENCE,
+        })
+
+    # Enforce at-most-one-group-per-file
+    placed: set[str] = set()
+    final: list[dict] = []
+    for g in cleaned:
+        filtered = [m for m in g["members"] if m["filename"] not in placed]
+        if len(filtered) < 2:
+            continue
+        for m in filtered:
+            placed.add(m["filename"])
+        g["members"] = filtered
+        final.append(g)
+    return final
+
+
+def _run_cross_script_pass(
+    session: Session,
+    session_id: str,
+    client,
+    placed_file_ids: set[int],
+    model: Optional[str] = None,
+) -> tuple[int, int]:
+    """
+    Run the cross-script LLM pass on every session file not already in a
+    group. Persists new groups with scope='cross_script' and dir_path=None.
+
+    Returns (groups_saved, members_added).
+    """
+    singletons = (
+        session.query(File)
+        .filter(
+            File.session_id == session_id,
+            File.status != FileStatus.ERROR,
+            ~File.id.in_(placed_file_ids) if placed_file_ids else True,
+        )
+        .all()
+    )
+    if placed_file_ids:
+        singletons = [f for f in singletons if f.id not in placed_file_ids]
+
+    n = len(singletons)
+    if n < CROSS_SCRIPT_MIN_SINGLETONS:
+        logger.info(
+            "Relate cross-script pass: skipping, only %d singletons (<%d)",
+            n, CROSS_SCRIPT_MIN_SINGLETONS,
+        )
+        return (0, 0)
+    if n > CROSS_SCRIPT_MAX_SINGLETONS:
+        logger.info(
+            "Relate cross-script pass: skipping, %d singletons (>%d) — too expensive",
+            n, CROSS_SCRIPT_MAX_SINGLETONS,
+        )
+        return (0, 0)
+
+    # Build filename→file_id map. Cross-scope: two singletons in different
+    # directories may share the same basename. Keep the first — the LLM
+    # sees basenames only, and the user intent (cluster by subject) doesn't
+    # care which concrete inode gets linked.
+    fn_to_id: dict[str, int] = {}
+    for f in singletons:
+        fn_to_id.setdefault(f.filename, f.id)
+
+    all_groups: list[dict] = []
+    for chunk in _chunk(singletons, MAX_FILES_PER_CALL):
+        if len(chunk) < 2:
+            continue
+        all_groups.extend(_call_llm_cross_script(client, chunk, model=model))
+
+    # Enforce at-most-one-group-per-file ACROSS chunks
+    placed: set[str] = set()
+    merged: list[dict] = []
+    for g in all_groups:
+        filtered = [m for m in g["members"] if m["filename"] not in placed]
+        if len(filtered) < 2:
+            continue
+        for m in filtered:
+            placed.add(m["filename"])
+        g["members"] = filtered
+        merged.append(g)
+
+    _deduplicate_labels(merged)
+    saved = _save_groups(session, merged, session_id, "cross_script", None, fn_to_id)
+    members_added = sum(len(g["members"]) for g in merged)
+    if saved:
+        logger.info(
+            "Relate cross-script pass: saved %d groups with %d members",
+            saved, members_added,
+        )
+    return (saved, members_added)
+
+
+# ---------------------------------------------------------------------------
+# Singleton-to-folder linkage
+# ---------------------------------------------------------------------------
+
+_ALPHA_TOKEN_RE = re.compile(r"[A-Za-z]{4,}")
+
+
+def _link_singletons_to_folder_groups(
+    session: Session,
+    session_id: str,
+) -> int:
+    """
+    For each file still not in any RelationGroup, try to attach it as a
+    SIBLING member of an existing LLM-quality group whose label matches
+    either the singleton's numeric prefix (e.g. `108` in `108_project_files`
+    → group `project_10_8`) or its first ≥4-char alpha token (e.g. `Fonts`
+    in `Fonts.rar` → group `font_configurations`).
+
+    Returns the number of singletons linked.
+    """
+    from datahoarder.db.models import RelationMember
+
+    # Existing group labels with confidence ≥0.5 (skip weak backstop-only)
+    groups = (
+        session.query(RelationGroup)
+        .filter(
+            RelationGroup.session_id == session_id,
+            RelationGroup.confidence >= 0.5,
+        )
+        .all()
+    )
+    if not groups:
+        return 0
+
+    label_by_group = {g.id: (g.label or "").lower() for g in groups}
+
+    # Files already in any RelationMember for this session
+    placed_file_ids: set[int] = {
+        row[0] for row in session.query(RelationMember.file_id)
+        .join(RelationGroup, RelationGroup.id == RelationMember.group_id)
+        .filter(RelationGroup.session_id == session_id)
+    }
+
+    singletons = (
+        session.query(File)
+        .filter(
+            File.session_id == session_id,
+            File.status != FileStatus.ERROR,
+            ~File.id.in_(placed_file_ids) if placed_file_ids else True,
+        )
+        .all()
+    )
+    if placed_file_ids:
+        singletons = [f for f in singletons if f.id not in placed_file_ids]
+
+    if not singletons:
+        return 0
+
+    linked = 0
+    # Track group membership count so we don't over-attach to one group
+    # (e.g. don't dump every .zip in the session into project_10_8)
+    per_group_added: dict[int, int] = defaultdict(int)
+    _MAX_LINKED_PER_GROUP = 4  # cap: avoids pathological over-attachment
+
+    for f in singletons:
+        stem = Path(f.filename).stem.lower()
+
+        # Candidate tokens from the singleton
+        num_prefix = _numeric_prefix(stem)  # "108" or "10.8" or None
+        num_prefix_underscored = num_prefix.replace(".", "_") if num_prefix else None
+        # Also consider "108" → "10_8" (a common convention for dates
+        # without a separator: 108 == 10.8 == 10_8)
+        implicit_date_variant = None
+        if num_prefix and "." not in num_prefix and len(num_prefix) in (3, 4):
+            # "108" → "10_8"; "1008" → "10_08"; etc.
+            split = len(num_prefix) // 2 if len(num_prefix) == 4 else 2
+            implicit_date_variant = f"{num_prefix[:split]}_{num_prefix[split:]}"
+
+        alpha_tokens = [t.lower() for t in _ALPHA_TOKEN_RE.findall(stem)]
+
+        best_group_id: Optional[int] = None
+        best_reason: str = ""
+
+        for g in groups:
+            if per_group_added[g.id] >= _MAX_LINKED_PER_GROUP:
+                continue
+            lbl = label_by_group[g.id]
+            matched = False
+            # Match 1: numeric prefix appears as `_<prefix>_` or at the
+            # start after `project_`.
+            for candidate in filter(None, (num_prefix_underscored, implicit_date_variant)):
+                if (
+                    f"_{candidate}_" in f"_{lbl}_"
+                    or lbl.startswith(f"project_{candidate}_")
+                    or lbl == f"project_{candidate}"
+                ):
+                    matched = True
+                    best_reason = f"numeric prefix match ({candidate})"
+                    break
+            # Match 2: first alpha token (≥4 chars) matches a token in label
+            if not matched:
+                for tok in alpha_tokens:
+                    if tok in lbl.split("_"):
+                        matched = True
+                        best_reason = f"alpha token match ({tok})"
+                        break
+            if matched:
+                best_group_id = g.id
+                break
+
+        if best_group_id is None:
+            continue
+
+        session.add(RelationMember(
+            group_id=best_group_id,
+            file_id=f.id,
+            role=_ROLE_BY_STRING["sibling"],
+        ))
+        per_group_added[best_group_id] += 1
+        linked += 1
+        logger.info(
+            "Relate: linked singleton %r to group %r (%s)",
+            f.filename, label_by_group[best_group_id], best_reason,
+        )
+
+    if linked:
+        session.commit()
+    return linked
+
+
+# ---------------------------------------------------------------------------
+# Backstop (regex prefix clustering)
+# ---------------------------------------------------------------------------
+
+
 def _prefix_cluster_backstop(files: list[File]) -> list[dict]:
     """
     Regex-only fallback: group files sharing a leading numeric prefix.
@@ -612,5 +969,42 @@ def relate(
                     "total": len(call_units),
                     **summary,
                 })
+
+        # -------------------------------------------------------------
+        # Session-wide post-passes: cross-script clustering, then
+        # singleton-to-folder linkage.
+        # -------------------------------------------------------------
+
+        # Build the set of file_ids already in any RelationGroup for this
+        # session (needed by the cross-script pass to know which files are
+        # still singletons). Pull fresh from DB — the per-directory loop
+        # above persisted groups, so file_id membership is now authoritative
+        # on disk, not in any in-memory `placed` set.
+        from datahoarder.db.models import RelationMember as _RelMember
+        placed_file_ids: set[int] = {
+            row[0] for row in session.query(_RelMember.file_id)
+            .join(RelationGroup, RelationGroup.id == _RelMember.group_id)
+            .filter(RelationGroup.session_id == session_id)
+        }
+
+        if client is not None:
+            try:
+                cs_groups, cs_members = _run_cross_script_pass(
+                    session, session_id, client, placed_file_ids, model=model,
+                )
+                if cs_groups:
+                    summary["groups"] += cs_groups
+                    summary["members"] += cs_members
+                    summary["cross_script_groups"] = cs_groups
+            except Exception as exc:
+                logger.warning("Cross-script pass failed: %s", exc)
+
+        try:
+            linked = _link_singletons_to_folder_groups(session, session_id)
+            if linked:
+                summary["members"] += linked
+                summary["singleton_links"] = linked
+        except Exception as exc:
+            logger.warning("Singleton-linkage pass failed: %s", exc)
 
     return summary

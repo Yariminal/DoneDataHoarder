@@ -41,7 +41,23 @@ SKIP_EXTENSIONS: set[str] = {
     ".sys", ".dll", ".exe", ".com",
     ".ini", ".dat", ".log",
     ".db", ".db-shm", ".db-wal",
+    # CAD/print artifacts — no user content worth archiving
+    ".ctb",      # AutoCAD plot style tables
+    ".3dmbak",   # Rhino auto-backup (sibling of .3dm we do want)
+    ".plt",      # HPGL plot files
 }
+
+# Exact filenames to skip regardless of extension — OS / finder / editor
+# metadata that masquerades as real files.
+SKIP_FILENAMES: set[str] = {
+    ".DS_Store",        # macOS Finder metadata
+    "Thumbs.db",        # Windows Explorer thumbnail cache
+    "desktop.ini",      # Windows folder config
+    "._.DS_Store",      # macOS AppleDouble sidecar
+}
+
+# Filename prefixes to skip (macOS AppleDouble forks: `._foo.pdf`).
+SKIP_FILENAME_PREFIXES: tuple[str, ...] = ("._",)
 
 
 def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[Path]:
@@ -55,6 +71,11 @@ def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[
             if d not in skip and not d.startswith(".")
         ]
         for name in filenames:
+            # Filename-pattern skips (OS/editor metadata) come first — these
+            # match names like ".DS_Store" that have no "extension" and would
+            # otherwise pass the suffix check.
+            if name in SKIP_FILENAMES or name.startswith(SKIP_FILENAME_PREFIXES):
+                continue
             if Path(name).suffix.lower() not in SKIP_EXTENSIONS:
                 yield Path(dirpath) / name
 

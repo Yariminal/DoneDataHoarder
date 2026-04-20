@@ -9,6 +9,7 @@ Ollama API docs: https://github.com/ollama/ollama/blob/main/docs/api.md
 """
 import base64
 import json
+import os
 import re
 import threading
 from pathlib import Path
@@ -26,7 +27,12 @@ DEFAULT_HOST = "http://localhost:11434"
 _OLLAMA_REQUEST_LOCK = threading.Semaphore(1)
 DEFAULT_TEXT_MODEL = "gemma3:12b"
 DEFAULT_VISION_MODEL = "gemma3:12b"  # gemma3 is multimodal
-TIMEOUT = 120  # seconds — vision inference can be slow
+
+# Per-request HTTP timeout. Default 300s (5 min) handles big reasoning models
+# (gemma4:26b on 100-file Relate chunks) and vision inference on large images.
+# Override via `DATAHOARDER_OLLAMA_TIMEOUT` env var for very slow hardware or
+# tighter CI budgets.
+TIMEOUT = int(os.environ.get("DATAHOARDER_OLLAMA_TIMEOUT", "300"))
 
 
 class OllamaClient:
