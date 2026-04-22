@@ -283,6 +283,7 @@ class ScanSession(Base):
     files_skipped: Mapped[int] = mapped_column(Integer, default=0)
     files_error: Mapped[int] = mapped_column(Integer, default=0)
     completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_scanned_path: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
 
 # ---------------------------------------------------------------------------

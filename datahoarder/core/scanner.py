@@ -193,17 +193,60 @@ def _get_file_dates(
     return date_modified, date_modified, "mtime_fallback", warning
 
 
+def _collect_file_stat(
+    file_path: Path,
+    force_rescan: bool,
+    session_id: str | None,
+) -> dict | None:
+    """Best-effort stat collection for a single file. Returns a record dict or None on skip/error."""
+    path_str = str(file_path.resolve())
+    try:
+        stat = file_path.stat()
+        date_modified, date_created, date_created_source, date_warning = _get_file_dates(
+            file_path, stat
+        )
+        record = dict(
+            path=path_str,
+            filename=file_path.name,
+            extension=file_path.suffix.lower() or None,
+            size_bytes=stat.st_size,
+            date_modified=date_modified,
+            date_created=date_created,
+            date_created_source=date_created_source,
+            status=FileStatus.PENDING,
+            scanned_at=datetime.utcnow(),
+        )
+        if date_warning:
+            record["error_message"] = date_warning
+        if session_id:
+            record["session_id"] = session_id
+        return record
+    except (PermissionError, OSError) as exc:
+        logger.warning(
+            "Scan error for file",
+            extra={"path": path_str, "error": str(exc)},
+        )
+        return {"_error": True, "path": path_str}
+
+
 def scan(
     root: Path,
     force_rescan: bool = False,
     extra_skip_dirs: set[str] | None = None,
     session_id: str | None = None,
+    workers: int = 1,
 ) -> dict:
     """
     Walk *root* and upsert File records into the database.
 
+    Args:
+        workers: Number of parallel threads for filesystem stat collection.
+                 DB writes remain single-threaded to avoid SQLite locks.
+
     Returns a summary dict with counts for new / skipped / error files.
     """
+    import concurrent.futures
+
     engine = get_engine()
 
     with Session(engine) as session:
@@ -225,6 +268,7 @@ def scan(
             "root": str(root.resolve()),
             "force_rescan": force_rescan,
             "session_id": session_id,
+            "workers": workers,
         },
     )
 
@@ -238,8 +282,10 @@ def scan(
     ) as progress:
         task = progress.add_task("Scanning…", total=None)
         batch: list[dict] = []
+        last_path: str | None = None
 
         def _flush(session: Session) -> None:
+            nonlocal last_path
             if not batch:
                 return
             logger.info(
@@ -247,82 +293,116 @@ def scan(
                 extra={"batch_size": len(batch), "counts": counts.copy()},
             )
             for record in batch:
+                if record.get("_error"):
+                    counts["errors"] += 1
+                    continue
                 path_str = record["path"]
+                last_path = path_str
                 existing = session.query(File).filter_by(path=path_str).first()
                 if existing and not force_rescan:
                     counts["skipped"] += 1
                 elif existing:
                     # Update basic stat fields, reset status
                     for k, v in record.items():
+                        if k.startswith("_"):
+                            continue
                         setattr(existing, k, v)
                     existing.status = FileStatus.PENDING
                     counts["new"] += 1
                 else:
-                    session.add(File(**record))
+                    session.add(File(**{k: v for k, v in record.items() if not k.startswith("_")}))
                     counts["new"] += 1
             session.commit()
+            # Persist resume point
+            if last_path and scan_session_id:
+                sess_rec = session.get(ScanSession, scan_session_id)
+                if sess_rec:
+                    sess_rec.last_scanned_path = last_path
+                    session.commit()
             batch.clear()
 
-        with Session(engine) as session:
-            for file_path in walk_files(root, extra_skip_dirs):
-                progress.advance(task)
-                path_str = str(file_path.resolve())
+        # Pre-walk to collect paths
+        all_paths = list(walk_files(root, extra_skip_dirs))
+        total_files = len(all_paths)
+        progress.update(task, total=total_files)
 
-                if not force_rescan:
-                    # Fast pre-check without loading the full object
-                    exists = session.query(File.id).filter_by(path=path_str).scalar()
-                    if exists is not None:
-                        counts["skipped"] += 1
-                        continue
+        if workers > 1:
+            # Parallel stat collection, sequential DB writes
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_collect_file_stat, fp, force_rescan, session_id): fp
+                    for fp in all_paths
+                }
+                with Session(engine) as session:
+                    for future in concurrent.futures.as_completed(futures):
+                        file_path = futures[future]
+                        progress.advance(task)
+                        path_str = str(file_path.resolve())
 
-                try:
-                    stat = file_path.stat()
-                    date_modified, date_created, date_created_source, date_warning = _get_file_dates(
-                        file_path, stat
-                    )
-                    record = dict(
-                        path=path_str,
-                        filename=file_path.name,
-                        extension=file_path.suffix.lower() or None,
-                        size_bytes=stat.st_size,
-                        date_modified=date_modified,
-                        date_created=date_created,
-                        date_created_source=date_created_source,
-                        status=FileStatus.PENDING,
-                        scanned_at=datetime.utcnow(),
-                    )
-                    if date_warning:
-                        record["error_message"] = date_warning
-                    if session_id:
-                        record["session_id"] = session_id
-                    batch.append(record)
-                except (PermissionError, OSError) as exc:
-                    counts["errors"] += 1
-                    logger.warning(
-                        "Scan error for file",
-                        extra={"path": path_str, "error": str(exc)},
-                    )
-                    continue
+                        if not force_rescan:
+                            exists = session.query(File.id).filter_by(path=path_str).scalar()
+                            if exists is not None:
+                                counts["skipped"] += 1
+                                continue
 
-                if len(batch) >= BATCH_SIZE:
+                        try:
+                            record = future.result()
+                            batch.append(record)
+                        except Exception as exc:
+                            counts["errors"] += 1
+                            logger.warning(
+                                "Scan error for file",
+                                extra={"path": path_str, "error": str(exc)},
+                            )
+
+                        if len(batch) >= BATCH_SIZE:
+                            _flush(session)
+                            progress.update(
+                                task,
+                                description=f"Scanning… {counts['new']} new, {counts['skipped']} skipped",
+                            )
+
                     _flush(session)
-                    progress.update(
-                        task,
-                        description=f"Scanning… {counts['new']} new, {counts['skipped']} skipped",
-                    )
+        else:
+            # Sequential path (original behaviour)
+            with Session(engine) as session:
+                for file_path in all_paths:
+                    progress.advance(task)
+                    path_str = str(file_path.resolve())
 
-            _flush(session)
+                    if not force_rescan:
+                        exists = session.query(File.id).filter_by(path=path_str).scalar()
+                        if exists is not None:
+                            counts["skipped"] += 1
+                            continue
 
-            # Mark session complete
-            sess_record = session.get(ScanSession, scan_session_id)
-            if sess_record:
-                sess_record.finished_at = datetime.utcnow()
-                sess_record.files_new = counts["new"]
-                sess_record.files_skipped = counts["skipped"]
-                sess_record.files_error = counts["errors"]
-                sess_record.files_found = counts["new"] + counts["skipped"]
-                sess_record.completed = True
-                session.commit()
+                    record = _collect_file_stat(file_path, force_rescan, session_id)
+                    if record is None or record.get("_error"):
+                        counts["errors"] += 1
+                        continue
+                    batch.append(record)
+
+                    if len(batch) >= BATCH_SIZE:
+                        _flush(session)
+                        progress.update(
+                            task,
+                            description=f"Scanning… {counts['new']} new, {counts['skipped']} skipped",
+                        )
+
+                _flush(session)
+
+    # Mark session complete (separate session to avoid lock contention)
+    with Session(engine) as session:
+        sess_record = session.get(ScanSession, scan_session_id)
+        if sess_record:
+            sess_record.finished_at = datetime.utcnow()
+            sess_record.files_new = counts["new"]
+            sess_record.files_skipped = counts["skipped"]
+            sess_record.files_error = counts["errors"]
+            sess_record.files_found = counts["new"] + counts["skipped"]
+            sess_record.completed = True
+            sess_record.last_scanned_path = None
+            session.commit()
 
     logger.info(
         "Scan complete",

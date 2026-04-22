@@ -22,6 +22,7 @@ def _migrate_add_columns(engine: Engine, inspector) -> None:
         ("sessions", "propose_model", "VARCHAR", "NULL"),
         ("sessions", "relate_scope", "VARCHAR", "'per_directory'"),
         ("files", "date_created_source", "VARCHAR", "NULL"),
+        ("scan_sessions", "last_scanned_path", "VARCHAR", "NULL"),
     ]
 
     for table, column, sql_type, default in migrations:

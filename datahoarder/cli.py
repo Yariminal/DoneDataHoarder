@@ -197,6 +197,7 @@ def scan(
     root: Annotated[Path, typer.Argument(help="Directory to scan.")],
     db: Annotated[str, typer.Option("--db", help="SQLite database path.", envvar="DATAHOARDER_DB")] = "datahoarder.db",
     force: Annotated[bool, typer.Option("--force", help="Re-scan already-indexed files.")] = False,
+    workers: Annotated[int, typer.Option("--workers", "-w", help="Parallel threads for stat collection (DB stays single-threaded).")] = 1,
 ):
     """[bold cyan]Scan[/bold cyan] a directory and build the file index."""
     _init_db(db)
@@ -208,7 +209,7 @@ def scan(
     console.print(Panel(f"Scanning [bold]{root}[/bold]", style="cyan"))
 
     from datahoarder.core.scanner import scan as do_scan
-    counts = do_scan(root, force_rescan=force)
+    counts = do_scan(root, force_rescan=force, workers=workers)
 
     console.print(
         f"\n[bold green]Scan complete[/bold green] — "
