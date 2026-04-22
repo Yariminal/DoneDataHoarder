@@ -271,9 +271,9 @@ class ScanSession(Base):
     __tablename__ = "scan_sessions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    session_id: Mapped[str] = mapped_column(
+    session_id: Mapped[Optional[str]] = mapped_column(
         String(36), ForeignKey("sessions.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+        nullable=True, index=True,
     )
     root_path: Mapped[str] = mapped_column(String, nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

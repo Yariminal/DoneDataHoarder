@@ -83,6 +83,7 @@ def init_db(db_path: Path) -> Engine:
         # Add any missing columns to existing tables
         inspector = inspect(_engine)
         _migrate_add_columns(_engine, inspector)
+        _migrate_nullable_columns(_engine, inspector)
     except sa_exc.OperationalError as exc:
         if "database is locked" in str(exc).lower():
             _handle_db_lock(exc, db_path)
@@ -90,6 +91,48 @@ def init_db(db_path: Path) -> Engine:
 
     _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
     return _engine
+
+
+def _migrate_nullable_columns(engine: Engine, inspector) -> None:
+    """Alter columns to nullable where the schema has evolved (SQLite limited support)."""
+    from sqlalchemy import text
+
+    # SQLite only supports limited ALTER TABLE; we recreate the table
+    # if we need to drop a NOT NULL constraint. For scan_sessions,
+    # dropping and recreating is acceptable (it's just scan metadata).
+    nullable_migrations = [
+        ("scan_sessions", "session_id"),
+    ]
+
+    for table, column in nullable_migrations:
+        if table not in inspector.get_table_names():
+            continue
+        cols = inspector.get_columns(table)
+        col_info = next((c for c in cols if c["name"] == column), None)
+        if col_info and not col_info.get("nullable", True):
+            # Column is NOT NULL but should be nullable — we need to recreate the table
+            with engine.begin() as conn:
+                conn.execute(text(f"ALTER TABLE {table} RENAME TO {table}_old"))
+                # Create new table with correct schema (sqlite-specific)
+                if table == "scan_sessions":
+                    conn.execute(text(
+                        f"CREATE TABLE {table} ("
+                        f"id INTEGER NOT NULL PRIMARY KEY, "
+                        f"session_id VARCHAR(36), "
+                        f"root_path VARCHAR NOT NULL, "
+                        f"started_at DATETIME, "
+                        f"finished_at DATETIME, "
+                        f"files_found INTEGER DEFAULT 0, "
+                        f"files_new INTEGER DEFAULT 0, "
+                        f"files_skipped INTEGER DEFAULT 0, "
+                        f"files_error INTEGER DEFAULT 0, "
+                        f"completed BOOLEAN DEFAULT 0, "
+                        f"last_scanned_path VARCHAR, "
+                        f"FOREIGN KEY(session_id) REFERENCES sessions (id) ON DELETE CASCADE"
+                        f")"
+                    ))
+                conn.execute(text(f"INSERT INTO {table} SELECT * FROM {table}_old"))
+                conn.execute(text(f"DROP TABLE {table}_old"))
 
 
 

@@ -208,8 +208,26 @@ def scan(
 
     console.print(Panel(f"Scanning [bold]{root}[/bold]", style="cyan"))
 
+    # Create a UserSession so every scanned file has a valid session_id
+    from datahoarder.db.session import get_engine
+    from datahoarder.db.models import UserSession, SessionStatus
+    from sqlalchemy.orm import Session
+    import uuid
+
+    engine = get_engine()
+    with Session(engine) as session:
+        user_sess = UserSession(
+            id=str(uuid.uuid4()),
+            name=root.name,
+            root_path=str(root),
+            status=SessionStatus.ACTIVE,
+        )
+        session.add(user_sess)
+        session.commit()
+        session_id = user_sess.id
+
     from datahoarder.core.scanner import scan as do_scan
-    counts = do_scan(root, force_rescan=force, workers=workers)
+    counts = do_scan(root, force_rescan=force, workers=workers, session_id=session_id)
 
     console.print(
         f"\n[bold green]Scan complete[/bold green] — "
@@ -750,6 +768,107 @@ def serve(
     )
 
     uvicorn.run(web_app, host=host, port=port, log_level="warning")
+
+
+# ---------------------------------------------------------------------------
+# models
+# ---------------------------------------------------------------------------
+
+@app.command()
+def models(
+    ollama_host: Annotated[str, typer.Option("--ollama-host", help="Ollama server URL.", envvar="OLLAMA_HOST")] = "http://localhost:11434",
+    recommend: Annotated[bool, typer.Option("--recommend", help="Recommend a model based on available RAM.")] = False,
+):
+    """[bold]List[/bold] installed Ollama models and check vision support."""
+    from datahoarder.ai.ollama_client import OllamaClient
+
+    client = OllamaClient(host=ollama_host)
+    if not client.is_available():
+        console.print(f"[red]Ollama not reachable at {ollama_host}.[/red]")
+        console.print("Start Ollama with: [bold]ollama serve[/bold]")
+        raise typer.Exit(1)
+
+    installed = client.list_models()
+    if not installed:
+        console.print("[yellow]No models installed.[/yellow]")
+        console.print("Install a vision model: [bold]ollama pull gemma3:12b[/bold]")
+        return
+
+    table = Table(title="Installed Ollama Models", show_lines=True)
+    table.add_column("Model", style="cyan")
+    table.add_column("Vision", style="bold")
+
+    vision_models = {"llava", "bakllava", "gemma3", "moondream", "cogvlm"}
+    for name in installed:
+        has_vision = any(vm in name.lower() for vm in vision_models)
+        table.add_row(
+            name,
+            "[green]Yes[/green]" if has_vision else "[dim]No[/dim]",
+        )
+    console.print(table)
+
+    if recommend:
+        try:
+            import psutil
+            ram_gb = psutil.virtual_memory().total / 1024 ** 3
+            console.print(f"\nDetected RAM: [bold]{ram_gb:.1f} GB[/bold]")
+            if ram_gb >= 16:
+                console.print("Recommendation: [green]gemma3:12b[/green] (best quality, vision)")
+            elif ram_gb >= 8:
+                console.print("Recommendation: [green]gemma3:4b[/green] (good balance)")
+            elif ram_gb >= 4:
+                console.print("Recommendation: [yellow]gemma3:1b[/yellow] (fast, lower quality)")
+            else:
+                console.print("Recommendation: [red]Insufficient RAM[/red] for local LLMs; use Gemini backend.")
+        except ImportError:
+            console.print("\n[yellow]Install psutil for RAM-based recommendations:[/yellow] pip install psutil")
+            console.print("Default recommendation: [green]gemma3:12b[/green] (vision-capable)")
+
+
+# ---------------------------------------------------------------------------
+# bench
+# ---------------------------------------------------------------------------
+
+@app.command()
+def bench(
+    tmp_dir: Annotated[Optional[Path], typer.Option("--tmp-dir", help="Directory to create synthetic files in.")] = None,
+    file_count: Annotated[int, typer.Option("--files", help="Number of synthetic files to create.")] = 100,
+    db: Annotated[str, typer.Option("--db", help="SQLite database path.", envvar="DATAHOARDER_DB")] = "datahoarder.db",
+):
+    """[bold]Benchmark[/bold] scan speed on a synthetic corpus."""
+    import tempfile
+    import time
+
+    from datahoarder.core.scanner import scan as do_scan
+
+    _init_db(db)
+
+    test_dir = tmp_dir or Path(tempfile.mkdtemp(prefix="datahoarder_bench_"))
+    test_dir.mkdir(parents=True, exist_ok=True)
+
+    console.print(Panel(f"Creating {file_count} synthetic files in {test_dir}…", style="cyan"))
+
+    for i in range(file_count):
+        (test_dir / f"file_{i:04d}.txt").write_text(f"benchmark content {i}\n" * 50)
+        if i % 10 == 0:
+            (test_dir / f"image_{i:04d}.jpg").write_bytes(b"\xff\xd8" + b"\x00" * 1024)
+
+    console.print("[green]Created.[/green] Running scan…")
+    start = time.perf_counter()
+    counts = do_scan(test_dir, workers=1)
+    elapsed = time.perf_counter() - start
+
+    files_per_sec = counts["new"] / elapsed if elapsed > 0 else 0
+    console.print(
+        f"\n[bold green]Scan benchmark complete[/bold green] — "
+        f"{counts['new']} files in {elapsed:.2f}s "
+        f"([cyan]{files_per_sec:.1f}[/cyan] files/sec)"
+    )
+
+    # Cleanup
+    import shutil
+    shutil.rmtree(test_dir, ignore_errors=True)
+    console.print(f"[dim]Cleaned up {test_dir}[/dim]")
 
 
 # ---------------------------------------------------------------------------
