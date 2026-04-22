@@ -69,7 +69,7 @@ def _process_one_file(
             "Processing file",
             extra={
                 "file_id": file_id,
-                "filename": file_rec.filename,
+                "file_name": file_rec.filename,
                 "mime_type": file_rec.mime_type,
             },
         )
@@ -107,7 +107,7 @@ def _process_one_file(
                 "AI analysis complete",
                 extra={
                     "file_id": file_id,
-                    "filename": file_rec.filename,
+                    "file_name": file_rec.filename,
                     "model": str(type(client).__name__),
                 },
             )
@@ -118,7 +118,7 @@ def _process_one_file(
                 "AI analysis failed",
                 extra={
                     "file_id": file_id,
-                    "filename": file_rec.filename,
+                    "file_name": file_rec.filename,
                     "error": str(exc),
                 },
             )
