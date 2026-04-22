@@ -4,7 +4,8 @@ Ollama client — talks to a local Ollama instance.
 Supports:
 - Text-only generation (llama3, mistral, gemma, etc.)
 - Vision generation (llava, bakllava, gemma3, etc.) with base64 images
-- Structured JSON output with retry logic via json_utils
+- Circuit breaker for resilience
+- Structured JSON via shared json_utils
 
 Ollama API docs: https://github.com/ollama/ollama/blob/main/docs/api.md
 """
@@ -15,6 +16,7 @@ from typing import Any, Optional
 
 import httpx
 
+from datahoarder.ai.base_client import BaseAIClient
 from datahoarder.ai.circuit_breaker import CircuitBreaker
 from datahoarder.ai.json_utils import generate_json_with_retry
 
@@ -30,8 +32,22 @@ DEFAULT_TEXT_MODEL = "gemma3:12b"
 DEFAULT_VISION_MODEL = "gemma3:12b"  # gemma3 is multimodal
 TIMEOUT = 120  # seconds — vision inference can be slow
 
+# Approximate context lengths for common Ollama models
+_CONTEXT_LENGTHS: dict[str, int] = {
+    "gemma3:12b": 128_000,
+    "gemma3:4b": 128_000,
+    "gemma3:1b": 128_000,
+    "llama3": 8_192,
+    "llama3:8b": 8_192,
+    "llama3:70b": 8_192,
+    "mistral": 32_768,
+    "mixtral": 32_768,
+    "qwen2": 128_000,
+    "phi3": 128_000,
+}
 
-class OllamaClient:
+
+class OllamaClient(BaseAIClient):
     def __init__(
         self,
         host: str = DEFAULT_HOST,
@@ -55,7 +71,7 @@ class OllamaClient:
         # causing all threads to hang indefinitely.
 
     # ------------------------------------------------------------------
-    # Connectivity check
+    # BaseAIClient interface
     # ------------------------------------------------------------------
 
     def is_available(self) -> bool:
@@ -66,14 +82,22 @@ class OllamaClient:
         except Exception:
             return False
 
-    def list_models(self) -> list[str]:
-        try:
-            with httpx.Client(timeout=10) as client:
-                resp = client.get(f"{self.host}/api/tags")
-                resp.raise_for_status()
-                return [m["name"] for m in resp.json().get("models", [])]
-        except Exception:
-            return []
+    def is_healthy(self) -> bool:
+        """Return True if the circuit breaker allows traffic AND Ollama is reachable."""
+        if not self.circuit_breaker.is_healthy():
+            return False
+        return self.is_available()
+
+    def supports_vision(self) -> bool:
+        vision_models = {"llava", "bakllava", "gemma3", "moondream", "cogvlm"}
+        model_lower = (self.vision_model or "").lower()
+        return any(vm in model_lower for vm in vision_models)
+
+    def max_context_tokens(self) -> Optional[int]:
+        return _CONTEXT_LENGTHS.get(self.text_model)
+
+    def close(self) -> None:
+        pass  # No persistent client to close
 
     # ------------------------------------------------------------------
     # Text generation
@@ -95,9 +119,7 @@ class OllamaClient:
                 f"Run 'datahoarder doctor' to diagnose, or switch to Gemini backend."
             )
         try:
-            return self._do_generate(
-                prompt, model, system, temperature, seed, **kwargs
-            )
+            return self._do_generate(prompt, model, system, temperature, seed, **kwargs)
         except Exception:
             self.circuit_breaker.record_failure()
             raise
@@ -128,7 +150,6 @@ class OllamaClient:
         # Ollama structured-output support: map response_format -> format
         response_format = kwargs.get("response_format")
         if response_format is not None:
-            # Ollama accepts "format": "json" or a JSON schema dict
             fmt = response_format.get("type")
             if fmt == "json_object":
                 payload["format"] = "json"
@@ -189,16 +210,12 @@ class OllamaClient:
         """Internal: actual HTTP call for vision generation."""
         model = model or self.vision_model
 
-        b64_images = []
-
-        # Single image from path or bytes
+        b64_images: list[str] = []
         if image_path is not None:
             with open(image_path, "rb") as f:
                 image_bytes = f.read()
         if image_bytes is not None:
             b64_images.append(base64.b64encode(image_bytes).decode())
-
-        # Multiple images
         if images_list:
             for img in images_list:
                 b64_images.append(base64.b64encode(img).decode())
@@ -243,6 +260,7 @@ class OllamaClient:
     def generate_json(
         self,
         prompt: str,
+        model_cls: type | None = None,
         image_path: Path | None = None,
         image_bytes: bytes | None = None,
         images_list: list[bytes] | None = None,
@@ -261,9 +279,8 @@ class OllamaClient:
         """
         from pydantic import create_model
 
-        # Build a loose Pydantic model that accepts any dict keys so we can
-        # validate JSON structure without requiring every caller to supply a schema.
-        LooseDict = create_model("LooseDict", __base__=dict)
+        if model_cls is None:
+            model_cls = create_model("LooseDict", __base__=dict)
 
         if image_path or image_bytes or images_list:
             generate_fn = lambda **kw: self.generate_with_image(
@@ -290,7 +307,7 @@ class OllamaClient:
         return generate_json_with_retry(
             generate_fn=generate_fn,
             prompt=prompt,
-            model_cls=LooseDict,
+            model_cls=model_cls,
             system=system,
             temperature=temperature,
             seed=seed,
@@ -299,20 +316,14 @@ class OllamaClient:
         ).model_dump()
 
     # ------------------------------------------------------------------
-    # Health
+    # Model listing
     # ------------------------------------------------------------------
 
-    def is_healthy(self) -> bool:
-        """Return True if the circuit breaker allows traffic AND Ollama is reachable."""
-        if not self.circuit_breaker.is_healthy():
-            return False
-        return self.is_available()
-
-    def close(self):
-        pass  # No shared client to close
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        pass
+    def list_models(self) -> list[str]:
+        try:
+            with httpx.Client(timeout=10) as client:
+                resp = client.get(f"{self.host}/api/tags")
+                resp.raise_for_status()
+                return [m["name"] for m in resp.json().get("models", [])]
+        except Exception:
+            return []

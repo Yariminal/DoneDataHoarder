@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+from datahoarder.ai.base_client import BaseAIClient
 from datahoarder.ai.json_utils import generate_json_with_retry
 
 try:
@@ -19,7 +20,7 @@ except ImportError:
 DEFAULT_MODEL = "gemini-2.0-flash"
 
 
-class GeminiClient:
+class GeminiClient(BaseAIClient):
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -40,10 +41,47 @@ class GeminiClient:
         genai.configure(api_key=key)
         self._model = genai.GenerativeModel(model)
 
+    # ------------------------------------------------------------------
+    # BaseAIClient interface
+    # ------------------------------------------------------------------
+
+    def is_available(self) -> bool:
+        try:
+            # Lightweight connectivity check via model info
+            self._model.count_tokens("hello")
+            return True
+        except Exception:
+            return False
+
+    def is_healthy(self) -> bool:
+        return self.is_available()
+
+    def supports_vision(self) -> bool:
+        return True  # Gemini 2.0 Flash / Pro are multimodal
+
+    def max_context_tokens(self) -> Optional[int]:
+        # Gemini 2.0 Flash: 1M tokens
+        if "flash" in self.model_name.lower():
+            return 1_048_576
+        # Gemini 2.0 Pro: 2M tokens
+        if "pro" in self.model_name.lower():
+            return 2_097_152
+        return None
+
+    def close(self) -> None:
+        pass  # google-generativeai uses global state; nothing to close per-instance
+
+    # ------------------------------------------------------------------
+    # Text generation
+    # ------------------------------------------------------------------
+
     def generate(
         self,
         prompt: str,
+        model: Optional[str] = None,
+        system: Optional[str] = None,
         temperature: float = 0.2,
+        seed: Optional[int] = None,
         **kwargs: Any,
     ) -> str:
         cfg = genai.types.GenerationConfig(temperature=temperature)
@@ -51,7 +89,6 @@ class GeminiClient:
         response_format = kwargs.get("response_format")
         if response_format is not None:
             try:
-                # Newer SDK versions accept response_mime_type="application/json"
                 cfg = genai.types.GenerationConfig(
                     temperature=temperature,
                     response_mime_type="application/json",
@@ -61,14 +98,21 @@ class GeminiClient:
         resp = self._model.generate_content(prompt, generation_config=cfg)
         return resp.text.strip()
 
+    # ------------------------------------------------------------------
+    # Vision generation
+    # ------------------------------------------------------------------
+
     def generate_with_image(
         self,
         prompt: str,
         image_path: Path | None = None,
         image_bytes: bytes | None = None,
         images_list: list[bytes] | None = None,
-        mime_type: str = "image/jpeg",
+        model: Optional[str] = None,
+        system: Optional[str] = None,
         temperature: float = 0.2,
+        seed: Optional[int] = None,
+        mime_type: str = "image/jpeg",
         **kwargs: Any,
     ) -> str:
         parts: list[Any] = [prompt]
@@ -99,16 +143,23 @@ class GeminiClient:
         resp = self._model.generate_content(parts, generation_config=cfg)
         return resp.text.strip()
 
+    # ------------------------------------------------------------------
+    # Structured JSON extraction helper
+    # ------------------------------------------------------------------
+
     def generate_json(
         self,
         prompt: str,
+        model_cls: type | None = None,
         image_path: Path | None = None,
         image_bytes: bytes | None = None,
         images_list: list[bytes] | None = None,
-        mime_type: str = "image/jpeg",
+        model: Optional[str] = None,
+        system: Optional[str] = None,
         temperature: float = 0.0,
         seed: int = 42,
         max_retries: int = 3,
+        mime_type: str = "image/jpeg",
     ) -> dict:
         """
         Like generate / generate_with_image but instructs the model to return
@@ -116,7 +167,8 @@ class GeminiClient:
         """
         from pydantic import create_model
 
-        LooseDict = create_model("LooseDict", __base__=dict)
+        if model_cls is None:
+            model_cls = create_model("LooseDict", __base__=dict)
 
         if image_path or image_bytes or images_list:
             generate_fn = lambda **kw: self.generate_with_image(
@@ -138,7 +190,7 @@ class GeminiClient:
         return generate_json_with_retry(
             generate_fn=generate_fn,
             prompt=prompt,
-            model_cls=LooseDict,
+            model_cls=model_cls,
             temperature=temperature,
             seed=seed,
             max_retries=max_retries,
