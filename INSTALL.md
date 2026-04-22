@@ -110,6 +110,25 @@ Audio without faster-whisper:
 
 ## Troubleshooting
 
+### "Ollama model not found"
+Install the required model locally:
+```bash
+ollama pull gemma3:12b
+```
+Or switch to Gemini backend:
+```bash
+export GEMINI_API_KEY=your-key
+export DATAHOARDER_BACKEND=gemini
+datahoarder analyze /path/to/files
+```
+
+### "Database is locked"
+Another DataHoarder process (CLI, web UI, or background job) is holding the SQLite connection.
+- Close any other terminals running `datahoarder`
+- Stop the web UI (`Ctrl+C` if running)
+- On Unix: `pkill -f datahoarder`
+- On Windows: `taskkill /F /IM python.exe` (use with caution)
+
 ### "ffmpeg not found in PATH"
 - **Windows**: Add ffmpeg installation folder to PATH, or reinstall via Chocolatey
 - **Mac/Linux**: Verify with `which ffmpeg`, or reinstall via package manager
