@@ -49,6 +49,32 @@ def main_callback(
     from datahoarder.logging import setup_logging
     setup_logging(verbose=verbose)
 
+    # First-run welcome
+    _maybe_show_welcome()
+
+
+def _maybe_show_welcome() -> None:
+    """Show a friendly welcome on first run."""
+    welcome_file = Path.home() / ".datahoarder" / ".welcome_shown"
+    if welcome_file.exists():
+        return
+    console.print(
+        Panel(
+            "[bold green]Welcome to DataHoarder![/bold green]\n\n"
+            "Your AI-powered file organization assistant.\n"
+            "  • Run [cyan]datahoarder doctor[/cyan] to check your setup\n"
+            "  • Run [cyan]datahoarder scan /path/to/files[/cyan] to get started\n"
+            "  • Docs: [blue]https://github.com/Yariminal/DoneDataHoarder[/blue]",
+            title="🗄️  DataHoarder",
+            style="green",
+        )
+    )
+    try:
+        welcome_file.parent.mkdir(parents=True, exist_ok=True)
+        welcome_file.touch()
+    except OSError:
+        pass
+
 
 def _init_db(db_path: str) -> Path:
     from datahoarder.db.session import init_db
@@ -351,14 +377,15 @@ def relate(
 @app.command()
 def propose(
     db: Annotated[str, typer.Option("--db", help="SQLite database path.", envvar="DATAHOARDER_DB")] = "datahoarder.db",
-    limit: Annotated[Optional[int], typer.Option("--limit")] = None,
+    limit: Annotated[Optional[int], typer.Option("--limit", help="Max proposals to generate.")] = None,
+    offset: Annotated[Optional[int], typer.Option("--offset", help="Skip first N files.")] = None,
 ):
     """[bold blue]Generate[/bold blue] rename/tag proposals from analyzed files."""
     _init_db(db)
     console.print(Panel("Generating proposals", style="blue"))
 
     from datahoarder.proposals.namer import generate_proposals
-    counts = generate_proposals(limit=limit)
+    counts = generate_proposals(limit=limit, offset=offset)
 
     console.print(
         f"\n[bold green]Proposals ready[/bold green] — "
@@ -379,19 +406,21 @@ def review(
     min_confidence: Annotated[float, typer.Option("--min-confidence", "-c")] = 0.0,
     dupes: Annotated[bool, typer.Option("--dupes", help="Show duplicate groups instead of rename proposals.")] = False,
     interactive: Annotated[bool, typer.Option("--interactive", "-i", help="Approve/reject one by one.")] = False,
+    limit: Annotated[Optional[int], typer.Option("--limit", help="Max proposals to display.")] = None,
+    offset: Annotated[Optional[int], typer.Option("--offset", help="Skip first N proposals.")] = None,
 ):
     """[bold]Review[/bold] pending proposals before applying them."""
     _init_db(db)
 
     if dupes:
-        _review_dupes()
+        _review_dupes(limit=limit, offset=offset)
         return
 
     from datahoarder.executor import preview
-    preview(min_confidence=min_confidence)
+    preview(min_confidence=min_confidence, limit=limit, offset=offset)
 
     if interactive:
-        _interactive_review()
+        _interactive_review(limit=limit, offset=offset)
     else:
         console.print(
             "\nRun [bold]datahoarder execute[/bold] to apply all high-confidence proposals, "
@@ -399,7 +428,10 @@ def review(
         )
 
 
-def _review_dupes() -> None:
+def _review_dupes(
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> None:
     from datahoarder.core.dedup import duplicate_summary
 
     groups = duplicate_summary()
@@ -407,7 +439,9 @@ def _review_dupes() -> None:
         console.print("[yellow]No duplicate groups found. Run 'datahoarder dedup' first.[/yellow]")
         return
 
-    for g in groups[:50]:  # show first 50
+    start = offset or 0
+    end = (start + limit) if limit else len(groups)
+    for g in groups[start:end]:
         table = Table(
             title=f"Group {g['group_id']} ({g['type']}) — "
                   f"{g['count']} files — "
@@ -424,7 +458,10 @@ def _review_dupes() -> None:
         console.print(table)
 
 
-def _interactive_review() -> None:
+def _interactive_review(
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> None:
     """One-by-one proposal review loop."""
     from datahoarder.db.session import get_engine
     from datahoarder.db.models import Proposal, ProposalStatus
@@ -433,18 +470,20 @@ def _interactive_review() -> None:
     engine = get_engine()
 
     with Session(engine) as session:
-        proposals = (
+        query = (
             session.query(Proposal)
             .filter(Proposal.status == ProposalStatus.PENDING)
             .order_by(Proposal.confidence.desc())
-            .all()
         )
+        total = query.count()
+        if offset:
+            query = query.offset(offset)
+        if limit:
+            query = query.limit(limit)
+        proposals = query.all()
 
-    console.print(f"\n[bold]{len(proposals)} proposals to review.[/bold]")
+    console.print(f"\n[bold]{len(proposals)} proposals to review[/bold] (total pending: {total}).")
     console.print("Keys: [green]y[/green]=approve  [red]n[/red]=reject  [yellow]s[/yellow]=skip  [bold]q[/bold]=quit\n")
-
-    from datahoarder.db.session import get_engine
-    engine = get_engine()
 
     for i, prop in enumerate(proposals, 1):
         console.print(

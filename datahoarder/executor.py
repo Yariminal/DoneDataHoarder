@@ -267,22 +267,31 @@ def _delete_duplicate(
 # Public interface
 # ---------------------------------------------------------------------------
 
-def preview(min_confidence: float = 0.0) -> None:
+def preview(
+    min_confidence: float = 0.0,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> None:
     """Print a rich table of pending proposals."""
     engine = get_engine()
     with Session(engine) as session:
-        proposals = (
+        query = (
             session.query(Proposal)
             .filter(Proposal.status == ProposalStatus.PENDING)
             .join(File)
-            .all()
         )
+        total = query.count()
+        if offset:
+            query = query.offset(offset)
+        if limit:
+            query = query.limit(limit)
+        proposals = query.all()
         if not proposals:
             console.print("[yellow]No pending proposals.[/yellow]")
             return
 
         table = Table(
-            title=f"Pending Proposals ({len(proposals)})",
+            title=f"Pending Proposals (showing {len(proposals)} of {total})",
             show_lines=True,
             expand=True,
         )

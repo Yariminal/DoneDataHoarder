@@ -701,10 +701,19 @@ def _normalize_spelling_in_proposals(session_id: str | None) -> int:
 # Proposal generation
 # ---------------------------------------------------------------------------
 
-def generate_proposals(limit: Optional[int] = None, session_id: str | None = None) -> dict:
+def generate_proposals(
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+    session_id: str | None = None,
+) -> dict:
     """
     Create Proposal records for all ANALYZED files.
     Optionally translates filenames based on session's preferred_language setting.
+
+    Args:
+        limit: Maximum number of files to process.
+        offset: Skip first N files (useful for debugging partial runs).
+        session_id: Restrict to files belonging to this session.
 
     Returns:
         Summary dict with proposal counts.
@@ -732,9 +741,11 @@ def generate_proposals(limit: Optional[int] = None, session_id: str | None = Non
         query = session.query(File).filter(File.status == FileStatus.ANALYZED)
         if session_id:
             query = query.filter(File.session_id == session_id)
+        total = query.count()
+        if offset:
+            query = query.offset(offset)
         if limit:
             query = query.limit(limit)
-        total = query.count()
 
 
     with Progress(
