@@ -43,6 +43,8 @@ try:
 except ImportError:
     _HAS_PIL = False
 
+from datahoarder.phash import compute_phash as _compute_phash
+
 try:
     import mutagen
     _HAS_MUTAGEN = True
@@ -130,14 +132,8 @@ def _audio_date(path: Path) -> Optional[datetime]:
 
 
 def _perceptual_hash(path: Path) -> Optional[str]:
-    """Compute perceptual hash for images (for near-duplicate detection)."""
-    if not _HAS_PIL:
-        return None
-    try:
-        with PilImage.open(path) as img:
-            return str(imagehash.phash(img))
-    except Exception:
-        return None
+    """Compute perceptual hash for images and videos (delegates to phash module)."""
+    return _compute_phash(path)
 
 
 def _best_date(
@@ -215,12 +211,15 @@ def enrich(workers: int = 1, limit: Optional[int] = None, session_id: str | None
                         # Hashes
                         file_rec.hash_md5 = _md5(path)
 
-                        # EXIF / audio dates
+                        # EXIF / audio dates + perceptual hashes
                         if mime.startswith("image/"):
                             file_rec.date_exif = _exif_date(path)
                             file_rec.hash_perceptual = _perceptual_hash(path)
                         elif mime.startswith(("video/", "audio/")):
                             file_rec.date_exif = _audio_date(path)
+                            # Video thumbnail pHash (best-effort via ffmpeg)
+                            if mime.startswith("video/"):
+                                file_rec.hash_perceptual = _perceptual_hash(path)
 
                         file_rec.date_best = _best_date(
                             file_rec.date_exif,
@@ -329,6 +328,8 @@ def enrich_with_progress(
                         file_rec.hash_perceptual = _perceptual_hash(path)
                     elif mime.startswith(("video/", "audio/")):
                         file_rec.date_exif = _audio_date(path)
+                        if mime.startswith("video/"):
+                            file_rec.hash_perceptual = _perceptual_hash(path)
 
                     file_rec.date_best = _best_date(
                         file_rec.date_exif,

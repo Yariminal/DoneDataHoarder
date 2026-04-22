@@ -879,6 +879,8 @@ def bench(
 def config(
     edit_naming: Annotated[bool, typer.Option("--edit-naming", help="Open naming_rules.json in your default editor.")] = False,
     reset_naming: Annotated[bool, typer.Option("--reset-naming", help="Reset naming_rules.json to built-in defaults.")] = False,
+    edit_phash: Annotated[bool, typer.Option("--edit-phash", help="Open phash_config.json in your default editor.")] = False,
+    reset_phash: Annotated[bool, typer.Option("--reset-phash", help="Reset phash_config.json to built-in defaults.")] = False,
 ):
     """[bold]Manage[/bold] DataHoarder configuration files."""
     from datahoarder.config import (
@@ -887,6 +889,9 @@ def config(
         save_naming_rules,
         _DEFAULT_USELESS_STEM_PATTERNS,
         _DEFAULT_HYGIENE_CONFIG,
+        _DEFAULT_PHASH_CONFIG_FILE,
+        load_phash_config,
+        save_phash_config,
     )
 
     if reset_naming:
@@ -902,7 +907,6 @@ def config(
     if edit_naming:
         path = _DEFAULT_NAMING_RULES_FILE
         if not path.exists():
-            # Seed with defaults so user has something to edit
             defaults = {
                 "useless_stem_patterns": _DEFAULT_USELESS_STEM_PATTERNS,
                 "hygiene": _DEFAULT_HYGIENE_CONFIG,
@@ -920,6 +924,42 @@ def config(
             editor = os.environ.get("EDITOR", "nano")
             subprocess.run([editor, str(path)])
         console.print(f"[green]Saved[/green] naming rules: {path}")
+        return
+
+    if reset_phash:
+        from datahoarder.phash import DEFAULT_ALGORITHM, DEFAULT_HASH_SIZE, DEFAULT_THRESHOLD, DEFAULT_VIDEO_ENABLED
+        defaults = {
+            "algorithm": DEFAULT_ALGORITHM,
+            "hash_size": DEFAULT_HASH_SIZE,
+            "threshold": DEFAULT_THRESHOLD,
+            "video_enabled": DEFAULT_VIDEO_ENABLED,
+        }
+        save_phash_config(defaults)
+        console.print(f"[green]Reset[/green] perceptual hash config to defaults: {_DEFAULT_PHASH_CONFIG_FILE}")
+        return
+
+    if edit_phash:
+        path = _DEFAULT_PHASH_CONFIG_FILE
+        if not path.exists():
+            from datahoarder.phash import DEFAULT_ALGORITHM, DEFAULT_HASH_SIZE, DEFAULT_THRESHOLD, DEFAULT_VIDEO_ENABLED
+            defaults = {
+                "algorithm": DEFAULT_ALGORITHM,
+                "hash_size": DEFAULT_HASH_SIZE,
+                "threshold": DEFAULT_THRESHOLD,
+                "video_enabled": DEFAULT_VIDEO_ENABLED,
+            }
+            save_phash_config(defaults)
+            console.print(f"[green]Created[/green] default perceptual hash config: {path}")
+        import subprocess
+        import platform
+        if platform.system() == "Windows":
+            subprocess.run(["notepad", str(path)])
+        elif platform.system() == "Darwin":
+            subprocess.run(["open", "-t", str(path)])
+        else:
+            editor = os.environ.get("EDITOR", "nano")
+            subprocess.run([editor, str(path)])
+        console.print(f"[green]Saved[/green] perceptual hash config: {path}")
         return
 
     # Default: show current config status
@@ -940,6 +980,17 @@ def config(
         str(_DEFAULT_NAMING_RULES_FILE),
     )
     console.print(table)
+
+    phash = load_phash_config()
+    ptable = Table(title="Perceptual Hash Config", show_lines=True)
+    ptable.add_column("Setting", style="cyan")
+    ptable.add_column("Value", style="bold")
+    ptable.add_row("Algorithm", phash.get("algorithm", "phash"))
+    ptable.add_row("Hash size", str(phash.get("hash_size", 8)))
+    ptable.add_row("Threshold", str(phash.get("threshold", 8)))
+    ptable.add_row("Video enabled", "Yes" if phash.get("video_enabled", True) else "No")
+    ptable.add_row("Config file", str(_DEFAULT_PHASH_CONFIG_FILE))
+    console.print(ptable)
 
 
 # ---------------------------------------------------------------------------

@@ -26,13 +26,20 @@ from datahoarder.db.models import (
 )
 from datahoarder.db.session import get_engine
 
+from datahoarder.config import load_phash_config
+from datahoarder.phash import (
+    hash_distance,
+    is_near_duplicate,
+)
+
 try:
     import imagehash
     _HAS_IMAGEHASH = True
 except ImportError:
     _HAS_IMAGEHASH = False
 
-PHASH_THRESHOLD = 8  # max bit-distance to consider "near-duplicate" (lowered from 10 for better sensitivity)
+# Threshold loaded from user config (defaults to 8)
+AI_SIMILARITY_THRESHOLD = 0.55  # min similarity score for AI-based duplicates
 AI_SIMILARITY_THRESHOLD = 0.55  # min similarity score for AI-based duplicates
 TEXT_NEAR_THRESHOLD = 0.90  # min SequenceMatcher ratio for near-identical text files
 TEXT_DEDUP_SIZE_CAP = 200_000  # skip text files larger than ~200 KB to keep O(n^2) bounded
@@ -151,10 +158,19 @@ def find_exact_duplicates(session_id: str | None = None) -> dict:
 # Stage 2 — Perceptual duplicates (pHash)
 # ---------------------------------------------------------------------------
 
-def find_perceptual_duplicates(threshold: int = PHASH_THRESHOLD, session_id: str | None = None) -> dict:
-    """Find near-duplicate images using perceptual hashing."""
+def find_perceptual_duplicates(threshold: int | None = None, session_id: str | None = None) -> dict:
+    """
+    Find near-duplicate images and videos using perceptual hashing.
+
+    Uses the configured threshold (or the provided override).  Includes both
+    image/* and video/* MIME types now that the enricher extracts frame
+    thumbnails for videos.
+    """
     if not _HAS_IMAGEHASH:
         return {"error": "imagehash not installed"}
+
+    cfg = load_phash_config()
+    threshold = threshold if threshold is not None else cfg.get("threshold", 8)
 
     engine = get_engine()
     counts = {"groups": 0, "duplicates": 0}
@@ -163,7 +179,9 @@ def find_perceptual_duplicates(threshold: int = PHASH_THRESHOLD, session_id: str
         q = (
             session.query(File.id, File.hash_perceptual)
             .filter(File.hash_perceptual.isnot(None))
-            .filter(File.mime_type.like("image/%"))
+            .filter(
+                (File.mime_type.like("image/%")) | (File.mime_type.like("video/%"))
+            )
         )
         if session_id:
             q = q.filter(File.session_id == session_id)
@@ -172,10 +190,10 @@ def find_perceptual_duplicates(threshold: int = PHASH_THRESHOLD, session_id: str
     if not rows:
         return counts
 
-    # Build list of (id, pHash) pairs
-    hashes = [(fid, imagehash.hex_to_hash(phash)) for fid, phash in rows]
+    # Build list of (id, pHash_str) pairs — keep strings for hash_distance
+    hashes = rows  # [(fid, phash_str), ...]
 
-    # O(n²) comparison — acceptable for up to ~50k images; can be improved with BK-tree
+    # O(n²) comparison — acceptable for up to ~50k items; can be improved with BK-tree
     visited: set[int] = set()
     groups: list[list[int]] = []
 
@@ -186,7 +204,7 @@ def find_perceptual_duplicates(threshold: int = PHASH_THRESHOLD, session_id: str
         TaskProgressColumn(),
         TimeElapsedColumn(),
     ) as progress:
-        task = progress.add_task("Comparing image hashes…", total=len(hashes))
+        task = progress.add_task("Comparing perceptual hashes…", total=len(hashes))
 
         for i, (id_a, hash_a) in enumerate(hashes):
             progress.advance(task)
@@ -196,7 +214,7 @@ def find_perceptual_duplicates(threshold: int = PHASH_THRESHOLD, session_id: str
             for id_b, hash_b in hashes[i + 1:]:
                 if id_b in visited:
                     continue
-                if abs(hash_a - hash_b) <= threshold:
+                if is_near_duplicate(hash_a, hash_b, threshold=threshold):
                     group.append(id_b)
             if len(group) > 1:
                 for gid in group:

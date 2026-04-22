@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 _DEFAULT_CONFIG_DIR = Path.home() / ".datahoarder"
 _DEFAULT_NAMING_RULES_FILE = _DEFAULT_CONFIG_DIR / "naming_rules.json"
+_DEFAULT_PHASH_CONFIG_FILE = _DEFAULT_CONFIG_DIR / "phash_config.json"
 
 # Built-in default naming rules (matches former namer.py hard-coded values)
 _DEFAULT_USELESS_STEM_PATTERNS = [
@@ -100,3 +101,73 @@ def get_hygiene_config(config_path: Optional[Path] = None) -> dict[str, str]:
     """Return hygiene character regexes."""
     rules = load_naming_rules(config_path)
     return rules.get("hygiene", _DEFAULT_HYGIENE_CONFIG)
+
+
+# ---------------------------------------------------------------------------
+# Perceptual hash configuration
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PHASH_CONFIG = {
+    "algorithm": "phash",
+    "hash_size": 8,
+    "threshold": 8,
+    "video_enabled": True,
+}
+
+_VALID_ALGORITHMS = {"phash", "dhash", "whash", "ahash"}
+
+
+def load_phash_config(config_path: Optional[Path] = None) -> dict[str, Any]:
+    """
+    Load perceptual hash config from ~/.datahoarder/phash_config.json.
+
+    Returns dict with:
+      - algorithm:   one of phash|dhash|whash|ahash
+      - hash_size:   int (must be power of 2, >= 4)
+      - threshold:   int (max Hamming distance to consider "near-duplicate")
+      - video_enabled: bool (whether to extract video frame thumbnails for hashing)
+    """
+    path = config_path or _DEFAULT_PHASH_CONFIG_FILE
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    else:
+        data = {}
+
+    # Merge with defaults and validate
+    result = dict(_DEFAULT_PHASH_CONFIG)
+    result.update(data)
+
+    # Coerce / validate
+    algo = str(result.get("algorithm", "phash")).lower()
+    if algo not in _VALID_ALGORITHMS:
+        algo = "phash"
+    result["algorithm"] = algo
+
+    try:
+        result["hash_size"] = int(result["hash_size"])
+        if result["hash_size"] < 4:
+            result["hash_size"] = 4
+    except (ValueError, TypeError):
+        result["hash_size"] = 8
+
+    try:
+        result["threshold"] = int(result["threshold"])
+        if result["threshold"] < 0:
+            result["threshold"] = 0
+    except (ValueError, TypeError):
+        result["threshold"] = 8
+
+    result["video_enabled"] = bool(result.get("video_enabled", True))
+    return result
+
+
+def save_phash_config(data: dict[str, Any], config_path: Optional[Path] = None) -> None:
+    """Persist perceptual hash config to ~/.datahoarder/phash_config.json."""
+    _ensure_dir()
+    path = config_path or _DEFAULT_PHASH_CONFIG_FILE
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
