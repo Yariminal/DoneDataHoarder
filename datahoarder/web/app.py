@@ -25,7 +25,7 @@ def create_app(db_path: Path) -> FastAPI:
     app = FastAPI(
         title="DataHoarder",
         description="AI-powered file organization",
-        version="0.1.0",
+        version="0.3.0",
     )
 
     # Mount static files and templates
