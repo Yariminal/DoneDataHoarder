@@ -21,6 +21,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from datahoarder.config import get_compiled_useless_patterns, get_hygiene_config
 from datahoarder.db.models import File, FileStatus, Proposal, ProposalStatus, ProposalType, UserSession
 from datahoarder.db.session import get_engine
 
@@ -34,32 +35,15 @@ DOC_EXTENSIONS = {
     ".pptx", ".ppt", ".txt", ".md", ".rtf",
 }
 
-# Stems that carry no information about the file's content. When a file has one
-# of these, it is always worth proposing a rename — even with weak AI signal
-# the result is unambiguously more useful than "1", "15.12", "IMG_1234", etc.
-# Patterns are matched case-insensitively against the lowercased stem.
-_USELESS_STEM_PATTERNS = [
-    re.compile(r"^\d+$"),                    # 1, 2, 99
-    re.compile(r"^\d+([._-]\d+)+$"),         # 15.12, 2018-01, 1_2_3
-    re.compile(r"^[a-z]$"),                  # a, b, c (single char)
-    re.compile(r"^untitled[\s_-]*\d*$"),     # untitled, untitled1, untitled_2
-    re.compile(r"^new[\s_-]*(file|document|image|folder)?[\s_-]*\d*$"),
-    re.compile(r"^document[\s_-]*\d*$"),     # document, document1
-    re.compile(r"^copy([\s_-]*of[\s_-]*)?$"),  # copy, copy of
-    re.compile(r"^scan[\s_-]*\d*$"),         # scan, scan_001
-    re.compile(r"^img[\s_-]*\d*$"),          # img, IMG_1234, img1
-    re.compile(r"^image[\s_-]*\d*$"),        # image1
-    re.compile(r"^dsc[\s_-]*\d*$"),          # DSC_1234, DSC0001 (camera default)
-    re.compile(r"^p\d+$"),                   # P1010234 (Panasonic camera)
-    re.compile(r"^photo[\s_-]*\d*$"),
-    re.compile(r"^picture[\s_-]*\d*$"),
-    re.compile(r"^file[\s_-]*\d*$"),
-    re.compile(r"^pdf[\s_-]*\d*$"),
-    re.compile(r"^doc[\s_-]*\d*$"),
-    re.compile(r"^temp[\s_-]*\d*$"),
-    re.compile(r"^tmp[\s_-]*\d*$"),
-    re.compile(r"^[a-z]{1,3}\d{1,4}$"),      # IMG1234-style 3-letter prefixes
-]
+# Lazy-loaded compiled patterns from ~/.datahoarder/naming_rules.json
+_useless_stem_patterns_cache: list[re.Pattern] | None = None
+
+
+def _get_useless_patterns() -> list[re.Pattern]:
+    global _useless_stem_patterns_cache
+    if _useless_stem_patterns_cache is None:
+        _useless_stem_patterns_cache = get_compiled_useless_patterns()
+    return _useless_stem_patterns_cache
 
 
 def _is_useless_stem(stem: str) -> bool:
@@ -73,7 +57,7 @@ def _is_useless_stem(stem: str) -> bool:
     s = stem.strip().lower()
     if not s:
         return True
-    return any(p.match(s) for p in _USELESS_STEM_PATTERNS)
+    return any(p.match(s) for p in _get_useless_patterns())
 
 
 def _folder_context_fallback(file_rec: File) -> Optional[str]:
@@ -114,14 +98,15 @@ def _safe(text: str) -> str:
     return text[:60]
 
 
-# Filesystem characters that are either illegal on Windows / macOS / Linux or
-# known to cause friction (shell escaping, URL encoding, cloud-sync choking).
-# `_hygienic_stem` rewrites any occurrence of these to a single underscore.
-_ILLEGAL_FS_CHARS = re.compile(r'[<>:"|?*\\/\x00-\x1f]')
-# Characters that are legal but noisy — parentheses, brackets, hash, ampersand,
-# percent, exclamation, semicolon, comma. Keep dot (for version markers like
-# "v1.2"), hyphen (intentional separator), apostrophe (proper-name possessives).
-_NOISY_FS_CHARS = re.compile(r'[()\[\]{}#&%!;,@$=+`~^]')
+# Hygiene regexes loaded from ~/.datahoarder/naming_rules.json
+_hygiene_config_cache: dict[str, str] | None = None
+
+
+def _get_hygiene_config() -> dict[str, str]:
+    global _hygiene_config_cache
+    if _hygiene_config_cache is None:
+        _hygiene_config_cache = get_hygiene_config()
+    return _hygiene_config_cache
 
 
 def _hygienic_stem(stem: str) -> str:
@@ -138,11 +123,15 @@ def _hygienic_stem(stem: str) -> str:
       "too    many   spaces"                -> "too_many_spaces"
       "normal_file_name"                    -> "normal_file_name"  (no change)
     """
+    cfg = _get_hygiene_config()
+    illegal_re = re.compile(cfg.get("illegal_chars_regex", r'[<>:"|?*\\/\x00-\x1f]'))
+    noisy_re = re.compile(cfg.get("noisy_chars_regex", r'[()\[\]{}#&%!;,@$=+`~^]'))
+
     s = stem.strip()
     # Illegal chars first — must be rewritten, never just stripped.
-    s = _ILLEGAL_FS_CHARS.sub("_", s)
+    s = illegal_re.sub("_", s)
     # Noisy but legal chars — rewrite to underscore for visual consistency.
-    s = _NOISY_FS_CHARS.sub("_", s)
+    s = noisy_re.sub("_", s)
     # Whitespace runs -> single underscore.
     s = re.sub(r"\s+", "_", s)
     # Collapse duplicate underscores (may have been introduced above).

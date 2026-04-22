@@ -713,6 +713,77 @@ def serve(
 
 
 # ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+@app.command()
+def config(
+    edit_naming: Annotated[bool, typer.Option("--edit-naming", help="Open naming_rules.json in your default editor.")] = False,
+    reset_naming: Annotated[bool, typer.Option("--reset-naming", help="Reset naming_rules.json to built-in defaults.")] = False,
+):
+    """[bold]Manage[/bold] DataHoarder configuration files."""
+    from datahoarder.config import (
+        _DEFAULT_NAMING_RULES_FILE,
+        load_naming_rules,
+        save_naming_rules,
+        _DEFAULT_USELESS_STEM_PATTERNS,
+        _DEFAULT_HYGIENE_CONFIG,
+    )
+
+    if reset_naming:
+        defaults = {
+            "useless_stem_patterns": _DEFAULT_USELESS_STEM_PATTERNS,
+            "hygiene": _DEFAULT_HYGIENE_CONFIG,
+            "user_patterns": [],
+        }
+        save_naming_rules(defaults)
+        console.print(f"[green]Reset[/green] naming rules to defaults: {_DEFAULT_NAMING_RULES_FILE}")
+        return
+
+    if edit_naming:
+        path = _DEFAULT_NAMING_RULES_FILE
+        if not path.exists():
+            # Seed with defaults so user has something to edit
+            defaults = {
+                "useless_stem_patterns": _DEFAULT_USELESS_STEM_PATTERNS,
+                "hygiene": _DEFAULT_HYGIENE_CONFIG,
+                "user_patterns": [],
+            }
+            save_naming_rules(defaults)
+            console.print(f"[green]Created[/green] default naming rules: {path}")
+        import subprocess
+        import platform
+        if platform.system() == "Windows":
+            subprocess.run(["notepad", str(path)])
+        elif platform.system() == "Darwin":
+            subprocess.run(["open", "-t", str(path)])
+        else:
+            editor = os.environ.get("EDITOR", "nano")
+            subprocess.run([editor, str(path)])
+        console.print(f"[green]Saved[/green] naming rules: {path}")
+        return
+
+    # Default: show current config status
+    rules = load_naming_rules()
+    table = Table(title="Naming Rules", show_lines=True)
+    table.add_column("Setting", style="cyan")
+    table.add_column("Value", style="bold")
+    table.add_row(
+        "Built-in patterns",
+        str(len(rules.get("useless_stem_patterns", []))),
+    )
+    table.add_row(
+        "User patterns",
+        str(len(rules.get("user_patterns", []))),
+    )
+    table.add_row(
+        "Config file",
+        str(_DEFAULT_NAMING_RULES_FILE),
+    )
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
