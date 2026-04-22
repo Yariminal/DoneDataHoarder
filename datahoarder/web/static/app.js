@@ -380,7 +380,9 @@ document.addEventListener('alpine:init', () => {
     },
     async load() {
       try {
-        this.stats = await api.get('/stats');
+        const sid = Alpine.store('session').current_session_id;
+        const url = sid ? `/stats?session_id=${sid}` : '/stats';
+        this.stats = await api.get(url);
         this._loadedVersion = window._dataVersion;
       } catch (e) {
         Alpine.store('app').toast('Failed to load stats', 'error');
@@ -439,6 +441,8 @@ document.addEventListener('alpine:init', () => {
         if (this.statusFilter) url += `&status=${this.statusFilter}`;
         if (this.mimeFilter) url += `&mime_prefix=${this.mimeFilter}`;
         if (this.search) url += `&search=${encodeURIComponent(this.search)}`;
+        const sid = Alpine.store('session').current_session_id;
+        if (sid) url += `&session_id=${sid}`;
         const data = await api.get(url);
         this.files = data.items;
         this.total = data.total;
@@ -513,6 +517,8 @@ document.addEventListener('alpine:init', () => {
         if (this.typeFilter)   url += `&proposal_type=${this.typeFilter}`;
         if (this.minConfidence > 0) url += `&min_confidence=${this.minConfidence / 100}`;
         if (this.search) url += `&search=${encodeURIComponent(this.search)}`;
+        const sid = Alpine.store('session').current_session_id;
+        if (sid) url += `&session_id=${sid}`;
         const data = await api.get(url);
         this.proposals = data.items;
         this.total = data.total;

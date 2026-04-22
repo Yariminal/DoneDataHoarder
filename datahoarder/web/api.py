@@ -33,11 +33,6 @@ from datahoarder.db.models import (
 )
 from datahoarder.db.session import get_engine
 
-# ---------------------------------------------------------------------------
-# Global: current active session ID (set by frontend, used by all endpoints)
-# ---------------------------------------------------------------------------
-_current_session_id: str | None = None
-
 router = APIRouter()
 
 
@@ -186,9 +181,6 @@ def create_session(body: CreateSessionRequest):
         session.add(user_session)
         session.commit()
 
-        global _current_session_id
-        _current_session_id = user_session.id
-
         return {
             "id": user_session.id,
             "name": user_session.name,
@@ -283,9 +275,6 @@ def get_session_detail(session_id: str):
             .filter(DuplicateGroup.session_id == session_id)
             .scalar() or 0
         )
-
-        global _current_session_id
-        _current_session_id = session_id
 
         return {
             "id": user_session.id,
@@ -420,16 +409,12 @@ def delete_session(session_id: str):
         session.delete(user_session)
         session.commit()
 
-    global _current_session_id
-    if _current_session_id == session_id:
-        _current_session_id = None
-
     return {"status": "deleted", "id": session_id}
 
 
 def _require_session_id(body_session_id: str = "") -> str:
-    """Helper: resolve the active session_id from request body or global state."""
-    sid = body_session_id or _current_session_id
+    """Helper: resolve the active session_id from request body."""
+    sid = body_session_id
     if not sid:
         raise HTTPException(400, "No active session. Create or load a session first.")
     return sid
@@ -491,8 +476,8 @@ def _mark_session_unsaved(session_id: str, step: str | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 @router.get("/stats", response_model=StatsResponse)
-def get_stats():
-    sid = _current_session_id
+def get_stats(session_id: Optional[str] = None):
+    sid = session_id
     engine = get_engine()
     with Session(engine) as session:
         file_q = session.query(File)
@@ -578,12 +563,13 @@ def list_files(
     order: str = "asc",
     page: int = 1,
     per_page: int = 50,
+    session_id: Optional[str] = None,
 ):
     engine = get_engine()
     with Session(engine) as session:
         query = session.query(File)
-        if _current_session_id:
-            query = query.filter(File.session_id == _current_session_id)
+        if session_id:
+            query = query.filter(File.session_id == session_id)
 
         if status:
             try:
@@ -737,12 +723,13 @@ def list_proposals(
     order: str = "desc",
     page: int = 1,
     per_page: int = 50,
+    session_id: Optional[str] = None,
 ):
     engine = get_engine()
     with Session(engine) as session:
         query = session.query(Proposal).join(File)
-        if _current_session_id:
-            query = query.filter(File.session_id == _current_session_id)
+        if session_id:
+            query = query.filter(File.session_id == session_id)
 
         if status:
             try:
@@ -940,7 +927,7 @@ def set_keeper(group_id: int, body: SetKeeperRequest):
 def execute_proposals(body: ExecuteRequest):
     from datahoarder.executor import execute as do_execute, _make_quiet_console
 
-    sid = body.session_id or _current_session_id
+    sid = body.session_id
     if not sid:
         raise HTTPException(400, "No active session. Create or load a session first.")
 
