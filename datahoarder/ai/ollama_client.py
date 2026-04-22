@@ -277,10 +277,10 @@ class OllamaClient(BaseAIClient):
         Defaults to temperature=0.0 + seed=42 for deterministic structured output.
         This makes repeated calls with the same input produce the same JSON.
         """
-        from pydantic import create_model
+        from datahoarder.ai.json_utils import LooseDict
 
         if model_cls is None:
-            model_cls = create_model("LooseDict", __base__=dict)
+            model_cls = LooseDict
 
         if image_path or image_bytes or images_list:
             generate_fn = lambda **kw: self.generate_with_image(

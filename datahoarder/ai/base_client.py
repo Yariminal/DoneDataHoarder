@@ -84,10 +84,10 @@ class BaseAIClient(ABC):
         If *model_cls* is provided, the parsed JSON is validated against it.
         If None, a loose dict schema is used.
         """
-        from pydantic import create_model
+        from datahoarder.ai.json_utils import LooseDict
 
         if model_cls is None:
-            model_cls = create_model("LooseDict", __base__=dict)
+            model_cls = LooseDict
 
         if image_path or image_bytes or images_list:
             generate_fn = lambda **kw: self.generate_with_image(

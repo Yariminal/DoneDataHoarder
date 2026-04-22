@@ -15,9 +15,15 @@ import re
 import time
 from typing import Any, Callable, Optional, Type, TypeVar
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 T = TypeVar("T", bound=BaseModel)
+
+
+class LooseDict(BaseModel):
+    """Accepts any JSON object — validates as a dict with arbitrary keys."""
+    model_config = ConfigDict(extra="allow")
+
 
 MAX_RETRIES = 3
 BASE_DELAY = 1.0  # seconds
