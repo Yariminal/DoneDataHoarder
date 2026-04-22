@@ -12,7 +12,6 @@ Parallelism model:
     connection pool exhaustion when workers > 1.
   - GPU safety: WhisperModel runs on CPU (fixed), so no GPU contention with Ollama.
 """
-import logging
 import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -33,8 +32,9 @@ from datahoarder.analyzers.video import VideoAnalyzer
 from datahoarder.core.context import build_context
 from datahoarder.db.models import File, FileStatus
 from datahoarder.db.session import get_engine
+from datahoarder.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 QUERY_BATCH = 50
 
@@ -65,7 +65,14 @@ def _process_one_file(
         if not file_rec:
             return file_id, "error", "File not found in DB"
 
-        logger.debug("Processing file %d: %s (%s)", file_id, file_rec.filename, file_rec.mime_type)
+        logger.debug(
+            "Processing file",
+            extra={
+                "file_id": file_id,
+                "filename": file_rec.filename,
+                "mime_type": file_rec.mime_type,
+            },
+        )
 
         ext = file_rec.extension or ""
         if ext in skip_ext:
@@ -96,10 +103,25 @@ def _process_one_file(
             analyzer.save_result(
                 file_rec, result, model_name=str(type(client).__name__),
             )
+            logger.info(
+                "AI analysis complete",
+                extra={
+                    "file_id": file_id,
+                    "filename": file_rec.filename,
+                    "model": str(type(client).__name__),
+                },
+            )
             return file_id, "analyzed", None
         except Exception as exc:
             tb = traceback.format_exc()
-            logger.warning("File %d failed: %s", file_id, exc)
+            logger.warning(
+                "AI analysis failed",
+                extra={
+                    "file_id": file_id,
+                    "filename": file_rec.filename,
+                    "error": str(exc),
+                },
+            )
             file_rec.status = FileStatus.ERROR
             file_rec.error_message = f"{exc}\n{tb}"[:1000]
             session.commit()

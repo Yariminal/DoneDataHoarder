@@ -18,6 +18,9 @@ from sqlalchemy.orm import Session
 
 from datahoarder.db.models import File, FileStatus, ScanSession
 from datahoarder.db.session import get_engine
+from datahoarder.logging import get_logger
+
+logger = get_logger(__name__)
 
 BATCH_SIZE = 500
 
@@ -216,6 +219,14 @@ def scan(
         scan_session_id = sess_record.id
 
     counts = {"new": 0, "skipped": 0, "errors": 0}
+    logger.info(
+        "Scan started",
+        extra={
+            "root": str(root.resolve()),
+            "force_rescan": force_rescan,
+            "session_id": session_id,
+        },
+    )
 
     with Progress(
         SpinnerColumn(),
@@ -231,6 +242,10 @@ def scan(
         def _flush(session: Session) -> None:
             if not batch:
                 return
+            logger.info(
+                "Flushing batch",
+                extra={"batch_size": len(batch), "counts": counts.copy()},
+            )
             for record in batch:
                 path_str = record["path"]
                 existing = session.query(File).filter_by(path=path_str).first()
@@ -281,8 +296,12 @@ def scan(
                     if session_id:
                         record["session_id"] = session_id
                     batch.append(record)
-                except (PermissionError, OSError):
+                except (PermissionError, OSError) as exc:
                     counts["errors"] += 1
+                    logger.warning(
+                        "Scan error for file",
+                        extra={"path": path_str, "error": str(exc)},
+                    )
                     continue
 
                 if len(batch) >= BATCH_SIZE:
@@ -305,4 +324,12 @@ def scan(
                 sess_record.completed = True
                 session.commit()
 
+    logger.info(
+        "Scan complete",
+        extra={
+            "new": counts["new"],
+            "skipped": counts["skipped"],
+            "errors": counts["errors"],
+        },
+    )
     return counts

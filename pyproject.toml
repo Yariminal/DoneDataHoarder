@@ -6,43 +6,71 @@ build-backend = "setuptools.build_meta"
 name = "datahoarder"
 version = "0.3.0"
 description = "AI-powered file organization for data hoarders"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "DataHoarder Contributors" },
+]
 requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Archiving",
+    "Topic :: Utilities",
+]
+keywords = ["file-organization", "ai", "photos", "documents", "deduplication"]
+
 dependencies = [
-    "sqlalchemy>=2.0",
-    "typer[all]>=0.12",
-    "rich>=13.0",
-    "pillow>=10.0",
-    "httpx>=0.27",
-    "pydantic>=2.0",
-    "python-dateutil>=2.9",
-    "imagehash>=4.3",
-    "exifread>=3.0",
-    "mutagen>=1.47",
+    "sqlalchemy>=2.0,<3.0",
+    "typer[all]>=0.12,<1.0",
+    "rich>=13.0,<15.0",
+    "pillow>=10.0,<13.0",
+    "httpx>=0.27,<1.0",
+    "pydantic>=2.0,<3.0",
+    "python-dateutil>=2.9,<3.0",
+    "imagehash>=4.3,<5.0",
+    "exifread>=3.0,<4.0",
+    "mutagen>=1.47,<2.0",
 ]
 
 [project.optional-dependencies]
 docs = [
-    "pdfplumber>=0.11",
-    "python-docx>=1.1",
-    "openpyxl>=3.1",
+    "pdfplumber>=0.11,<1.0",
+    "python-docx>=1.1,<2.0",
+    "openpyxl>=3.1,<4.0",
 ]
 video = [
-    "ffmpeg-python>=0.2",
-    "faster-whisper>=1.0",
+    "ffmpeg-python>=0.2,<1.0",
+    "faster-whisper>=1.0,<2.0",
 ]
 cloud = [
-    "google-generativeai>=0.8",
+    "google-generativeai>=0.8,<1.0",
 ]
 magic = [
     "python-magic-bin>=0.4.14; sys_platform == 'win32'",
     "python-magic>=0.4.27; sys_platform != 'win32'",
 ]
 web = [
-    "fastapi>=0.110",
-    "uvicorn[standard]>=0.29",
-    "jinja2>=3.1",
+    "fastapi>=0.110,<1.0",
+    "uvicorn[standard]>=0.29,<1.0",
+    "jinja2>=3.1,<4.0",
+]
+dev = [
+    "pytest>=9.0,<10.0",
+    "pytest-mock>=3.15,<4.0",
 ]
 all = ["datahoarder[docs,video,cloud,magic,web]"]
+
+[project.urls]
+Homepage = "https://github.com/Yariminal/DoneDataHoarder"
+Repository = "https://github.com/Yariminal/DoneDataHoarder.git"
+Issues = "https://github.com/Yariminal/DoneDataHoarder/issues"
 
 [project.scripts]
 datahoarder = "datahoarder.cli:app"

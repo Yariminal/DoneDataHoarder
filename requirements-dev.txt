@@ -1,0 +1,11 @@
+# Development dependencies for DataHoarder
+# Install with: pip install -e ".[dev]"
+#
+# For full feature support, also install extras:
+#   pip install -e ".[all]"
+#
+# Core dependencies are defined in pyproject.toml.
+
+-e .
+pytest>=9.0
+pytest-mock>=3.15

@@ -144,6 +144,9 @@ For contributing:
 ```bash
 git clone https://github.com/Yariminal/DoneDataHoarder.git
 cd DoneDataHoarder
-pip install -e .
-pip install ffmpeg-python faster-whisper  # Recommended for dev
+pip install -e ".[dev]"
+pip install -e ".[all]"  # Optional: all extras for full feature testing
 ```
+
+Development dependencies are listed in `requirements-dev.txt` (lightweight wrapper
+around `pyproject.toml` extras).

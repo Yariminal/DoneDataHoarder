@@ -41,6 +41,15 @@ app = typer.Typer(
 console = Console()
 
 
+@app.callback()
+def main_callback(
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Enable debug logging to console.", envvar="DATAHOARDER_LOG_VERBOSE")] = False,
+):
+    """Global options for all DataHoarder commands."""
+    from datahoarder.logging import setup_logging
+    setup_logging(verbose=verbose)
+
+
 def _init_db(db_path: str) -> Path:
     from datahoarder.db.session import init_db
     p = Path(db_path)

@@ -19,6 +19,9 @@ from sqlalchemy.orm import Session
 
 from datahoarder.db.models import File, FileStatus
 from datahoarder.db.session import get_engine
+from datahoarder.logging import get_logger
+
+logger = get_logger(__name__)
 
 # Optional heavy imports
 try:
@@ -233,6 +236,13 @@ def enrich(workers: int = 1, limit: Optional[int] = None, session_id: str | None
                         file_rec.status = FileStatus.ERROR
                         file_rec.error_message = str(exc)[:500]
                         counts["errors"] += 1
+                        logger.warning(
+                            "Enrichment failed",
+                            extra={
+                                "path": str(path),
+                                "error": str(exc),
+                            },
+                        )
 
                     progress.advance(task)
 
@@ -241,6 +251,13 @@ def enrich(workers: int = 1, limit: Optional[int] = None, session_id: str | None
             if limit and (counts["enriched"] + counts["errors"]) >= limit:
                 break
 
+    logger.info(
+        "Enrichment complete",
+        extra={
+            "enriched": counts["enriched"],
+            "errors": counts["errors"],
+        },
+    )
     return counts
 
 
