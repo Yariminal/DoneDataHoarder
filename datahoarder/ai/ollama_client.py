@@ -4,17 +4,19 @@ Ollama client — talks to a local Ollama instance.
 Supports:
 - Text-only generation (llama3, mistral, gemma, etc.)
 - Vision generation (llava, bakllava, gemma3, etc.) with base64 images
+- Structured JSON output with retry logic via json_utils
 
 Ollama API docs: https://github.com/ollama/ollama/blob/main/docs/api.md
 """
 import base64
-import json
-import re
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
+
+from datahoarder.ai.circuit_breaker import CircuitBreaker
+from datahoarder.ai.json_utils import generate_json_with_retry
 
 DEFAULT_HOST = "http://localhost:11434"
 
@@ -35,10 +37,16 @@ class OllamaClient:
         host: str = DEFAULT_HOST,
         text_model: str = DEFAULT_TEXT_MODEL,
         vision_model: str = DEFAULT_VISION_MODEL,
+        failure_threshold: int = 3,
+        recovery_timeout: float = 60.0,
     ):
         self.host = host.rstrip("/")
         self.text_model = text_model
         self.vision_model = vision_model
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=failure_threshold,
+            recovery_timeout_seconds=recovery_timeout,
+        )
         # NOTE: We create a fresh httpx client per request (via _request)
         # instead of sharing one across threads. A shared httpx.Client
         # causes connection pool deadlocks when multiple threads hit
@@ -78,8 +86,32 @@ class OllamaClient:
         system: Optional[str] = None,
         temperature: float = 0.2,
         seed: Optional[int] = None,
+        **kwargs: Any,
     ) -> str:
         """Send a text prompt, return the response string."""
+        if not self.circuit_breaker.is_healthy():
+            raise RuntimeError(
+                f"Ollama backend is unhealthy: circuit breaker is {self.circuit_breaker.state}. "
+                f"Run 'datahoarder doctor' to diagnose, or switch to Gemini backend."
+            )
+        try:
+            return self._do_generate(
+                prompt, model, system, temperature, seed, **kwargs
+            )
+        except Exception:
+            self.circuit_breaker.record_failure()
+            raise
+
+    def _do_generate(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        system: Optional[str] = None,
+        temperature: float = 0.2,
+        seed: Optional[int] = None,
+        **kwargs: Any,
+    ) -> str:
+        """Internal: actual HTTP call for text generation."""
         model = model or self.text_model
         options: dict = {"temperature": temperature}
         if seed is not None:
@@ -93,11 +125,23 @@ class OllamaClient:
         if system:
             payload["system"] = system
 
+        # Ollama structured-output support: map response_format -> format
+        response_format = kwargs.get("response_format")
+        if response_format is not None:
+            # Ollama accepts "format": "json" or a JSON schema dict
+            fmt = response_format.get("type")
+            if fmt == "json_object":
+                payload["format"] = "json"
+            elif isinstance(response_format, dict):
+                payload["format"] = response_format
+
         with _OLLAMA_REQUEST_LOCK:
             with httpx.Client(timeout=TIMEOUT) as client:
                 resp = client.post(f"{self.host}/api/generate", json=payload)
                 resp.raise_for_status()
-                return resp.json().get("response", "").strip()
+                result = resp.json().get("response", "").strip()
+                self.circuit_breaker.record_success()
+                return result
 
     # ------------------------------------------------------------------
     # Vision generation
@@ -113,8 +157,36 @@ class OllamaClient:
         system: Optional[str] = None,
         temperature: float = 0.2,
         seed: Optional[int] = None,
+        **kwargs: Any,
     ) -> str:
         """Send a prompt + one or more images, return the response string."""
+        if not self.circuit_breaker.is_healthy():
+            raise RuntimeError(
+                f"Ollama backend is unhealthy: circuit breaker is {self.circuit_breaker.state}. "
+                f"Run 'datahoarder doctor' to diagnose, or switch to Gemini backend."
+            )
+        try:
+            return self._do_generate_with_image(
+                prompt, image_path, image_bytes, images_list,
+                model, system, temperature, seed, **kwargs
+            )
+        except Exception:
+            self.circuit_breaker.record_failure()
+            raise
+
+    def _do_generate_with_image(
+        self,
+        prompt: str,
+        image_path: Path | None = None,
+        image_bytes: bytes | None = None,
+        images_list: list[bytes] | None = None,
+        model: Optional[str] = None,
+        system: Optional[str] = None,
+        temperature: float = 0.2,
+        seed: Optional[int] = None,
+        **kwargs: Any,
+    ) -> str:
+        """Internal: actual HTTP call for vision generation."""
         model = model or self.vision_model
 
         b64_images = []
@@ -147,11 +219,22 @@ class OllamaClient:
         if system:
             payload["system"] = system
 
+        # Ollama structured-output support: map response_format -> format
+        response_format = kwargs.get("response_format")
+        if response_format is not None:
+            fmt = response_format.get("type")
+            if fmt == "json_object":
+                payload["format"] = "json"
+            elif isinstance(response_format, dict):
+                payload["format"] = response_format
+
         with _OLLAMA_REQUEST_LOCK:
             with httpx.Client(timeout=TIMEOUT) as client:
                 resp = client.post(f"{self.host}/api/generate", json=payload)
                 resp.raise_for_status()
-                return resp.json().get("response", "").strip()
+                result = resp.json().get("response", "").strip()
+                self.circuit_breaker.record_success()
+                return result
 
     # ------------------------------------------------------------------
     # Structured JSON extraction helper
@@ -167,67 +250,63 @@ class OllamaClient:
         system: Optional[str] = None,
         temperature: float = 0.0,
         seed: int = 42,
+        max_retries: int = 3,
     ) -> dict:
         """
         Like generate / generate_with_image but instructs the model to return
-        valid JSON and parses the result.  Falls back to raw text on parse error.
+        valid JSON and parses the result.  Uses shared json_utils with retry.
 
         Defaults to temperature=0.0 + seed=42 for deterministic structured output.
         This makes repeated calls with the same input produce the same JSON.
         """
-        json_instruction = (
-            "\n\nYou MUST respond with valid JSON only. "
-            "No markdown, no explanation, no code fences. Just raw JSON."
-        )
-        full_prompt = prompt + json_instruction
+        from pydantic import create_model
+
+        # Build a loose Pydantic model that accepts any dict keys so we can
+        # validate JSON structure without requiring every caller to supply a schema.
+        LooseDict = create_model("LooseDict", __base__=dict)
 
         if image_path or image_bytes or images_list:
-            raw = self.generate_with_image(
-                full_prompt, image_path=image_path, image_bytes=image_bytes,
-                images_list=images_list, model=model, system=system,
-                temperature=temperature, seed=seed,
+            generate_fn = lambda **kw: self.generate_with_image(
+                kw.pop("prompt", prompt),
+                image_path=image_path,
+                image_bytes=image_bytes,
+                images_list=images_list,
+                model=model,
+                system=kw.pop("system", system),
+                temperature=kw.pop("temperature", temperature),
+                seed=kw.pop("seed", seed),
+                **kw,
             )
         else:
-            raw = self.generate(full_prompt, model=model, system=system,
-                                temperature=temperature, seed=seed)
+            generate_fn = lambda **kw: self.generate(
+                kw.pop("prompt", prompt),
+                model=model,
+                system=kw.pop("system", system),
+                temperature=kw.pop("temperature", temperature),
+                seed=kw.pop("seed", seed),
+                **kw,
+            )
 
-        # Strip any accidental markdown fences
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
+        return generate_json_with_retry(
+            generate_fn=generate_fn,
+            prompt=prompt,
+            model_cls=LooseDict,
+            system=system,
+            temperature=temperature,
+            seed=seed,
+            max_retries=max_retries,
+            response_format={"type": "json_object"},
+        ).model_dump()
 
-        # LLMs often produce Windows-style backslashes in paths (e.g. LOGOS\תנורים)
-        # which are invalid JSON escapes. Fix them before parsing.
-        def _fix_json(text: str) -> str:
-            return re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', text)
+    # ------------------------------------------------------------------
+    # Health
+    # ------------------------------------------------------------------
 
-        for attempt_raw in (raw, _fix_json(raw)):
-            try:
-                return json.loads(attempt_raw)
-            except json.JSONDecodeError:
-                pass
-
-        # Try to extract a JSON array [...] or object {...}
-        for attempt_raw in (raw, _fix_json(raw)):
-            arr_start = attempt_raw.find("[")
-            arr_end = attempt_raw.rfind("]")
-            if arr_start != -1 and arr_end != -1:
-                try:
-                    return json.loads(attempt_raw[arr_start : arr_end + 1])
-                except json.JSONDecodeError:
-                    pass
-            start = attempt_raw.find("{")
-            end = attempt_raw.rfind("}")
-            if start != -1 and end != -1:
-                try:
-                    return json.loads(attempt_raw[start : end + 1])
-                except json.JSONDecodeError:
-                    pass
-
-        return {"raw_response": raw}
+    def is_healthy(self) -> bool:
+        """Return True if the circuit breaker allows traffic AND Ollama is reachable."""
+        if not self.circuit_breaker.is_healthy():
+            return False
+        return self.is_available()
 
     def close(self):
         pass  # No shared client to close

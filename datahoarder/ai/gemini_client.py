@@ -4,10 +4,11 @@ Gemini client — optional cloud AI backend (Google Gemini 2.0 Flash / Pro).
 Usage requires:  pip install google-generativeai
 and setting:     GEMINI_API_KEY environment variable (or passing api_key=).
 """
-import json
 import os
 from pathlib import Path
-from typing import Optional, Any
+from typing import Any, Optional
+
+from datahoarder.ai.json_utils import generate_json_with_retry
 
 try:
     import google.generativeai as genai
@@ -39,8 +40,24 @@ class GeminiClient:
         genai.configure(api_key=key)
         self._model = genai.GenerativeModel(model)
 
-    def generate(self, prompt: str, temperature: float = 0.2) -> str:
+    def generate(
+        self,
+        prompt: str,
+        temperature: float = 0.2,
+        **kwargs: Any,
+    ) -> str:
         cfg = genai.types.GenerationConfig(temperature=temperature)
+        # Gemini supports response_format via generation_config for Flash models
+        response_format = kwargs.get("response_format")
+        if response_format is not None:
+            try:
+                # Newer SDK versions accept response_mime_type="application/json"
+                cfg = genai.types.GenerationConfig(
+                    temperature=temperature,
+                    response_mime_type="application/json",
+                )
+            except Exception:
+                pass  # fallback to plain generation if SDK too old
         resp = self._model.generate_content(prompt, generation_config=cfg)
         return resp.text.strip()
 
@@ -52,6 +69,7 @@ class GeminiClient:
         images_list: list[bytes] | None = None,
         mime_type: str = "image/jpeg",
         temperature: float = 0.2,
+        **kwargs: Any,
     ) -> str:
         parts: list[Any] = [prompt]
 
@@ -69,6 +87,15 @@ class GeminiClient:
             raise ValueError("At least one image must be provided")
 
         cfg = genai.types.GenerationConfig(temperature=temperature)
+        response_format = kwargs.get("response_format")
+        if response_format is not None:
+            try:
+                cfg = genai.types.GenerationConfig(
+                    temperature=temperature,
+                    response_mime_type="application/json",
+                )
+            except Exception:
+                pass
         resp = self._model.generate_content(parts, generation_config=cfg)
         return resp.text.strip()
 
@@ -79,36 +106,41 @@ class GeminiClient:
         image_bytes: bytes | None = None,
         images_list: list[bytes] | None = None,
         mime_type: str = "image/jpeg",
+        temperature: float = 0.0,
+        seed: int = 42,
+        max_retries: int = 3,
     ) -> dict:
-        json_instruction = (
-            "\n\nRespond with valid JSON only. "
-            "No markdown code fences, no explanation. Raw JSON."
-        )
-        full_prompt = prompt + json_instruction
+        """
+        Like generate / generate_with_image but instructs the model to return
+        valid JSON and parses the result.  Uses shared json_utils with retry.
+        """
+        from pydantic import create_model
+
+        LooseDict = create_model("LooseDict", __base__=dict)
 
         if image_path or image_bytes or images_list:
-            raw = self.generate_with_image(
-                full_prompt, image_path=image_path,
-                image_bytes=image_bytes, images_list=images_list,
+            generate_fn = lambda **kw: self.generate_with_image(
+                kw.pop("prompt", prompt),
+                image_path=image_path,
+                image_bytes=image_bytes,
+                images_list=images_list,
                 mime_type=mime_type,
+                temperature=kw.pop("temperature", temperature),
+                **kw,
             )
         else:
-            raw = self.generate(full_prompt)
+            generate_fn = lambda **kw: self.generate(
+                kw.pop("prompt", prompt),
+                temperature=kw.pop("temperature", temperature),
+                **kw,
+            )
 
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
-
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            start, end = raw.find("{"), raw.rfind("}")
-            if start != -1 and end != -1:
-                try:
-                    return json.loads(raw[start : end + 1])
-                except json.JSONDecodeError:
-                    pass
-            return {"raw_response": raw}
+        return generate_json_with_retry(
+            generate_fn=generate_fn,
+            prompt=prompt,
+            model_cls=LooseDict,
+            temperature=temperature,
+            seed=seed,
+            max_retries=max_retries,
+            response_format={"type": "json_object"},
+        ).model_dump()

@@ -5,9 +5,10 @@ Designed to be resumable: already-indexed files are skipped by default.
 All writes are batched (BATCH_SIZE) to keep SQLite happy on large drives.
 """
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional
 
 from rich.progress import (
     BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
@@ -19,6 +20,19 @@ from datahoarder.db.models import File, FileStatus, ScanSession
 from datahoarder.db.session import get_engine
 
 BATCH_SIZE = 500
+
+# Optional media-metadata imports for Linux birthtime fallback
+try:
+    import exifread
+    _HAS_EXIFREAD = True
+except ImportError:
+    _HAS_EXIFREAD = False
+
+try:
+    import mutagen
+    _HAS_MUTAGEN = True
+except ImportError:
+    _HAS_MUTAGEN = False
 
 # Directories we never want to descend into
 SKIP_DIRS: set[str] = {
@@ -57,6 +71,123 @@ def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[
         for name in filenames:
             if Path(name).suffix.lower() not in SKIP_EXTENSIONS:
                 yield Path(dirpath) / name
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform date_created extraction
+# ---------------------------------------------------------------------------
+
+_IMAGE_EXTENSIONS_FOR_EXIF = {
+    ".jpg", ".jpeg", ".png", ".tiff", ".tif",
+    ".webp", ".heic", ".heif",
+}
+_AUDIO_VIDEO_EXTENSIONS_FOR_MUTAGEN = {
+    ".mp3", ".m4a", ".flac", ".wav", ".ogg",
+    ".mp4", ".mov", ".avi", ".mkv", ".wmv",
+    ".m4v", ".3gp",
+}
+
+
+def _exif_date_created(path: Path) -> Optional[datetime]:
+    """Best-effort EXIF DateTimeOriginal extraction for birthtime fallback."""
+    if not _HAS_EXIFREAD:
+        return None
+    try:
+        with open(path, "rb") as f:
+            tags = exifread.process_file(f, stop_tag="EXIF DateTimeOriginal", details=False)
+        for tag_key in ("EXIF DateTimeOriginal", "EXIF DateTimeDigitized", "Image DateTime"):
+            tag = tags.get(tag_key)
+            if tag:
+                raw = str(tag).strip()
+                try:
+                    return datetime.strptime(raw, "%Y:%m:%d %H:%M:%S")
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    return None
+
+
+def _mutagen_date_created(path: Path) -> Optional[datetime]:
+    """Best-effort audio/video metadata date extraction for birthtime fallback."""
+    if not _HAS_MUTAGEN:
+        return None
+    try:
+        f = mutagen.File(str(path), easy=True)
+        if not f:
+            return None
+        for key in ("date", "year", "tdrc"):
+            val = f.get(key)
+            if val:
+                raw = str(val[0]).strip()
+                for fmt in ("%Y-%m-%d", "%Y", "%Y-%m-%dT%H:%M:%S"):
+                    try:
+                        return datetime.strptime(raw[: len(fmt)], fmt)
+                    except ValueError:
+                        continue
+    except Exception:
+        pass
+    return None
+
+
+def _get_file_dates(
+    file_path: Path, stat_result: os.stat_result
+) -> tuple[datetime, datetime, Optional[str], Optional[str]]:
+    """
+    Return (date_modified, date_created, date_created_source, warning).
+
+    Priority:
+      1. macOS / BSD  -> st_birthtime
+      2. Windows       -> st_ctime (creation time)
+      3. Linux         -> st_birthtime if exposed by Python/os
+      4. Linux media   -> EXIF (images) / mutagen (audio/video)
+      5. All others    -> st_mtime with warning
+    """
+    date_modified = datetime.fromtimestamp(stat_result.st_mtime)
+    warning: Optional[str] = None
+
+    # 1. macOS / BSD birthtime
+    if hasattr(stat_result, "st_birthtime"):
+        return (
+            date_modified,
+            datetime.fromtimestamp(stat_result.st_birthtime),
+            "birthtime",
+            None,
+        )
+
+    # 2. Windows creation time
+    if sys.platform == "win32" or os.name == "nt":
+        return (
+            date_modified,
+            datetime.fromtimestamp(stat_result.st_ctime),
+            "ctime_windows",
+            None,
+        )
+
+    # 3. Linux: some Python builds / filesystems expose st_birthtime
+    try:
+        birth = stat_result.st_birthtime
+        return date_modified, datetime.fromtimestamp(birth), "birthtime", None
+    except AttributeError:
+        pass
+
+    # 4. Linux media fallbacks
+    ext = file_path.suffix.lower()
+    if ext in _IMAGE_EXTENSIONS_FOR_EXIF:
+        exif_dt = _exif_date_created(file_path)
+        if exif_dt:
+            return date_modified, exif_dt, "exif_fallback", None
+    if ext in _AUDIO_VIDEO_EXTENSIONS_FOR_MUTAGEN:
+        mutagen_dt = _mutagen_date_created(file_path)
+        if mutagen_dt:
+            return date_modified, mutagen_dt, "mutagen_fallback", None
+
+    # 5. Final fallback to mtime with warning
+    warning = (
+        f"date_created fell back to mtime for {file_path.name} "
+        f"(birthtime unavailable on {sys.platform})"
+    )
+    return date_modified, date_modified, "mtime_fallback", warning
 
 
 def scan(
@@ -131,16 +262,22 @@ def scan(
 
                 try:
                     stat = file_path.stat()
+                    date_modified, date_created, date_created_source, date_warning = _get_file_dates(
+                        file_path, stat
+                    )
                     record = dict(
                         path=path_str,
                         filename=file_path.name,
                         extension=file_path.suffix.lower() or None,
                         size_bytes=stat.st_size,
-                        date_modified=datetime.fromtimestamp(stat.st_mtime),
-                        date_created=datetime.fromtimestamp(stat.st_ctime),
+                        date_modified=date_modified,
+                        date_created=date_created,
+                        date_created_source=date_created_source,
                         status=FileStatus.PENDING,
                         scanned_at=datetime.utcnow(),
                     )
+                    if date_warning:
+                        record["error_message"] = date_warning
                     if session_id:
                         record["session_id"] = session_id
                     batch.append(record)

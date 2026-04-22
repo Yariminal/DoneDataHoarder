@@ -13,6 +13,7 @@ Usage:
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Annotated, Optional
@@ -55,6 +56,101 @@ def _init_ai(backend: str, ollama_host: str, model: str) -> None:
         text_model=model,
         vision_model=model,
     )
+
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+@app.command()
+def doctor(
+    db: Annotated[str, typer.Option("--db", help="SQLite database path.", envvar="DATAHOARDER_DB")] = "datahoarder.db",
+    ollama_host: Annotated[str, typer.Option("--ollama-host", help="Ollama server URL.", envvar="OLLAMA_HOST")] = "http://localhost:11434",
+    model: Annotated[str, typer.Option("--model", help="Ollama model name to check.", envvar="DATAHOARDER_MODEL")] = "gemma3:12b",
+    backend: Annotated[str, typer.Option("--backend", help="AI backend: ollama|gemini|auto", envvar="DATAHOARDER_BACKEND")] = "ollama",
+):
+    """[bold green]Diagnose[/bold green] the environment: Ollama, disk space, and DB integrity."""
+    import shutil
+    import sqlite3
+
+    from datahoarder.ai.ollama_client import OllamaClient
+
+    console.print(Panel("Running diagnostics…", style="green"))
+    table = Table(title="Doctor Report", show_lines=True)
+    table.add_column("Check", style="cyan")
+    table.add_column("Status", style="bold")
+    table.add_column("Detail", style="dim")
+
+    # --- Ollama reachability ---
+    ollama = OllamaClient(host=ollama_host, text_model=model, vision_model=model)
+    if ollama.is_available():
+        models = ollama.list_models()
+        if model in models:
+            table.add_row("Ollama reachability", "[green]OK[/green]", f"Reachable at {ollama_host}")
+            table.add_row("Ollama model", "[green]OK[/green]", f"{model} is installed")
+        else:
+            table.add_row("Ollama reachability", "[green]OK[/green]", f"Reachable at {ollama_host}")
+            table.add_row(
+                "Ollama model",
+                "[yellow]MISSING[/yellow]",
+                f"Model '{model}' not found. Install with: [bold]ollama pull {model}[/bold]",
+            )
+    else:
+        table.add_row(
+            "Ollama reachability",
+            "[red]FAIL[/red]",
+            f"Not reachable at {ollama_host}. Start with: [bold]ollama serve[/bold]",
+        )
+
+    # --- Gemini (if configured) ---
+    if backend in ("gemini", "auto") or os.environ.get("GEMINI_API_KEY"):
+        try:
+            from datahoarder.ai.gemini_client import GeminiClient
+            GeminiClient()
+            table.add_row("Gemini backend", "[green]OK[/green]", "API key configured")
+        except Exception as exc:
+            table.add_row("Gemini backend", "[yellow]WARN[/yellow]", str(exc))
+    else:
+        table.add_row("Gemini backend", "[dim]SKIP[/dim]", "Not configured")
+
+    # --- Disk space ---
+    db_path = Path(db)
+    try:
+        usage = shutil.disk_usage(db_path.resolve().parent)
+        free_gb = usage.free / 1024 ** 3
+        total_gb = usage.total / 1024 ** 3
+        if free_gb < 1.0:
+            table.add_row(
+                "Disk space",
+                "[red]LOW[/red]",
+                f"{free_gb:.1f} GB free of {total_gb:.1f} GB",
+            )
+        else:
+            table.add_row(
+                "Disk space",
+                "[green]OK[/green]",
+                f"{free_gb:.1f} GB free of {total_gb:.1f} GB",
+            )
+    except Exception as exc:
+        table.add_row("Disk space", "[yellow]WARN[/yellow]", str(exc))
+
+    # --- DB integrity ---
+    if db_path.exists():
+        try:
+            conn = sqlite3.connect(str(db_path.resolve()), timeout=5)
+            cur = conn.execute("PRAGMA integrity_check")
+            result = cur.fetchone()[0]
+            conn.close()
+            if result == "ok":
+                table.add_row("DB integrity", "[green]OK[/green]", str(db_path.resolve()))
+            else:
+                table.add_row("DB integrity", "[red]FAIL[/red]", result)
+        except Exception as exc:
+            table.add_row("DB integrity", "[red]FAIL[/red]", str(exc))
+    else:
+        table.add_row("DB integrity", "[yellow]SKIP[/yellow]", "Database does not exist yet")
+
+    console.print(table)
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +477,9 @@ def execute(
     [bold red]Execute[/bold red] proposals on disk.
 
     Defaults to dry-run. Pass [bold]--commit[/bold] to make real changes.
+
+    All changes are logged to ~/.datahoarder/undo.log for recovery.
+    Use [bold]datahoarder undo --last[/bold] to reverse recent operations.
     """
     _init_db(db)
 
@@ -398,6 +497,55 @@ def execute(
     do_execute(
         dry_run=not commit,
         min_confidence=min_confidence,
+    )
+
+
+# ---------------------------------------------------------------------------
+# undo
+# ---------------------------------------------------------------------------
+
+@app.command()
+def undo(
+    last: Annotated[bool, typer.Option("--last", help="Undo the most recent batch of operations.")] = True,
+    session_id: Annotated[Optional[str], typer.Option("--session", "-s", help="Undo operations from a specific session.")] = None,
+    force: Annotated[bool, typer.Option("--force", "-f", help="Skip confirmation prompt.")] = False,
+    list_sessions: Annotated[bool, typer.Option("--list", "-l", help="List available undo sessions.")] = False,
+):
+    """[bold red]Undo[/bold red] the last executed operations (requires --force to apply without confirmation)."""
+    from datahoarder.core.undo_log import undo_operations, list_undo_sessions
+
+    if list_sessions:
+        sessions = list_undo_sessions()
+        if not sessions:
+            console.print("[yellow]No undo sessions found.[/yellow]")
+            return
+
+        table = Table(title="Undo Sessions", show_lines=True)
+        table.add_column("Time", style="cyan")
+        table.add_column("Operations", style="bold")
+        table.add_column("Duration", style="dim")
+
+        for s in reversed(sessions[-10:]):  # Show last 10
+            ops = ", ".join(f"{k}: {v}" for k, v in s["operations"].items())
+            duration = f"{s['duration_seconds']:.1f}s"
+            ts = s["timestamp"][:19].replace("T", " ")  # Format ISO timestamp
+            table.add_row(ts, f"{s['operation_count']} ops ({ops})", duration)
+
+        console.print(table)
+        return
+
+    if not last and not session_id:
+        console.print("[yellow]Use --last to undo the most recent operations, or --session <id> for a specific session.[/yellow]")
+        console.print("Use --list to see available sessions.")
+        raise typer.Exit(1)
+
+    if not force:
+        console.print(Panel("[bold yellow]DRY RUN — use --force to actually undo[/bold yellow]", style="yellow"))
+
+    undo_operations(
+        session_id=session_id,
+        force=force,
+        console=console,
     )
 
 

@@ -149,6 +149,7 @@ class File(Base):
     # --- dates ---
     date_modified: Mapped[Optional[datetime]] = mapped_column(DateTime)
     date_created: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    date_created_source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     date_exif: Mapped[Optional[datetime]] = mapped_column(DateTime)   # most reliable for photos
     date_best: Mapped[Optional[datetime]] = mapped_column(DateTime)   # best guess (exif > modified > created)
 

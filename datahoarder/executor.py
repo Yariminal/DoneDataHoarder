@@ -2,7 +2,7 @@
 Executor — applies approved Proposals to the filesystem.
 
 ALWAYS run with dry_run=True first to preview changes.
-All applied changes are logged to the database.
+All applied changes are logged to the database and to ~/.datahoarder/undo.log.
 """
 import json
 import os
@@ -22,6 +22,7 @@ from datahoarder.db.models import (
     Proposal, ProposalStatus, ProposalType,
 )
 from datahoarder.db.session import get_engine
+from datahoarder.core.undo_log import log_operation, undo_operations, list_undo_sessions
 
 console = Console()
 
@@ -81,7 +82,9 @@ def _write_pdf_metadata(path: Path, tags: list[str], description: str) -> bool:
 # Core execution
 # ---------------------------------------------------------------------------
 
-def _apply_rename(proposal: Proposal, dry_run: bool) -> tuple[bool, str]:
+def _apply_rename(
+    proposal: Proposal, dry_run: bool, session_id: str | None = None
+) -> tuple[bool, str]:
     """Rename a file on disk."""
     src = Path(proposal.current_value)
     dst = Path(proposal.proposed_value)
@@ -94,6 +97,14 @@ def _apply_rename(proposal: Proposal, dry_run: bool) -> tuple[bool, str]:
     if not dry_run:
         try:
             src.rename(dst)
+            # Log the operation for undo
+            log_operation(
+                operation="RENAME",
+                original_path=str(src),
+                new_path=str(dst),
+                session_id=session_id,
+                extra={"proposal_id": proposal.id},
+            )
         except OSError as exc:
             return False, str(exc)
 
@@ -126,7 +137,9 @@ def _apply_tags(proposal: Proposal, file_rec: File, dry_run: bool) -> tuple[bool
     return True, f"Tags written to {path.name}" if written else f"Tags noted for {path.name}"
 
 
-def _apply_move(proposal: Proposal, dry_run: bool) -> tuple[bool, str]:
+def _apply_move(
+    proposal: Proposal, dry_run: bool, session_id: str | None = None
+) -> tuple[bool, str]:
     """Move a file to a new directory on disk."""
     src = Path(proposal.current_value)
     dst = Path(proposal.proposed_value)
@@ -146,13 +159,23 @@ def _apply_move(proposal: Proposal, dry_run: bool) -> tuple[bool, str]:
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dst))
+        # Log the operation for undo
+        log_operation(
+            operation="MOVE",
+            original_path=str(src),
+            new_path=str(dst),
+            session_id=session_id,
+            extra={"proposal_id": proposal.id},
+        )
     except OSError as exc:
         return False, str(exc)
 
     return True, f"Moved: {src.name} -> {dst.parent.name}/{dst.name}"
 
 
-def _apply_rename_folder(proposal: Proposal, dry_run: bool, db_session: Session) -> tuple[bool, str]:
+def _apply_rename_folder(
+    proposal: Proposal, dry_run: bool, db_session: Session, session_id: str | None = None
+) -> tuple[bool, str]:
     """Rename a folder on disk and update all File paths in the DB."""
     src = Path(proposal.current_value)
     dst = Path(proposal.proposed_value)
@@ -169,6 +192,14 @@ def _apply_rename_folder(proposal: Proposal, dry_run: bool, db_session: Session)
 
     try:
         src.rename(dst)
+        # Log the operation for undo
+        log_operation(
+            operation="RENAME_FOLDER",
+            original_path=str(src),
+            new_path=str(dst),
+            session_id=session_id,
+            extra={"proposal_id": proposal.id},
+        )
     except OSError as exc:
         return False, f"Rename failed: {exc}"
 
@@ -187,7 +218,9 @@ def _apply_rename_folder(proposal: Proposal, dry_run: bool, db_session: Session)
     return True, f"Renamed folder: {src.name} -> {dst.name} ({len(files_in_folder)} files updated)"
 
 
-def _delete_duplicate(file_id: int, dry_run: bool) -> tuple[bool, str]:
+def _delete_duplicate(
+    file_id: int, dry_run: bool, session_id: str | None = None
+) -> tuple[bool, str]:
     """Move a duplicate to a .trash folder instead of hard-deleting."""
     engine = get_engine()
     with Session(engine) as session:
@@ -213,6 +246,15 @@ def _delete_duplicate(file_id: int, dry_run: bool) -> tuple[bool, str]:
                 dst = trash_dir / f"{stem}_{i}{suffix}"
                 i += 1
         shutil.move(str(path), str(dst))
+
+        # Log the operation for undo (store original location)
+        log_operation(
+            operation="TRASH",
+            original_path=str(path),
+            new_path=str(dst),
+            session_id=session_id,
+            extra={"file_id": file_id},
+        )
 
         f.path = str(dst)
         f.status = FileStatus.APPLIED
@@ -272,15 +314,22 @@ def execute(
     """
     Apply approved (or all pending) proposals.
 
+    IMPORTANT: Defaults to dry-run mode (dry_run=True).
+    You must explicitly pass dry_run=False or use --commit in CLI to apply changes.
+
+    All changes are logged to ~/.datahoarder/undo.log with SHA256 hashes for verification.
+    Use datahoarder undo --last to reverse operations.
+
     Args:
-        dry_run:          If True, print what would happen but change nothing.
+        dry_run:          If True (default), preview only. Set to False to apply changes.
         min_confidence:   Only apply proposals above this confidence level.
         proposal_ids:     If set, only apply these specific proposal IDs.
         proposal_types:   If set, only apply these proposal types.
+        session_id:       Session identifier for transaction log grouping.
         _console:         Optional Console override (use _make_quiet_console() for web).
 
     Returns:
-        Summary dict.
+        Summary dict with 'applied', 'failed', 'skipped' counts.
     """
     con = _console or console
     engine = get_engine()
@@ -329,7 +378,7 @@ def execute(
 
             try:
                 if prop.proposal_type == ProposalType.RENAME:
-                    ok, msg = _apply_rename(prop, dry_run)
+                    ok, msg = _apply_rename(prop, dry_run, session_id)
                     if ok and not dry_run:
                         # Update File.path in DB to new location
                         if file_rec:
@@ -354,7 +403,7 @@ def execute(
                     ok, msg = _apply_tags(prop, file_rec, dry_run)
 
                 elif prop.proposal_type == ProposalType.RENAME_FOLDER:
-                    ok, msg = _apply_rename_folder(prop, dry_run, session)
+                    ok, msg = _apply_rename_folder(prop, dry_run, session, session_id)
                     # After a successful folder rename, update paths in all
                     # remaining proposals that reference the old folder path
                     if ok and not dry_run:
@@ -383,14 +432,14 @@ def execute(
                                 con.print(f"  [dim]Skipped no-op move (folder renamed in-place): {Path(other.current_value).name}[/dim]")
 
                 elif prop.proposal_type == ProposalType.MOVE:
-                    ok, msg = _apply_move(prop, dry_run)
+                    ok, msg = _apply_move(prop, dry_run, session_id)
                     if ok and not dry_run:
                         if file_rec:
                             file_rec.path = prop.proposed_value
                             file_rec.filename = Path(prop.proposed_value).name
 
                 elif prop.proposal_type == ProposalType.MARK_DUPLICATE:
-                    ok, msg = _delete_duplicate(prop.file_id, dry_run)
+                    ok, msg = _delete_duplicate(prop.file_id, dry_run, session_id)
 
                 else:
                     ok, msg = True, f"Skipped unsupported type: {prop.proposal_type}"

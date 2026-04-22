@@ -52,12 +52,27 @@ def init_ai(
         )
 
 
-def get_client():
-    """Return the active AI client (Ollama preferred)."""
+def get_client(failover: bool = True):
+    """
+    Return the active AI client.
+
+    Priority: Ollama (local) → Gemini (cloud) → raises RuntimeError.
+
+    If *failover* is True and Ollama's circuit breaker is open,
+    automatically falls back to Gemini when configured.
+    """
     if _ollama is not None:
-        return _ollama
+        if _ollama.is_healthy():
+            return _ollama
+        if failover and _gemini is not None:
+            return _gemini
     if _gemini is not None:
         return _gemini
+    if _ollama is not None and not _ollama.is_healthy():
+        raise RuntimeError(
+            "Ollama backend is unhealthy (circuit breaker OPEN). "
+            "Run 'datahoarder doctor' to diagnose, or configure Gemini backend."
+        )
     raise RuntimeError("AI backend not initialised. Call init_ai() first.")
 
 
