@@ -68,6 +68,34 @@ datahoarder execute --commit
 | `GEMINI_API_KEY` | Gemini API key (for cloud fallback) |
 | `DATAHOARDER_LOG` | `DEBUG`, `INFO`, `WARNING` |
 
+## Test Automation
+
+Run automated end-to-end tests on zipped fixtures and get AI-powered critique of the organization results.
+
+```bash
+# 1. Create test_fixtures/ and add .zip files of messy folders
+mkdir test_fixtures
+cp ~/my_test_data.zip test_fixtures/
+
+# 2. Run the automated test harness
+python scripts/test_runner.py test_fixtures/
+
+# 3. Review generated reports
+ls test_outputs/test_reports/
+```
+
+What it does for each `.zip` fixture:
+1. Unzips into a temp directory
+2. Runs the full `datahoarder pipeline`
+3. Applies all proposals (`execute --commit`)
+4. Captures the before/after directory trees
+5. Queries the test DB for stats and proposals
+6. Asks an LLM to critique the results (scores, strengths, missed opportunities)
+7. Saves the DB to `test_outputs/test_dbs/` and a Markdown report to `test_outputs/test_reports/`
+
+Use `--skip-execute` to run the pipeline without touching files (dry-run critique only).
+Use `--backend gemini` if Ollama is unavailable for the critique step.
+
 ## Documentation
 
 - [Installation Guide](INSTALL.md)
