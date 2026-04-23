@@ -89,7 +89,7 @@ class OllamaClient(BaseAIClient):
         return self.is_available()
 
     def supports_vision(self) -> bool:
-        vision_models = {"llava", "bakllava", "gemma3", "moondream", "cogvlm"}
+        vision_models = {"llava", "bakllava", "gemma3", "gemma4", "moondream", "cogvlm"}
         model_lower = (self.vision_model or "").lower()
         return any(vm in model_lower for vm in vision_models)
 
