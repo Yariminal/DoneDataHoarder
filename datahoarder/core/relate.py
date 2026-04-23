@@ -295,6 +295,22 @@ def _chunk(items: list, size: int) -> Iterable[list]:
         yield items[i:i + size]
 
 
+def _model_timeout(model_name: Optional[str]) -> int:
+    """Return appropriate timeout for model size. Large models need more time."""
+    if not model_name:
+        return 120
+    # Detect large models (>20B parameters) from naming patterns
+    import re
+    size_match = re.search(r'[:](\d+)(?:\.\d+)?b$', model_name.lower())
+    if size_match:
+        size_b = float(size_match.group(1))
+        if size_b >= 20:
+            return 300  # 5 minutes for 20B+ models
+        elif size_b >= 10:
+            return 180  # 3 minutes for 10-20B models
+    return 120
+
+
 def _call_llm_for_group(
     client,
     dir_label: str,
@@ -326,6 +342,7 @@ def _call_llm_for_group(
             "system": RELATE_SYSTEM_PROMPT,
             "temperature": 0.0,
             "seed": 42,
+            "timeout": _model_timeout(model),
         }
         if model:
             kwargs["model"] = model

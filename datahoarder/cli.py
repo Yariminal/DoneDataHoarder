@@ -359,11 +359,14 @@ def relate(
     scope: Annotated[str, typer.Option("--scope", help="'per_directory' (default) or 'cross_directory'.")] = "per_directory",
     backend: Annotated[str, typer.Option("--backend", help="'ollama' or 'gemini'.")] = "ollama",
     ollama_host: Annotated[str, typer.Option("--ollama-host", help="Ollama server URL.", envvar="OLLAMA_HOST")] = "http://localhost:11434",
-    model: Annotated[str, typer.Option("--model", "-m", help="LLM model.")] = "gemma3:12b",
+    model: Annotated[str, typer.Option("--model", "-m", help="LLM model for this run.")] = "gemma3:12b",
+    relate_model: Annotated[str, typer.Option("--relate-model", help="Dedicated model for the relate step (defaults to --model if not set).")] = "gemma4:26b",
 ):
     """[bold cyan]Relate[/bold cyan] — LLM-group files that are conceptually one thing (CAD + backups + exports, etc.)."""
     _init_db(db)
-    _init_ai(backend, ollama_host, model)
+    # Relate uses its own model (defaults to gemma4:26b for reasoning)
+    effective_model = relate_model
+    _init_ai(backend, ollama_host, effective_model)
     console.print(Panel("Finding related file groups", style="cyan"))
 
     from datahoarder.core.relate import relate as do_relate
@@ -392,7 +395,7 @@ def relate(
         )
 
     summary = do_relate(
-        session_id=session_id, scope=scope, model=model, progress_cb=_cb,
+        session_id=session_id, scope=scope, model=effective_model, progress_cb=_cb,
     )
     console.print(
         f"\n[bold green]Relate complete[/bold green] — "

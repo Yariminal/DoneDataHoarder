@@ -160,6 +160,7 @@ class GeminiClient(BaseAIClient):
         seed: int = 42,
         max_retries: int = 3,
         mime_type: str = "image/jpeg",
+        **kwargs: Any,
     ) -> dict:
         """
         Like generate / generate_with_image but instructs the model to return
@@ -187,7 +188,7 @@ class GeminiClient(BaseAIClient):
                 **kw,
             )
 
-        return generate_json_with_retry(
+        validated = generate_json_with_retry(
             generate_fn=generate_fn,
             prompt=prompt,
             model_cls=model_cls,
@@ -195,4 +196,10 @@ class GeminiClient(BaseAIClient):
             seed=seed,
             max_retries=max_retries,
             response_format={"type": "json_object"},
-        ).model_dump()
+            **kwargs,
+        )
+        result = validated.model_dump()
+        # Unwrap lists that were boxed for LooseDict validation
+        if isinstance(result, dict) and "_list" in result:
+            return result["_list"]
+        return result

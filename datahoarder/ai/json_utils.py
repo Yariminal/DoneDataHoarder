@@ -145,6 +145,10 @@ def extract_json(raw: str, fix_escapes: bool = True) -> Any:
 
 def validate_json(data: Any, model_cls: Type[T]) -> T:
     """Validate a parsed JSON dict/list against a Pydantic model."""
+    # LooseDict expects a dict, but some LLM calls (e.g., relate) return
+    # a JSON array. Wrap lists transparently so validation passes.
+    if model_cls is LooseDict and isinstance(data, list):
+        data = {"_list": data}
     try:
         return model_cls.model_validate(data)
     except ValidationError as exc:

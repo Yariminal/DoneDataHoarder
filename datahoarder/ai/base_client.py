@@ -77,6 +77,7 @@ class BaseAIClient(ABC):
         temperature: float = 0.0,
         seed: int = 42,
         max_retries: int = 3,
+        **kwargs: Any,
     ) -> dict:
         """
         Structured JSON output with retry and optional Pydantic validation.
@@ -120,8 +121,13 @@ class BaseAIClient(ABC):
             seed=seed,
             max_retries=max_retries,
             response_format={"type": "json_object"},
+            **kwargs,
         )
-        return validated.model_dump()
+        result = validated.model_dump()
+        # Unwrap lists that were boxed for LooseDict validation
+        if isinstance(result, dict) and "_list" in result:
+            return result["_list"]
+        return result
 
     # ------------------------------------------------------------------
     # Shared image helper

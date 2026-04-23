@@ -148,16 +148,23 @@ class OllamaClient(BaseAIClient):
             payload["system"] = system
 
         # Ollama structured-output support: map response_format -> format
+        # NOTE: Some models (e.g., gemma4:26b) hang indefinitely with
+        # constrained JSON decoding. Skip native format for those and rely
+        # on prompt engineering + json_utils extraction instead.
+        _MODELS_WITH_BROKEN_JSON_FORMAT = {"gemma4:26b", "gemma4:e2b", "gemma4:e4b", "gpt-oss:20b"}
         response_format = kwargs.get("response_format")
-        if response_format is not None:
+        if response_format is not None and model not in _MODELS_WITH_BROKEN_JSON_FORMAT:
             fmt = response_format.get("type")
             if fmt == "json_object":
                 payload["format"] = "json"
             elif isinstance(response_format, dict):
                 payload["format"] = response_format
 
+        # Allow per-request timeout override (e.g., for large models like gemma4:26b)
+        timeout = kwargs.get("timeout", TIMEOUT)
+
         with _OLLAMA_REQUEST_LOCK:
-            with httpx.Client(timeout=TIMEOUT) as client:
+            with httpx.Client(timeout=timeout) as client:
                 resp = client.post(f"{self.host}/api/generate", json=payload)
                 resp.raise_for_status()
                 result = resp.json().get("response", "").strip()
@@ -237,16 +244,21 @@ class OllamaClient(BaseAIClient):
             payload["system"] = system
 
         # Ollama structured-output support: map response_format -> format
+        # NOTE: Some models hang with constrained JSON decoding (see text gen).
+        _MODELS_WITH_BROKEN_JSON_FORMAT = {"gemma4:26b", "gemma4:e2b", "gemma4:e4b", "gpt-oss:20b"}
         response_format = kwargs.get("response_format")
-        if response_format is not None:
+        if response_format is not None and model not in _MODELS_WITH_BROKEN_JSON_FORMAT:
             fmt = response_format.get("type")
             if fmt == "json_object":
                 payload["format"] = "json"
             elif isinstance(response_format, dict):
                 payload["format"] = response_format
 
+        # Allow per-request timeout override
+        timeout = kwargs.get("timeout", TIMEOUT)
+
         with _OLLAMA_REQUEST_LOCK:
-            with httpx.Client(timeout=TIMEOUT) as client:
+            with httpx.Client(timeout=timeout) as client:
                 resp = client.post(f"{self.host}/api/generate", json=payload)
                 resp.raise_for_status()
                 result = resp.json().get("response", "").strip()
@@ -269,6 +281,7 @@ class OllamaClient(BaseAIClient):
         temperature: float = 0.0,
         seed: int = 42,
         max_retries: int = 3,
+        **kwargs: Any,
     ) -> dict:
         """
         Like generate / generate_with_image but instructs the model to return
@@ -304,7 +317,7 @@ class OllamaClient(BaseAIClient):
                 **kw,
             )
 
-        return generate_json_with_retry(
+        validated = generate_json_with_retry(
             generate_fn=generate_fn,
             prompt=prompt,
             model_cls=model_cls,
@@ -313,7 +326,13 @@ class OllamaClient(BaseAIClient):
             seed=seed,
             max_retries=max_retries,
             response_format={"type": "json_object"},
-        ).model_dump()
+            **kwargs,
+        )
+        result = validated.model_dump()
+        # Unwrap lists that were boxed for LooseDict validation
+        if isinstance(result, dict) and "_list" in result:
+            return result["_list"]
+        return result
 
     # ------------------------------------------------------------------
     # Model listing
