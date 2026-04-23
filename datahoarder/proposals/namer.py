@@ -561,7 +561,10 @@ def _resolve_collision(
 
     # Discriminator fallback before counters: use the original's numeric prefix
     prefix = _extract_distinguishing_prefix(original_path.stem)
-    if prefix and not stem.startswith(f"{prefix}_"):
+    # Avoid double-dating: if the proposed stem already starts with an ISO
+    # date (YYYY-MM-DD…), don't prepend another numeric/date prefix.
+    stem_has_date = bool(re.match(r"^\d{4}-\d{2}-\d{2}", stem))
+    if prefix and not stem.startswith(f"{prefix}_") and not stem_has_date:
         candidate = parent / f"{prefix}_{stem}{ext}"
         if (not candidate.exists() and candidate not in reserved) or candidate == original_path:
             return candidate
