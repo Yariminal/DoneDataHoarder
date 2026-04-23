@@ -2,7 +2,7 @@
 import sys
 from pathlib import Path
 
-from sqlalchemy import create_engine, inspect, Engine, exc as sa_exc
+from sqlalchemy import create_engine, inspect, Engine, exc as sa_exc, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from datahoarder.db.models import Base
@@ -68,6 +68,11 @@ def init_db(db_path: Path) -> Engine:
         if "database is locked" in str(exc).lower():
             _handle_db_lock(exc, db_path)
         raise
+
+    @event.listens_for(_engine, "connect")
+    def _set_wal(dbapi_conn, connection_record):
+        dbapi_conn.execute("PRAGMA journal_mode=WAL")
+        dbapi_conn.execute("PRAGMA synchronous=NORMAL")
 
     try:
         # Check if the 'sessions' table exists; if not, drop everything and
