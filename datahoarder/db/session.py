@@ -102,6 +102,7 @@ def _migrate_nullable_columns(engine: Engine, inspector) -> None:
     # dropping and recreating is acceptable (it's just scan metadata).
     nullable_migrations = [
         ("scan_sessions", "session_id"),
+        ("duplicate_groups", "session_id"),
     ]
 
     for table, column in nullable_migrations:
@@ -129,6 +130,18 @@ def _migrate_nullable_columns(engine: Engine, inspector) -> None:
                         f"completed BOOLEAN DEFAULT 0, "
                         f"last_scanned_path VARCHAR, "
                         f"FOREIGN KEY(session_id) REFERENCES sessions (id) ON DELETE CASCADE"
+                        f")"
+                    ))
+                elif table == "duplicate_groups":
+                    conn.execute(text(
+                        f"CREATE TABLE {table} ("
+                        f"id INTEGER NOT NULL PRIMARY KEY, "
+                        f"session_id VARCHAR(36), "
+                        f"dupe_type VARCHAR NOT NULL, "
+                        f"group_hash VARCHAR NOT NULL, "
+                        f"keep_file_id INTEGER, "
+                        f"FOREIGN KEY(session_id) REFERENCES sessions (id) ON DELETE CASCADE, "
+                        f"FOREIGN KEY(keep_file_id) REFERENCES files (id)"
                         f")"
                     ))
                 conn.execute(text(f"INSERT INTO {table} SELECT * FROM {table}_old"))

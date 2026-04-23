@@ -308,7 +308,10 @@ def dedup(
     _init_db(db)
     console.print(Panel("Duplicate detection", style="yellow"))
 
-    from datahoarder.core.dedup import find_exact_duplicates, find_perceptual_duplicates, duplicate_summary
+    from datahoarder.core.dedup import (
+        find_exact_duplicates, find_perceptual_duplicates,
+        duplicate_summary, generate_dedup_proposals,
+    )
 
     exact = find_exact_duplicates()
     console.print(
@@ -326,12 +329,23 @@ def dedup(
                 f"[yellow]{perc['duplicates']}[/yellow] redundant files"
             )
 
+    # Stage 5 — turn detected groups into actionable MARK_DUPLICATE proposals
+    prop_counts = generate_dedup_proposals()
+    if prop_counts["created"]:
+        console.print(
+            f"\n[bold green]Created {prop_counts['created']} MARK_DUPLICATE proposals[/bold green] "
+            f"({prop_counts['groups']} groups, {prop_counts['skipped']} already existed, "
+            f"{prop_counts['no_keeper']} missing keeper)"
+        )
+        console.print("Run [bold]datahoarder review --dupes[/bold] to inspect, then [bold]datahoarder execute --commit[/bold] to clean up.")
+    else:
+        console.print("\n[dim]No new duplicate proposals created.[/dim]")
+
     summary = duplicate_summary()
     if summary:
         total_wasted = sum(g["wasted_bytes"] for g in summary)
         mb = total_wasted / 1024 / 1024
         console.print(f"\n[bold]Estimated reclaimable space: [green]{mb:.1f} MB[/green][/bold]")
-        console.print("Run [bold]datahoarder review --dupes[/bold] to inspect groups.")
 
 
 # ---------------------------------------------------------------------------
@@ -344,11 +358,12 @@ def relate(
     session_id: Annotated[Optional[str], typer.Option("--session", help="Session ID to process. Defaults to latest.")] = None,
     scope: Annotated[str, typer.Option("--scope", help="'per_directory' (default) or 'cross_directory'.")] = "per_directory",
     backend: Annotated[str, typer.Option("--backend", help="'ollama' or 'gemini'.")] = "ollama",
+    ollama_host: Annotated[str, typer.Option("--ollama-host", help="Ollama server URL.", envvar="OLLAMA_HOST")] = "http://localhost:11434",
     model: Annotated[str, typer.Option("--model", "-m", help="LLM model.")] = "gemma3:12b",
 ):
     """[bold cyan]Relate[/bold cyan] — LLM-group files that are conceptually one thing (CAD + backups + exports, etc.)."""
     _init_db(db)
-    _init_ai(backend=backend, text_model=model, vision_model=model)
+    _init_ai(backend, ollama_host, model)
     console.print(Panel("Finding related file groups", style="cyan"))
 
     from datahoarder.core.relate import relate as do_relate
@@ -425,6 +440,7 @@ def review(
     min_confidence: Annotated[float, typer.Option("--min-confidence", "-c")] = 0.0,
     dupes: Annotated[bool, typer.Option("--dupes", help="Show duplicate groups instead of rename proposals.")] = False,
     interactive: Annotated[bool, typer.Option("--interactive", "-i", help="Approve/reject one by one.")] = False,
+    auto_apply: Annotated[bool, typer.Option("--auto-apply", "-a", help="Bulk-approve all pending proposals above min-confidence without interaction.")] = False,
     limit: Annotated[Optional[int], typer.Option("--limit", help="Max proposals to display.")] = None,
     offset: Annotated[Optional[int], typer.Option("--offset", help="Skip first N proposals.")] = None,
 ):
@@ -433,6 +449,23 @@ def review(
 
     if dupes:
         _review_dupes(limit=limit, offset=offset)
+        return
+
+    # Auto-approve mode: bulk-approve and skip interactive preview
+    if auto_apply:
+        count = _bulk_approve(min_confidence=min_confidence)
+        if count:
+            console.print(
+                f"\n[bold green]Approved {count} proposals[/bold green] "
+                f"(confidence >= {min_confidence})."
+            )
+            console.print(
+                "Run [bold]datahoarder execute --commit[/bold] to apply them to disk."
+            )
+        else:
+            console.print(
+                f"\n[yellow]No pending proposals meet confidence >= {min_confidence}.[/yellow]"
+            )
         return
 
     from datahoarder.executor import preview
@@ -528,6 +561,24 @@ def _interactive_review(
                 session.commit()
                 break
             session.commit()
+
+
+def _bulk_approve(min_confidence: float = 0.0) -> int:
+    """Bulk-approve all pending proposals above the confidence threshold."""
+    from datahoarder.db.session import get_engine
+    from datahoarder.db.models import Proposal, ProposalStatus
+    from sqlalchemy.orm import Session
+
+    engine = get_engine()
+    with Session(engine) as session:
+        query = (
+            session.query(Proposal)
+            .filter(Proposal.status == ProposalStatus.PENDING)
+            .filter(Proposal.confidence >= min_confidence)
+        )
+        count = query.update({"status": ProposalStatus.APPROVED})
+        session.commit()
+    return count
 
 
 # ---------------------------------------------------------------------------

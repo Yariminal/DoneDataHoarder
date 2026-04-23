@@ -230,9 +230,9 @@ class DuplicateGroup(Base):
     __tablename__ = "duplicate_groups"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    session_id: Mapped[str] = mapped_column(
+    session_id: Mapped[Optional[str]] = mapped_column(
         String(36), ForeignKey("sessions.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+        nullable=True, index=True,
     )
     dupe_type: Mapped[DupeType] = mapped_column(Enum(DupeType), nullable=False)
     group_hash: Mapped[str] = mapped_column(String, nullable=False, index=True)
