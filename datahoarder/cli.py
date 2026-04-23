@@ -416,8 +416,9 @@ def propose(
     db: Annotated[str, typer.Option("--db", help="SQLite database path.", envvar="DATAHOARDER_DB")] = "datahoarder.db",
     limit: Annotated[Optional[int], typer.Option("--limit", help="Max proposals to generate.")] = None,
     offset: Annotated[Optional[int], typer.Option("--offset", help="Skip first N files.")] = None,
+    no_organize: Annotated[bool, typer.Option("--no-organize", help="Skip folder reorganization proposals.")] = False,
 ):
-    """[bold blue]Generate[/bold blue] rename/tag proposals from analyzed files."""
+    """[bold blue]Generate[/bold blue] rename/tag and folder reorganization proposals from analyzed files."""
     _init_db(db)
     console.print(Panel("Generating proposals", style="blue"))
 
@@ -430,6 +431,34 @@ def propose(
         f"{counts['tags']} tag updates, "
         f"{counts['skipped']} unchanged"
     )
+
+    if not no_organize:
+        console.print(Panel("Analyzing folder structure for reorganization…", style="cyan"))
+        from datahoarder.proposals.organizer import generate_reorg_proposals
+        from datahoarder.db.session import get_engine
+        from datahoarder.db.models import UserSession
+        from sqlalchemy.orm import Session
+
+        # Initialize AI provider for the organizer (uses LLM for reorg suggestions)
+        # Default to a small, fast text model; user can override via --model if needed.
+        _init_ai("ollama", "http://localhost:11434", "llama3.2:3b")
+
+        engine = get_engine()
+        with Session(engine) as session:
+            latest = session.query(UserSession).order_by(UserSession.updated_at.desc()).first()
+            session_id = latest.id if latest else None
+
+        if session_id:
+            org_counts = generate_reorg_proposals(session_id=session_id)
+            console.print(
+                f"[bold cyan]Organization proposals[/bold cyan] — "
+                f"{org_counts.get('move', 0)} moves, "
+                f"{org_counts.get('rename_folder', 0)} folder renames, "
+                f"{org_counts.get('skipped', 0)} skipped"
+            )
+        else:
+            console.print("[yellow]No active session — skipping folder reorganization.[/yellow]")
+
     console.print("Run [bold]datahoarder review[/bold] to inspect them.")
 
 

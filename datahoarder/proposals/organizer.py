@@ -8,6 +8,8 @@ Two-phase approach:
 from __future__ import annotations
 
 import json
+import logging
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +20,8 @@ from datahoarder.db.models import (
     File, FileStatus, Proposal, ProposalStatus, ProposalType,
 )
 from datahoarder.db.session import get_engine
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -780,7 +784,10 @@ def generate_reorg_proposals(session_id: str) -> dict:
     try:
         result = client.generate_json(prompt, system=REORG_SYSTEM_PROMPT)
     except Exception as exc:
-        return {"error": f"LLM call failed: {exc}", **counts}
+        # LLM unavailable — fall through to deterministic backstops only.
+        # Don't return early; the backstops below can still improve structure.
+        logger.warning("Organizer LLM call failed: %s — falling back to rule-based backstops.", exc)
+        result = []
 
     # Parse the LLM response into Proposal records
     if isinstance(result, list):
@@ -1032,6 +1039,21 @@ def generate_reorg_proposals(session_id: str) -> dict:
             counts["rename_folder"] = counts.get("rename_folder", 0) + mojibake_fixed
     except Exception:
         # Best-effort — never break the pipeline if the backstop errors.
+        pass
+
+    # Deterministic backstop: generic/cryptic folder names and root loose files.
+    # When the LLM returns no proposals (common on small, already-organized
+    # datasets), this backstop still improves discoverability by:
+    #   1. Renaming numbered/generic folders to content-based names
+    #   2. Grouping loose root files by dominant content type
+    try:
+        generic_fixed = _backstop_generic_folders(session_id, root_path)
+        if generic_fixed:
+            counts["generic_renames"] = generic_fixed.get("renames", 0)
+            counts["generic_moves"] = generic_fixed.get("moves", 0)
+            counts["rename_folder"] = counts.get("rename_folder", 0) + generic_fixed.get("renames", 0)
+            counts["move"] = counts.get("move", 0) + generic_fixed.get("moves", 0)
+    except Exception:
         pass
 
     return counts
@@ -1315,3 +1337,180 @@ def _backstop_mojibake_folders(session_id: str, root_path: str) -> int:
             db.commit()
 
     return created
+
+
+# Generic folder names that provide zero discoverability — if a folder has one
+# of these names, we ALWAYS try to rename it based on content, even when the
+# LLM returns nothing.
+_GENERIC_FOLDER_PATTERNS = [
+    re.compile(r"^\d+$"),                       # "1", "2", "01", "99"
+    re.compile(r"^\d+[\s._-].*", re.I),       # "1 Milestone", "2_Final", "3.Photos"
+    re.compile(r"^(temp|tmp|new[\s_-]?folder|untitled|folder[\s_-]?\d*|item[\s_-]?\d*)$", re.I),
+    re.compile(r"^(section|part|chapter|stage|phase)[\s_-]?\d*$", re.I),
+]
+
+
+def _is_generic_folder_name(name: str) -> bool:
+    """Return True if *name* is a non-descriptive, numbered, or templated folder name."""
+    if not name or name in {".", "..", "(root)"}:
+        return False
+    for pat in _GENERIC_FOLDER_PATTERNS:
+        if pat.match(name):
+            return True
+    return False
+
+
+def _folder_content_label(mime_breakdown: dict[str, int]) -> str | None:
+    """Return a descriptive label for a folder based on its dominant MIME categories."""
+    if not mime_breakdown:
+        return None
+    # Ordered preference for common project folder names
+    priority = {
+        "image": "Images",
+        "design": "Design_Files",
+        "3d": "3D_Models",
+        "cad": "CAD_Drawings",
+        "document": "Documents",
+        "video": "Videos",
+        "audio": "Audio",
+        "code": "Code",
+        "web": "Web_Files",
+        "archive": "Archives",
+    }
+    total = sum(mime_breakdown.values())
+    for cat, label in priority.items():
+        if mime_breakdown.get(cat, 0) / total >= 0.4:
+            return label
+    # Fallback: plurality wins if no strong majority
+    top_cat, top_count = max(mime_breakdown.items(), key=lambda kv: kv[1])
+    if top_count / total >= 0.35:
+        return top_cat.replace("_", " ").title().replace(" ", "_")
+    return "Mixed_Content"
+
+
+def _backstop_generic_folders(session_id: str, root_path: str) -> dict[str, int]:
+    """
+    Deterministic backstop for generic folder names and loose root files.
+
+    1. Any folder whose name matches _GENERIC_FOLDER_PATTERNS gets a
+       RENAME_FOLDER proposal based on its dominant content type.
+    2. Loose files sitting directly in root (not in any subfolder) with a
+       clear MIME category get a MOVE proposal to root/<category>/.
+
+    Returns {"renames": int, "moves": int}.
+    """
+    engine = get_engine()
+    created_renames = 0
+    created_moves = 0
+
+    with Session(engine) as db:
+        # Build folder summaries fresh (lightweight — no LLM call)
+        folder_summaries = build_folder_tree(session_id, root_path)
+        root_norm = Path(root_path).resolve() if root_path else None
+
+        # --- Pass 1: rename generic folders ---
+        for fs in folder_summaries:
+            folder_name = Path(fs.path).name
+            if not _is_generic_folder_name(folder_name):
+                continue
+
+            # Skip if a proposal already exists for this folder
+            existing = db.query(Proposal).filter(
+                Proposal.proposal_type == ProposalType.RENAME_FOLDER,
+                Proposal.current_value == fs.path,
+            ).first()
+            if existing:
+                continue
+
+            label = _folder_content_label(fs.mime_breakdown)
+            if not label:
+                continue
+
+            anchor = db.query(File).filter(
+                File.session_id == session_id,
+                File.path.like(f"{fs.path}%"),
+            ).first()
+            if not anchor:
+                continue
+
+            src_path_obj = Path(fs.path)
+            dst_abs = str(src_path_obj.parent / label)
+            if dst_abs == fs.path:
+                continue
+
+            db.add(Proposal(
+                file_id=anchor.id,
+                proposal_type=ProposalType.RENAME_FOLDER,
+                current_value=fs.path,
+                proposed_value=dst_abs,
+                reasoning=(
+                    f"Generic folder name '{folder_name}' has low discoverability. "
+                    f"Renaming to '{label}' based on dominant content types: "
+                    f"{', '.join(f'{k}({v})' for k, v in sorted(fs.mime_breakdown.items(), key=lambda x: -x[1])[:3])}."
+                ),
+                confidence=0.65,
+                status=ProposalStatus.PENDING,
+            ))
+            created_renames += 1
+
+        # --- Pass 2: group loose root files by type ---
+        if root_norm:
+            root_files = [
+                f for f in folder_summaries
+                if Path(f.path).resolve() == root_norm and f.file_count > 0
+            ]
+            for root_fs in root_files:
+                if root_fs.file_count < 2:
+                    continue  # Not enough files to justify a move
+
+                # Categorize files
+                files_by_cat: dict[str, list[File]] = defaultdict(list)
+                for f_rec in db.query(File).filter(
+                    File.session_id == session_id,
+                    File.path.like(f"{root_fs.path}%"),
+                ).all():
+                    cat = _file_category(f_rec.mime_type, f_rec.extension)
+                    if cat != "other":
+                        files_by_cat[cat].append(f_rec)
+
+                # For each category with ≥2 files, suggest a subfolder
+                for cat, cat_files in files_by_cat.items():
+                    if len(cat_files) < 2:
+                        continue
+                    label = _folder_content_label({cat: len(cat_files)})
+                    if not label:
+                        continue
+                    dst_folder = str(root_norm / label)
+
+                    for f_rec in cat_files:
+                        # Skip if already has a MOVE proposal
+                        has_move = db.query(Proposal).filter_by(
+                            file_id=f_rec.id,
+                            proposal_type=ProposalType.MOVE,
+                        ).first()
+                        if has_move:
+                            continue
+
+                        src_path = Path(f_rec.path)
+                        dst_path = Path(dst_folder) / src_path.name
+                        if str(src_path) == str(dst_path):
+                            continue
+
+                        db.add(Proposal(
+                            file_id=f_rec.id,
+                            proposal_type=ProposalType.MOVE,
+                            current_value=str(src_path),
+                            proposed_value=str(dst_path),
+                            reasoning=(
+                                f"Root-level {cat} file — grouping with other "
+                                f"{cat} files into '{label}/' for better organization."
+                            ),
+                            confidence=0.55,
+                            status=ProposalStatus.PENDING,
+                        ))
+                        created_moves += 1
+
+        if created_renames or created_moves:
+            db.commit()
+
+    return {"renames": created_renames, "moves": created_moves}
