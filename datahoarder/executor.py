@@ -219,47 +219,43 @@ def _apply_rename_folder(
 
 
 def _delete_duplicate(
-    file_id: int, dry_run: bool, session_id: str | None = None
+    file_id: int, dry_run: bool, db_session: Session, session_id: str | None = None
 ) -> tuple[bool, str]:
     """Move a duplicate to a .trash folder instead of hard-deleting."""
-    engine = get_engine()
-    with Session(engine) as session:
-        f = session.get(File, file_id)
-        if not f:
-            return False, "File not found in DB"
-        path = Path(f.path)
-        if not path.exists():
-            return False, f"File not on disk: {path}"
+    f = db_session.get(File, file_id)
+    if not f:
+        return False, "File not found in DB"
+    path = Path(f.path)
+    if not path.exists():
+        return False, f"File not on disk: {path}"
 
-        trash_dir = path.parent / ".datahoarder_trash"
-        dst = trash_dir / path.name
+    trash_dir = path.parent / ".datahoarder_trash"
+    dst = trash_dir / path.name
 
-        if dry_run:
-            return True, f"[DRY RUN] Would trash: {path}"
+    if dry_run:
+        return True, f"[DRY RUN] Would trash: {path}"
 
-        trash_dir.mkdir(exist_ok=True)
-        # Handle collision in trash
-        if dst.exists():
-            stem, suffix = dst.stem, dst.suffix
-            i = 1
-            while dst.exists():
-                dst = trash_dir / f"{stem}_{i}{suffix}"
-                i += 1
-        shutil.move(str(path), str(dst))
+    trash_dir.mkdir(exist_ok=True)
+    # Handle collision in trash
+    if dst.exists():
+        stem, suffix = dst.stem, dst.suffix
+        i = 1
+        while dst.exists():
+            dst = trash_dir / f"{stem}_{i}{suffix}"
+            i += 1
+    shutil.move(str(path), str(dst))
 
-        # Log the operation for undo (store original location)
-        log_operation(
-            operation="TRASH",
-            original_path=str(path),
-            new_path=str(dst),
-            session_id=session_id,
-            extra={"file_id": file_id},
-        )
+    # Log the operation for undo (store original location)
+    log_operation(
+        operation="TRASH",
+        original_path=str(path),
+        new_path=str(dst),
+        session_id=session_id,
+        extra={"file_id": file_id},
+    )
 
-        f.path = str(dst)
-        f.status = FileStatus.APPLIED
-        session.commit()
-
+    f.path = str(dst)
+    f.status = FileStatus.APPLIED
     return True, f"Trashed: {path.name} -> {dst}"
 
 
@@ -448,7 +444,7 @@ def execute(
                             file_rec.filename = Path(prop.proposed_value).name
 
                 elif prop.proposal_type == ProposalType.MARK_DUPLICATE:
-                    ok, msg = _delete_duplicate(prop.file_id, dry_run, session_id)
+                    ok, msg = _delete_duplicate(prop.file_id, dry_run, session, session_id)
 
                 else:
                     ok, msg = True, f"Skipped unsupported type: {prop.proposal_type}"
