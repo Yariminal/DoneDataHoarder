@@ -1,0 +1,265 @@
+================================================================================
+DATAHOARDER AUTOMATED PIPELINE TEST — AI INSTRUCTIONS
+================================================================================
+Copy and paste the entire block below (from ---START--- to ---END---) into an 
+AI chat. The AI will execute the test sequence step by step.
+
+---START---
+
+You are an automated test runner for the DataHoarder project 
+(https://github.com/Yariminal/DoneDataHoarder). 
+
+Your goal: run the full DataHoarder pipeline on a real-world test folder, 
+apply all proposals, and critique the results.
+
+================================================================================
+STEP 0 — SETUP & CONTEXT
+================================================================================
+
+Working directory for tests: D:\Test
+This directory contains .zip files. Each .zip is a compressed test folder.
+
+DataHoarder is installed as a Python CLI entry point: `datahoarder`
+
+Available commands:
+  datahoarder scan <dir>          # scans files into the DB
+  datahoarder enrich              # extracts hashes, dates, MIME types
+  datahoarder analyze             # AI vision + text analysis
+  datahoarder dedup               # exact + perceptual duplicate detection
+  datahoarder relate              # LLM semantic grouping
+  datahoarder propose             # generates rename/move/tag proposals
+  datahoarder review              # interactive review (or --auto-apply)
+  datahoarder execute --force     # applies all APPROVED proposals to disk
+  datahoarder stats               # shows DB statistics
+  datahoarder doctor              # environment diagnostics
+
+The database path defaults to `datahoarder.db` in the current working directory.
+
+================================================================================
+STEP 1 — SELECT & PREPARE TEST FOLDER
+================================================================================
+
+1.1. List the .zip files in D:\Test:
+     dir D:\Test\*.zip
+
+1.2. Pick one .zip file to test (or I will tell you which one).
+
+1.3. Create a temporary extraction directory:
+     mkdir D:\Test\_extracted
+     # or use a unique name per test run, e.g. D:\Test\_run_YYYYMMDD_HHMMSS
+
+1.4. Extract the chosen .zip into that directory using PowerShell:
+     Expand-Archive -Path "D:\Test\<zipfile>.zip" -DestinationPath "D:\Test\_extracted" -Force
+
+1.5. Note the extracted root folder path. It might be:
+     D:\Test\_extracted\<foldername>
+
+================================================================================
+STEP 2 — INITIALIZE & RUN PIPELINE
+================================================================================
+
+2.1. Change into a clean working directory for this test run, e.g.:
+     cd D:\Test\_runs\<test_name>
+     
+     (Create the folder if it doesn't exist.)
+
+2.2. Initialize DataHoarder with a test-specific database:
+     $env:DATAHOARDER_DB = "D:\Test\Test db\<test_name>.db"
+     
+     (Create the "Test db" folder if it doesn't exist.)
+
+2.3. Run the full pipeline. You can run steps individually or use the 
+     pipeline command. Run individually for better control and logging:
+
+     # --- SCAN ---
+     datahoarder scan "D:\Test\_extracted\<foldername>" --workers 4
+     
+     # --- ENRICH ---
+     datahoarder enrich --workers 2
+     
+     # --- DEDUP ---
+     datahoarder dedup
+     
+     # --- ANALYZE ---
+     datahoarder analyze --workers 1
+     
+     # --- RELATE ---
+     datahoarder relate
+     
+     # --- PROPOSE ---
+     datahoarder propose
+     
+     # --- REVIEW & AUTO-APPLY ---
+     # Option A: Interactive review (if you are running manually)
+     datahoarder review
+     
+     # Option B: Auto-approve all high-confidence proposals
+     # (if running unattended)
+     datahoarder review --auto-apply --min-confidence 0.8
+     
+     # --- EXECUTE ---
+     datahoarder execute --force
+
+     # --- STATS ---
+     datahoarder stats
+
+IMPORTANT: If any step fails, STOP and report the error. Do not proceed.
+
+================================================================================
+STEP 3 — CAPTURE RESULTS
+================================================================================
+
+3.1. After `execute --force`, capture the final folder structure:
+     Get-ChildItem -Path "D:\Test\_extracted\<foldername>" -Recurse | 
+         Select-Object FullName, Length, LastWriteTime | 
+         Format-Table -AutoSize
+     
+     Also capture a tree-like view for readability:
+     tree /F "D:\Test\_extracted\<foldername>" 2>$null
+     (If `tree` is unavailable, use a recursive PowerShell listing.)
+
+3.2. Capture the .datahoarder_trash folder if it exists:
+     Get-ChildItem -Path "D:\Test\_extracted\<foldername>\.datahoarder_trash" -Recurse -ErrorAction SilentlyContinue
+
+3.3. Extract key statistics from the database using a direct query or the 
+     `stats` command. If you need deeper inspection, query the SQLite DB:
+     
+     sqlite3 "D:\Test\Test db\<test_name>.db" "SELECT status, COUNT(*) FROM files GROUP BY status;"
+     sqlite3 "D:\Test\Test db\<test_name>.db" "SELECT proposal_type, status, COUNT(*) FROM proposals GROUP BY proposal_type, status;"
+     sqlite3 "D:\Test\Test db\<test_name>.db" "SELECT dupe_type, COUNT(*) FROM duplicate_groups GROUP BY dupe_type;"
+
+3.4. Capture the DataHoarder log file if relevant:
+     Get-Content "$env:USERPROFILE\.datahoarder\datahoarder.log" -Tail 100
+
+================================================================================
+STEP 4 — CRITIQUE & ANALYSIS
+================================================================================
+
+Analyze the results and write a detailed critique covering:
+
+4.1. ORGANIZATION QUALITY
+    - Are folders well-structured and meaningfully named?
+    - Are files grouped logically (by date, type, project, event)?
+    - Are there any orphan files that should have been grouped?
+
+4.2. NAMING QUALITY
+    - Are renamed filenames descriptive and useful?
+    - Did the AI preserve important context (dates, locations, people)?
+    - Are there any mojibake/garbled characters in names?
+    - Are Hebrew / non-ASCII filenames handled correctly?
+
+4.3. DUPLICATE HANDLING
+    - Were true duplicates correctly identified and removed?
+    - Were any unique files mistakenly marked as duplicates?
+    - Check the .datahoarder_trash folder — were the "keepers" the best files?
+
+4.4. RELATE / SEMANTIC GROUPING
+    - Were related files (e.g., CAD source + PDF export + backup) grouped?
+    - Are there any false-positive groupings?
+
+4.4. ERROR & EDGE CASES
+    - Any files left in ERROR status? Why?
+    - Any files skipped that shouldn't have been?
+    - How did the system handle unusual formats or corrupt files?
+
+4.5. OVERALL ASSESSMENT
+    - Would you trust this on a real hoard of 100k+ files?
+    - What would break at scale?
+    - Suggest 3 concrete improvements.
+
+================================================================================
+STEP 5 — SAVE ARTIFACTS
+================================================================================
+
+5.1. Ensure the test database is saved:
+     # Already saved at D:\Test\Test db\<test_name>.db
+     # Verify the file exists and has non-zero size.
+
+5.2. Create a critique report file:
+     Save your full critique to:
+     D:\Test\Test db\<test_name>_critique.md
+     
+     Include in the report:
+     - Test date and DataHoarder version (from `datahoarder --help` or git log)
+     - Source zip file name
+     - Summary statistics (file counts, proposal counts, duplicate counts)
+     - The captured folder structure (tree / listing)
+     - Your detailed critique from Step 4
+     - Any error messages or stack traces encountered
+
+5.3. If you made any code fixes during the test, note them in the critique 
+     file under a "## Fixes Applied" section.
+
+================================================================================
+STEP 6 — CLEANUP (OPTIONAL)
+================================================================================
+
+6.1. If disk space is a concern and the test is complete:
+     Remove-Item -Recurse -Force "D:\Test\_extracted\<foldername>"
+     
+     KEEP the .db and _critique.md files in D:\Test\Test db\.
+
+6.2. If running another test, start fresh with a new extraction directory 
+     to avoid cross-contamination.
+
+================================================================================
+TIPS FOR THE AI RUNNER
+================================================================================
+
+- If a command hangs (e.g., `analyze` waiting on Ollama), check that 
+  Ollama is running: `ollama list` should show models. Start with 
+  `ollama serve` if needed.
+
+- If the DB is locked, another DataHoarder process is using it. Kill it:
+  Get-Process python | Stop-Process  # (careful — kills all Python)
+
+- For faster iteration on the same test folder, you can re-use the DB 
+  and run individual steps (e.g., just `propose` after tweaking namer rules).
+
+- The `datahoarder doctor` command is useful for pre-flight checks.
+
+- If you need to tweak configuration mid-test:
+  datahoarder config --edit-naming
+  datahoarder config --edit-phash
+
+================================================================================
+SAMPLE PROMPT TO PASTE INTO AN AI CHAT
+================================================================================
+
+Here is a compact version you can paste directly:
+
+---
+I need you to run an automated DataHoarder pipeline test.
+
+Test setup:
+- Working drive: D:\Test
+- There are .zip files in D:\Test. Pick the first one.
+- Extract it to D:\Test\_extracted
+- Use database path: D:\Test\Test db\autorun_1.db
+- Create the "Test db" folder if missing.
+
+Run this exact sequence and show me the output of each step:
+1. datahoarder doctor
+2. datahoarder scan D:\Test\_extracted\<folder> --workers 4
+3. datahoarder enrich
+4. datahoarder dedup
+5. datahoarder analyze --workers 1
+6. datahoarder relate
+7. datahoarder propose
+8. datahoarder review --auto-apply --min-confidence 0.8
+9. datahoarder execute --force
+10. datahoarder stats
+
+After execute, capture:
+- Recursive listing of the modified folder
+- Contents of .datahoarder_trash if present
+- Key SQLite queries from the DB
+
+Then write a detailed critique covering: folder structure quality, 
+naming quality, duplicate handling accuracy, relate grouping accuracy, 
+error handling, and 3 concrete improvement suggestions.
+
+Save the critique to D:\Test\Test db\autorun_1_critique.md
+---
+
+---END---

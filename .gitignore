@@ -18,9 +18,3 @@ venv/
 Thumbs.db
 TEST_REPORT*.md
 .claude/worktrees/
-
-# Test automation outputs
-test_outputs/
-test_dbs/
-test_reports/
-test_fixtures/*.unzipped/
