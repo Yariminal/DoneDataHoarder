@@ -645,9 +645,20 @@ def execute(
     else:
         console.print(Panel("[bold yellow]DRY RUN — no files will be changed[/bold yellow]", style="yellow"))
 
+    # Resolve latest session for empty-dir cleanup
+    from datahoarder.db.models import UserSession
+    from datahoarder.db.session import get_engine
+    from sqlalchemy.orm import Session
+    latest_session = None
+    with Session(get_engine()) as s:
+        latest = s.query(UserSession).order_by(UserSession.updated_at.desc()).first()
+        if latest:
+            latest_session = latest.id
+
     do_execute(
         dry_run=not commit,
         min_confidence=min_confidence,
+        session_id=latest_session,
     )
 
 

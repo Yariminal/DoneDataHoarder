@@ -24,6 +24,15 @@ from datahoarder.db.session import get_engine
 logger = logging.getLogger(__name__)
 
 
+def _normalize_folder_name(name: str) -> str:
+    """Normalize a folder name: strip illegal chars, replace spaces with underscores."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    name = re.sub(r"\s+", "_", name.strip())
+    name = re.sub(r"_+", "_", name)
+    name = name.strip("._")
+    return name
+
+
 @dataclass
 class FolderSummary:
     path: str
@@ -831,11 +840,7 @@ def generate_reorg_proposals(session_id: str) -> dict:
                 # Safety: LLM sometimes puts a full path in new_name — extract just the name
                 import re
                 new_name = Path(new_name).name
-                # Strip characters that are problematic in folder names
-                new_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", new_name)
-                new_name = re.sub(r"\s+", "_", new_name.strip())
-                new_name = re.sub(r"_+", "_", new_name)
-                new_name = new_name.strip("._")
+                new_name = _normalize_folder_name(new_name)
                 if not new_name:
                     counts["skipped"] += 1
                     continue
@@ -893,8 +898,8 @@ def generate_reorg_proposals(session_id: str) -> dict:
                     counts["skipped"] += 1
                     continue
 
-                src_abs = str(Path(root_path) / src_folder)
-                dst_abs = str(Path(root_path) / dst_folder)
+                src_abs = str(Path(root_path) / _normalize_folder_name(src_folder))
+                dst_abs = str(Path(root_path) / _normalize_folder_name(dst_folder))
 
                 # Look up each named file in the source folder
                 for fname in filenames:
@@ -946,9 +951,9 @@ def generate_reorg_proposals(session_id: str) -> dict:
                 counts["skipped"] += 1
                 continue
 
-            # Resolve to absolute paths
-            src_abs = str(Path(root_path) / src_folder)
-            dst_abs = str(Path(root_path) / dst_folder)
+            # Resolve to absolute paths (normalize folder names for consistency)
+            src_abs = str(Path(root_path) / _normalize_folder_name(src_folder))
+            dst_abs = str(Path(root_path) / _normalize_folder_name(dst_folder))
 
             # Find files in source folder
             query = db.query(File).filter(
@@ -1384,7 +1389,7 @@ def _folder_content_label(mime_breakdown: dict[str, int]) -> str | None:
     # Fallback: plurality wins if no strong majority
     top_cat, top_count = max(mime_breakdown.items(), key=lambda kv: kv[1])
     if top_count / total >= 0.35:
-        return top_cat.replace("_", " ").title().replace(" ", "_")
+        return top_cat.replace("_", " ").title().replace(" ", "_") + "_Files"
     return "Mixed_Content"
 
 

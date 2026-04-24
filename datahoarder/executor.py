@@ -221,7 +221,7 @@ def _apply_rename_folder(
 def _delete_duplicate(
     file_id: int, dry_run: bool, db_session: Session, session_id: str | None = None
 ) -> tuple[bool, str]:
-    """Move a duplicate to a .trash folder instead of hard-deleting."""
+    """Move a duplicate to a consolidated .datahoarder_trash folder instead of hard-deleting."""
     f = db_session.get(File, file_id)
     if not f:
         return False, "File not found in DB"
@@ -229,13 +229,25 @@ def _delete_duplicate(
     if not path.exists():
         return False, f"File not on disk: {path}"
 
-    trash_dir = path.parent / ".datahoarder_trash"
+    # Use a root-level trash folder if we can determine the session root,
+    # otherwise fall back to the file's parent directory.
+    trash_dir: Path
+    if session_id:
+        from datahoarder.db.models import UserSession
+        us = db_session.get(UserSession, session_id)
+        if us and us.root_path:
+            trash_dir = Path(us.root_path) / ".datahoarder_trash"
+        else:
+            trash_dir = path.parent / ".datahoarder_trash"
+    else:
+        trash_dir = path.parent / ".datahoarder_trash"
+
     dst = trash_dir / path.name
 
     if dry_run:
         return True, f"[DRY RUN] Would trash: {path}"
 
-    trash_dir.mkdir(exist_ok=True)
+    trash_dir.mkdir(parents=True, exist_ok=True)
     # Handle collision in trash
     if dst.exists():
         stem, suffix = dst.stem, dst.suffix
