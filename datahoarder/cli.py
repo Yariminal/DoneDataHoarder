@@ -492,7 +492,8 @@ def review(
                 f"(confidence >= {min_confidence})."
             )
             console.print(
-                "Run [bold]datahoarder execute --commit[/bold] to apply them to disk."
+                f"Run [bold]datahoarder execute --commit --min-confidence {min_confidence}[/bold] "
+                f"to apply them to disk."
             )
         else:
             console.print(
@@ -621,7 +622,7 @@ def _bulk_approve(min_confidence: float = 0.0) -> int:
 def execute(
     db: Annotated[str, typer.Option("--db", help="SQLite database path.", envvar="DATAHOARDER_DB")] = "datahoarder.db",
     commit: Annotated[bool, typer.Option("--commit", help="Apply changes for real (default is dry-run).")] = False,
-    min_confidence: Annotated[float, typer.Option("--min-confidence", "-c", help="Only apply proposals above this confidence.")] = 0.7,
+    min_confidence: Annotated[float, typer.Option("--min-confidence", "-c", help="Only apply proposals above this confidence.")] = 0.5,
 ):
     """
     [bold red]Execute[/bold red] proposals on disk.

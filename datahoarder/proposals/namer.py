@@ -195,6 +195,27 @@ def _build_echo_blocklist(file_rec: File, root_path: str | None) -> set[str]:
     return block
 
 
+def _deduplicate_stem_words(stem: str) -> str:
+    """
+    Remove duplicate words from a stem, keeping the first occurrence.
+    Prevents verbose AI descriptions like "architectural floor plan floor 310"
+    from producing "architectural_floor_plan_floor_310".
+
+    Preserves order and only drops exact duplicates (case-sensitive, since
+    stems are already lowercased at this point).
+    """
+    if not stem:
+        return stem
+    words = stem.split("_")
+    seen: set[str] = set()
+    unique: list[str] = []
+    for w in words:
+        if w and w not in seen:
+            seen.add(w)
+            unique.append(w)
+    return "_".join(unique)
+
+
 def _strip_context_echo(stem: str, blocklist: set[str]) -> str:
     """
     Drop tokens from `stem` that appear in `blocklist` (parent folder name +
@@ -366,6 +387,7 @@ def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str
     if not stem_from_desc and desc:
         words = re.sub(r"[^a-zA-Z0-9\s]", " ", desc).split()
         stem_from_desc = "_".join(w.lower() for w in words[:6] if len(w) > 2)
+        stem_from_desc = _deduplicate_stem_words(stem_from_desc)
         stem_from_desc = _safe(stem_from_desc)
 
     if not stem_from_desc:
