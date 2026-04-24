@@ -378,6 +378,7 @@ def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str
             if specific_tags:
                 # Use first 2-3 most relevant tags for more descriptive names
                 stem_from_desc = "_".join(specific_tags[:3])
+                stem_from_desc = _deduplicate_stem_words(stem_from_desc)
                 stem_from_desc = _safe(stem_from_desc)
         except (json.JSONDecodeError, TypeError):
             # If tags fail to parse, fall through to description
@@ -415,6 +416,7 @@ def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str
             root_path = None
     echo_block = _build_echo_blocklist(file_rec, root_path)
     stem_from_desc = _strip_context_echo(stem_from_desc, echo_block)
+    stem_from_desc = _deduplicate_stem_words(stem_from_desc)
 
     # Only use date prefix if the date is meaningful (not just a copy/extract timestamp).
     # Prefer real hardware sources (EXIF > filesystem) over AI-inferred date_best,
@@ -455,6 +457,10 @@ def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str
             stem = f"{sequence_info.base_name}{sequence_info.separator}{formatted_number}_{stem_from_desc}"
             # Clean up double underscores that might have resulted
             stem = re.sub(r"_+", "_", stem).strip("_")
+
+    # Final deduplication pass — sequence reconstruction or date+stem combo can
+    # introduce duplicates (e.g. "floor_plan_floor_310" when date+stem merge).
+    stem = _deduplicate_stem_words(stem)
 
     return stem + ext
 
