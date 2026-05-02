@@ -1,5 +1,5 @@
 """
-Tests for datahoarder.phash module.
+Tests for donedatahoarder.phash module.
 """
 import json
 import tempfile
@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from datahoarder import config, phash
+from donedatahoarder import config, phash
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +153,8 @@ def test_extract_video_frame_no_ffmpeg(monkeypatch):
     assert phash._extract_video_frame(fake_video) is None
 
 
-@patch("datahoarder.phash._video_duration", return_value=120.0)
-@patch("datahoarder.phash._ffmpeg_extract_frame", return_value=b"\xff\xd8\xff\xe0")
+@patch("donedatahoarder.phash._video_duration", return_value=120.0)
+@patch("donedatahoarder.phash._ffmpeg_extract_frame", return_value=b"\xff\xd8\xff\xe0")
 def test_extract_video_frame_success(mock_extract, mock_duration, monkeypatch, tmp_path):
     """Happy path: duration found, frame extracted, image opened."""
     from PIL import Image
@@ -168,7 +168,7 @@ def test_extract_video_frame_success(mock_extract, mock_duration, monkeypatch, t
     # The returned JPEG bytes are too short to be a real image, so _extract_video_frame
     # will fail at the PIL.open step.  Let's instead patch PIL.open.
     fake_img = MagicMock()
-    with patch("datahoarder.phash.PilImage.open", return_value=fake_img):
+    with patch("donedatahoarder.phash.PilImage.open", return_value=fake_img):
         result = phash._extract_video_frame(fake_video)
         assert result is fake_img
 

@@ -1,5 +1,5 @@
 """
-Unit tests for datahoarder.core.scanner — especially cross-platform date_created logic.
+Unit tests for donedatahoarder.core.scanner — especially cross-platform date_created logic.
 """
 import os
 import sys
@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from datahoarder.core.scanner import _get_file_dates, _exif_date_created, _mutagen_date_created
+from donedatahoarder.core.scanner import _get_file_dates, _exif_date_created, _mutagen_date_created
 
 
 class TestGetFileDates:
@@ -56,8 +56,8 @@ class TestGetFileDates:
                 assert "mtime" in warn.lower()
                 assert cre == mod
 
-    @patch("datahoarder.core.scanner._HAS_EXIFREAD", True)
-    @patch("datahoarder.core.scanner._exif_date_created")
+    @patch("donedatahoarder.core.scanner._HAS_EXIFREAD", True)
+    @patch("donedatahoarder.core.scanner._exif_date_created")
     def test_linux_image_exif_fallback(self, mock_exif):
         """Linux image without birthtime -> EXIF fallback."""
         mock_exif.return_value = datetime(2020, 5, 15, 10, 30, 0)
@@ -72,8 +72,8 @@ class TestGetFileDates:
                 assert cre == datetime(2020, 5, 15, 10, 30, 0)
                 assert warn is None
 
-    @patch("datahoarder.core.scanner._HAS_MUTAGEN", True)
-    @patch("datahoarder.core.scanner._mutagen_date_created")
+    @patch("donedatahoarder.core.scanner._HAS_MUTAGEN", True)
+    @patch("donedatahoarder.core.scanner._mutagen_date_created")
     def test_linux_audio_mutagen_fallback(self, mock_mutagen):
         """Linux audio without birthtime -> mutagen fallback."""
         mock_mutagen.return_value = datetime(2019, 8, 1, 0, 0, 0)
@@ -91,11 +91,11 @@ class TestGetFileDates:
 
 def test_exif_date_created_missing():
     """_exif_date_created returns None when exifread is missing or fails."""
-    with patch("datahoarder.core.scanner._HAS_EXIFREAD", False):
+    with patch("donedatahoarder.core.scanner._HAS_EXIFREAD", False):
         assert _exif_date_created(Path("/tmp/x.jpg")) is None
 
 
 def test_mutagen_date_created_missing():
     """_mutagen_date_created returns None when mutagen is missing or fails."""
-    with patch("datahoarder.core.scanner._HAS_MUTAGEN", False):
+    with patch("donedatahoarder.core.scanner._HAS_MUTAGEN", False):
         assert _mutagen_date_created(Path("/tmp/x.mp3")) is None

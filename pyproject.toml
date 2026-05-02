@@ -3,13 +3,13 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "datahoarder"
+name = "donedatahoarder"
 version = "0.3.0"
-description = "AI-powered file organization for data hoarders"
+description = "AI-powered file organization for data hoarders — local LLM (Ollama) renames, dedupes and organizes years of files"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [
-    { name = "DataHoarder Contributors" },
+    { name = "DoneDataHoarder Contributors" },
 ]
 requires-python = ">=3.10"
 classifiers = [
@@ -65,7 +65,7 @@ dev = [
     "pytest>=9.0,<10.0",
     "pytest-mock>=3.15,<4.0",
 ]
-all = ["datahoarder[docs,video,cloud,magic,web]"]
+all = ["donedatahoarder[docs,video,cloud,magic,web]"]
 
 [project.urls]
 Homepage = "https://github.com/Yariminal/DoneDataHoarder"
@@ -73,8 +73,8 @@ Repository = "https://github.com/Yariminal/DoneDataHoarder.git"
 Issues = "https://github.com/Yariminal/DoneDataHoarder/issues"
 
 [project.scripts]
-datahoarder = "datahoarder.cli:app"
+ddh = "donedatahoarder.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["datahoarder*"]
+include = ["donedatahoarder*"]

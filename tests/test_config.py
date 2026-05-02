@@ -1,12 +1,12 @@
 """
-Unit tests for datahoarder.config — naming rules loading and hygiene.
+Unit tests for donedatahoarder.config — naming rules loading and hygiene.
 """
 import json
 from pathlib import Path
 
 import pytest
 
-from datahoarder.config import (
+from donedatahoarder.config import (
     load_naming_rules,
     save_naming_rules,
     get_compiled_useless_patterns,

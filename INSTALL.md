@@ -1,12 +1,12 @@
-# DataHoarder Installation Guide
+# DoneDataHoarder Installation Guide
 
 ## Quick Start (No Video Analysis)
 
-DataHoarder works great for organizing images, documents, and metadata extraction without any additional dependencies:
+DoneDataHoarder works great for organizing images, documents, and metadata extraction without any additional dependencies:
 
 ```bash
-pip install datahoarder
-datahoarder serve --port 8000
+pip install donedatahoarder
+ddh serve --port 8000
 ```
 
 ## Full Installation (Including Video Analysis)
@@ -52,7 +52,7 @@ The following extras are automatically gracefully degraded if missing:
 
 ### Image & Document Organization (Minimum)
 ```bash
-pip install datahoarder
+pip install donedatahoarder
 # Works great for: JPG, PNG, GIF, WEBP, PDF, DOCX, XLSX
 ```
 
@@ -71,7 +71,7 @@ pip install faster-whisper
 
 ### Full Features (Everything)
 ```bash
-pip install datahoarder[all]
+pip install donedatahoarder[all]
 # Or install individual components as needed
 ```
 
@@ -80,10 +80,10 @@ pip install datahoarder[all]
 Check what's available:
 
 ```bash
-datahoarder --help
+ddh --help
 ```
 
-When you run analysis, DataHoarder will:
+When you run analysis, DoneDataHoarder will:
 - ✅ Use installed tools for optimal analysis
 - ✅ Gracefully degrade if optional dependencies are missing
 - ✅ Annotate analysis results with what was available
@@ -118,15 +118,15 @@ ollama pull gemma3:12b
 Or switch to Gemini backend:
 ```bash
 export GEMINI_API_KEY=your-key
-export DATAHOARDER_BACKEND=gemini
-datahoarder analyze /path/to/files
+export DDH_BACKEND=gemini
+ddh analyze /path/to/files
 ```
 
 ### "Database is locked"
-Another DataHoarder process (CLI, web UI, or background job) is holding the SQLite connection.
-- Close any other terminals running `datahoarder`
+Another DoneDataHoarder process (CLI, web UI, or background job) is holding the SQLite connection.
+- Close any other terminals running `ddh`
 - Stop the web UI (`Ctrl+C` if running)
-- On Unix: `pkill -f datahoarder`
+- On Unix: `pkill -f ddh`
 - On Windows: `taskkill /F /IM python.exe` (use with caution)
 
 ### "ffmpeg not found in PATH"
@@ -150,8 +150,8 @@ python -c "from faster_whisper import WhisperModel; WhisperModel('base')"
 If you prefer a containerized environment:
 
 ```bash
-docker build -t datahoarder .
-docker run -p 8000:8000 -v /path/to/files:/data datahoarder serve
+docker build -t donedatahoarder .
+docker run -p 8000:8000 -v /path/to/files:/data ddh serve
 ```
 
 (See Dockerfile in repo)
@@ -161,8 +161,8 @@ docker run -p 8000:8000 -v /path/to/files:/data datahoarder serve
 For contributing:
 
 ```bash
-git clone https://github.com/Yariminal/DoneDataHoarder.git
-cd DoneDataHoarder
+git clone https://github.com/Yariminal/DoneDoneDataHoarder.git
+cd DoneDoneDataHoarder
 pip install -e ".[dev]"
 pip install -e ".[all]"  # Optional: all extras for full feature testing
 ```

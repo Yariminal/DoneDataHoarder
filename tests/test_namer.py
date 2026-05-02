@@ -1,11 +1,11 @@
 """
-Unit tests for datahoarder.proposals.namer — naming heuristics.
+Unit tests for donedatahoarder.proposals.namer — naming heuristics.
 """
 from pathlib import Path
 
 import pytest
 
-from datahoarder.proposals.namer import (
+from donedatahoarder.proposals.namer import (
     _is_useless_stem,
     _hygienic_stem,
     _safe,

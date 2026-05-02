@@ -13,9 +13,9 @@ TEST_FOLDER = r"D:\Test\example_folder"
 BASE_URL = "http://127.0.0.1:8080/api"
 
 def start_server():
-    """Start the DataHoarder server in background."""
+    """Start the DoneDataHoarder server in background."""
     proc = subprocess.Popen(
-        [sys.executable, "-m", "datahoarder.cli", "serve"],
+        [sys.executable, "-m", "donedatahoarder.cli", "serve"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -113,7 +113,7 @@ def poll_for_job(job_id: str, max_wait: int = 900):
 def main():
     server_proc = None
     try:
-        print("Starting DataHoarder server...")
+        print("Starting DoneDataHoarder server...")
         server_proc = start_server()
 
         # Verify server is running

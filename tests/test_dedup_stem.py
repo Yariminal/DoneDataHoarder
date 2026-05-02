@@ -1,4 +1,4 @@
-from datahoarder.proposals.namer import _deduplicate_stem_words
+from donedatahoarder.proposals.namer import _deduplicate_stem_words
 
 tests = [
     ('architectural_floor_plan_floor_310', 'architectural_floor_plan_310'),

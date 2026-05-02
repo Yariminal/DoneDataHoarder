@@ -1,5 +1,5 @@
 """
-Unit tests for datahoarder.ai.json_utils — deliberately bad JSON recovery.
+Unit tests for donedatahoarder.ai.json_utils — deliberately bad JSON recovery.
 """
 import json
 from typing import Any
@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from datahoarder.ai.json_utils import (
+from donedatahoarder.ai.json_utils import (
     extract_json,
     generate_json_with_retry,
     validate_json,

@@ -17,4 +17,20 @@ venv/
 .DS_Store
 Thumbs.db
 TEST_REPORT*.md
+
+# Claude Code (per-user, never commit)
+.claude/launch.json
+.claude/settings.local.json
 .claude/worktrees/
+.claude/plans/
+
+# IDE / editor scratch
+.vscode/
+.idea/
+*.swp
+*~
+
+# Test scratch
+test.db
+*.sqlite
+*.sqlite3

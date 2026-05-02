@@ -1,4 +1,4 @@
-# Development dependencies for DataHoarder
+# Development dependencies for DoneDataHoarder
 # Install with: pip install -e ".[dev]"
 #
 # For full feature support, also install extras:

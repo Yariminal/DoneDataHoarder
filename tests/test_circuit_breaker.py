@@ -1,12 +1,12 @@
 """
-Unit tests for datahoarder.ai.circuit_breaker.
+Unit tests for donedatahoarder.ai.circuit_breaker.
 """
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from datahoarder.ai.circuit_breaker import CircuitBreaker
+from donedatahoarder.ai.circuit_breaker import CircuitBreaker
 
 
 class TestCircuitBreaker:

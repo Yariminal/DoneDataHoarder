@@ -1,0 +1,971 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DoneDataHoarder</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <script src="/static/app.js?v=2"></script>
+</head>
+<body x-data x-init="$store.app.tab = 'home'">
+
+<!-- ============================================================
+     App Shell
+     ============================================================ -->
+<div class="app-shell">
+
+  <!-- Header -->
+  <header class="app-header">
+    <h1 style="cursor:pointer" @click="goHome()"><span>Data</span>Hoarder</h1>
+    <div class="header-right" style="display:flex; align-items:center; gap:12px;">
+      <!-- Session info when active -->
+      <template x-if="$store.session.active">
+        <div style="display:flex; align-items:center; gap:10px;">
+          <span class="text-sm" style="color:var(--text-dim)">Session:</span>
+          <strong class="text-sm" x-text="$store.session.displayName"></strong>
+          <template x-if="$store.session.is_unsaved">
+            <span style="color:var(--warning); font-weight:bold;" title="Unsaved changes">*</span>
+          </template>
+          <button class="btn btn-outline btn-sm" @click="saveCurrentSession()" style="font-size:0.8rem;">
+            Save
+          </button>
+          <button class="btn btn-ghost btn-sm" @click="goHome()" style="font-size:0.8rem;" title="Back to sessions">
+            &#8962; Home
+          </button>
+        </div>
+      </template>
+      <span class="db-name" x-text="'v' + ($store.app.version || '0.3.0')"></span>
+    </div>
+  </header>
+
+  <!-- Sidebar — hidden when on home page -->
+  <nav class="sidebar" x-show="$store.session.active" x-cloak>
+    <ul class="sidebar-nav">
+      <li><button :class="{ active: $store.app.tab === 'dashboard' }" @click="$store.app.tab = 'dashboard'">
+        <span class="nav-icon">&#9638;</span> Dashboard
+      </button></li>
+      <li x-show="$store.session.hasScanned"><button :class="{ active: $store.app.tab === 'files' }" @click="$store.app.tab = 'files'">
+        <span class="nav-icon">&#128196;</span> Files
+      </button></li>
+      <li x-show="$store.session.hasScanned"><button :class="{ active: $store.app.tab === 'proposals' }" @click="$store.app.tab = 'proposals'">
+        <span class="nav-icon">&#9998;</span> Review
+      </button></li>
+      <li x-show="$store.session.hasScanned"><button :class="{ active: $store.app.tab === 'duplicates' }" @click="$store.app.tab = 'duplicates'">
+        <span class="nav-icon">&#128203;</span> Duplicates
+      </button></li>
+      <div class="sidebar-sep"></div>
+      <li><button :class="{ active: $store.app.tab === 'setup' }" @click="$store.app.tab = 'setup'">
+        <span class="nav-icon">&#9965;</span> Setup
+      </button></li>
+      <li><button :class="{ active: $store.app.tab === 'pipeline' }" @click="$store.app.tab = 'pipeline'">
+        <span class="nav-icon">&#9881;</span> Pipeline
+      </button></li>
+    </ul>
+
+    <!-- Session footer in sidebar -->
+    <div style="padding:12px 16px; border-top:1px solid var(--border); margin-top:auto;">
+      <template x-if="$store.session.last_saved_at">
+        <div class="text-dim text-sm" x-text="'Saved: ' + new Date($store.session.last_saved_at).toLocaleString()"></div>
+      </template>
+      <template x-if="$store.session.is_unsaved">
+        <div class="text-sm" style="color:var(--warning); margin-top:4px;">Unsaved changes</div>
+      </template>
+    </div>
+  </nav>
+
+  <!-- Main content area -->
+  <main class="main-content" :class="{ 'full-width': !$store.session.active }">
+
+    <!-- ====================== HOME ========================== -->
+    <section x-show="$store.app.tab === 'home'" x-data="home" x-cloak>
+      <div style="max-width:800px; margin:0 auto; padding:40px 20px;">
+        <div style="text-align:center; margin-bottom:40px;">
+          <h2 style="font-size:2rem; font-weight:700; margin-bottom:8px;">Welcome to DoneDataHoarder</h2>
+          <p class="text-dim" style="font-size:1.1rem;">Organize, analyze, and rename your files with AI</p>
+        </div>
+
+        <!-- Create new session -->
+        <div style="text-align:center; margin-bottom:32px;">
+          <button class="btn btn-primary" @click="createSession()" style="font-size:1.1rem; padding:12px 32px;">
+            + New Session
+          </button>
+        </div>
+
+        <!-- Previous sessions -->
+        <template x-if="sessions.length > 0">
+          <div>
+            <h3 style="font-size:1rem; margin-bottom:12px; color:var(--text-dim);">Previous Sessions</h3>
+            <div style="display:grid; gap:12px;">
+              <template x-for="s in sessions" :key="s.id">
+                <div class="card" style="cursor:pointer; transition:border-color .2s;"
+                     @click="loadSession(s.id)"
+                     @mouseenter="$el.style.borderColor='var(--primary)'"
+                     @mouseleave="$el.style.borderColor='var(--border)'">
+                  <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                    <div style="flex:1; min-width:0;">
+                      <div style="font-weight:600; font-size:1rem;" x-text="s.name || 'Unnamed Session'"></div>
+                      <div class="text-dim text-sm" style="margin-top:4px;">
+                        <span x-text="s.root_path || 'No folder set'"></span>
+                      </div>
+                      <div style="display:flex; gap:16px; margin-top:8px; align-items:center;">
+                        <span class="text-sm">
+                          <strong x-text="s.file_count"></strong> files
+                        </span>
+                        <span class="text-sm text-dim" x-text="'Modified ' + formatDate(s.updated_at)"></span>
+                        <!-- Pipeline progress indicators -->
+                        <div style="display:flex; gap:6px; align-items:center;">
+                          <span class="text-sm" :class="stepClass(s.completed_steps, 'scan')"
+                                x-text="stepIcon(s.completed_steps, 'scan') + ' Scan'"></span>
+                          <span class="text-sm" :class="stepClass(s.completed_steps, 'enrich')"
+                                x-text="stepIcon(s.completed_steps, 'enrich') + ' Enrich'"></span>
+                          <span class="text-sm" :class="stepClass(s.completed_steps, 'analyze')"
+                                x-text="stepIcon(s.completed_steps, 'analyze') + ' Analyze'"></span>
+                          <span class="text-sm" :class="stepClass(s.completed_steps, 'propose')"
+                                x-text="stepIcon(s.completed_steps, 'propose') + ' Propose'"></span>
+                        </div>
+                      </div>
+                    </div>
+                    <div style="flex-shrink:0; display:flex; gap:6px; align-items:center;">
+                      <template x-if="s.is_unsaved">
+                        <span class="badge badge-warning" style="font-size:0.75rem;">Unsaved</span>
+                      </template>
+                      <button class="btn btn-danger btn-sm" @click.stop="deleteSession(s.id, s.name)"
+                              title="Delete session" style="font-size:0.75rem;">Delete</button>
+                    </div>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+        </template>
+
+        <template x-if="sessions.length === 0 && !loading">
+          <div style="text-align:center; color:var(--text-dim); margin-top:40px;">
+            <p style="font-size:1.1rem;">No sessions yet</p>
+            <p class="text-sm" style="margin-top:4px;">Create a new session to get started</p>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- ====================== DASHBOARD ====================== -->
+    <section x-show="$store.app.tab === 'dashboard'" x-data="dashboard" x-cloak>
+      <div class="page-title">&#9638; Dashboard</div>
+
+      <template x-if="stats">
+        <div>
+          <!-- Stat cards -->
+          <div class="cards">
+            <div class="card">
+              <div class="card-label">Total Files</div>
+              <div class="card-value" x-text="stats.total_files.toLocaleString()"></div>
+            </div>
+            <div class="card">
+              <div class="card-label">Total Size</div>
+              <div class="card-value" x-text="formatBytes(stats.total_size_bytes)"></div>
+            </div>
+            <div class="card">
+              <div class="card-label">Pending Proposals</div>
+              <div class="card-value" x-text="(stats.proposal_counts.pending || 0).toLocaleString()"></div>
+            </div>
+            <div class="card">
+              <div class="card-label">Duplicate Groups</div>
+              <div class="card-value" x-text="stats.duplicate_groups"></div>
+              <div class="card-sub" x-text="'Wasted: ' + formatBytes(stats.duplicate_wasted_bytes)"></div>
+            </div>
+          </div>
+
+          <!-- Pipeline progress -->
+          <h3 class="mb-1" style="font-size:1rem;">Pipeline Progress</h3>
+          <div class="table-wrap mb-2">
+            <table>
+              <thead><tr><th>Status</th><th>Count</th><th style="width:50%">Progress</th></tr></thead>
+              <tbody>
+                <template x-for="step in pipelineProgress()" :key="step.label">
+                  <tr>
+                    <td><span class="badge" :class="'badge-' + step.label.toLowerCase()" x-text="step.label"></span></td>
+                    <td x-text="step.count.toLocaleString()"></td>
+                    <td>
+                      <div class="progress-bar">
+                        <div class="fill" :class="step.cls" :style="'width:' + step.pct + '%'"></div>
+                      </div>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Top extensions -->
+          <h3 class="mb-1" style="font-size:1rem;">Top File Types</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Extension</th><th>Count</th></tr></thead>
+              <tbody>
+                <template x-for="e in stats.by_extension" :key="e.ext">
+                  <tr>
+                    <td class="text-mono" x-text="e.ext || '(none)'"></td>
+                    <td x-text="e.count.toLocaleString()"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </template>
+
+      <template x-if="!stats">
+        <p class="text-dim">Loading...</p>
+      </template>
+    </section>
+
+    <!-- ====================== FILES ========================== -->
+    <section x-show="$store.app.tab === 'files'" x-data="fileBrowser" x-cloak>
+      <div class="page-title">&#128196; Files</div>
+
+      <!-- Toolbar -->
+      <div class="toolbar">
+        <input type="text" class="input" placeholder="Search files..."
+               x-model="search" @input="onSearch()" style="width:260px;">
+        <select class="input" x-model="statusFilter" @change="page=1; load()">
+          <option value="">All statuses</option>
+          <option value="pending">Pending</option>
+          <option value="enriched">Enriched</option>
+          <option value="analyzed">Analyzed</option>
+          <option value="proposed">Proposed</option>
+          <option value="applied">Applied</option>
+          <option value="error">Error</option>
+        </select>
+        <select class="input" x-model="mimeFilter" @change="page=1; load()">
+          <option value="">All types</option>
+          <option value="image/">Images</option>
+          <option value="video/">Videos</option>
+          <option value="audio/">Audio</option>
+          <option value="application/">Documents</option>
+          <option value="text/">Text</option>
+        </select>
+        <div class="spacer"></div>
+
+        <!-- Results management -->
+        <div style="display:flex; gap:6px; align-items:center;">
+          <select class="input" x-model="currentResult" @change="loadResult()" style="font-size:0.85rem;">
+            <option value="">Load results...</option>
+            <template x-for="r in savedResults" :key="r.filename">
+              <option :value="r.filename" x-text="r.filename + ' (' + new Date(r.saved_at).toLocaleString() + ')'"></option>
+            </template>
+          </select>
+          <button class="btn btn-outline btn-sm" @click="saveResults('files')" title="Save current results">Save</button>
+        </div>
+
+        <span class="text-dim text-sm" x-text="total.toLocaleString() + ' files'"></span>
+      </div>
+
+      <!-- Table -->
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:44px"></th>
+              <th>Filename</th>
+              <th>Size</th>
+              <th>Type</th>
+              <th>Status</th>
+              <th>AI Description</th>
+              <th style="width:50px"></th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="f in files" :key="f.id">
+              <tr>
+                <td>
+                  <template x-if="isImage(f)">
+                    <img :src="'/api/files/' + f.id + '/thumbnail?size=44'" class="thumb"
+                         loading="lazy" alt="">
+                  </template>
+                </td>
+                <td>
+                  <div class="truncate text-mono" :title="f.path" x-text="f.filename"></div>
+                  <div class="text-dim text-sm truncate" x-text="f.path" style="max-width:400px"></div>
+                </td>
+                <td class="text-sm" x-text="formatSize(f.size_bytes)"></td>
+                <td class="text-sm text-dim truncate" x-text="f.mime_type || f.extension || '-'" style="max-width:160px"></td>
+                <td><span class="badge" :class="'badge-' + f.status" x-text="f.status"></span></td>
+                <td class="text-sm truncate" x-text="f.ai_description || '-'" style="max-width:280px"></td>
+                <td><button class="btn btn-ghost btn-sm" @click="viewFile(f.id)">View</button></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+        <div class="pagination">
+          <span x-text="'Page ' + page + ' of ' + totalPages()"></span>
+          <div class="btn-group">
+            <button class="btn btn-outline btn-sm" :disabled="page <= 1" @click="prevPage()">Prev</button>
+            <button class="btn btn-outline btn-sm" :disabled="page >= totalPages()" @click="nextPage()">Next</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- File detail modal -->
+      <template x-if="showModal && selectedFile">
+        <div class="modal-backdrop" @click.self="closeModal()">
+          <div class="modal">
+            <button class="modal-close" @click="closeModal()">&#10005;</button>
+            <div class="modal-title" x-text="selectedFile.filename"></div>
+
+            <template x-if="selectedFile.mime_type && selectedFile.mime_type.startsWith('image/')">
+              <img :src="'/api/files/' + selectedFile.id + '/thumbnail?size=400'" class="thumb-lg" alt="">
+            </template>
+
+            <dl class="detail-grid">
+              <dt>Path</dt><dd class="text-mono text-sm" x-text="selectedFile.path"></dd>
+              <dt>Size</dt><dd x-text="formatSize(selectedFile.size_bytes)"></dd>
+              <dt>MIME</dt><dd x-text="selectedFile.mime_type || '-'"></dd>
+              <dt>MD5</dt><dd class="text-mono text-sm" x-text="selectedFile.hash_md5 || '-'"></dd>
+              <dt>Status</dt><dd><span class="badge" :class="'badge-' + selectedFile.status" x-text="selectedFile.status"></span></dd>
+              <dt>Date (best)</dt><dd x-text="selectedFile.date_best || '-'"></dd>
+              <dt>Date EXIF</dt><dd x-text="selectedFile.date_exif || '-'"></dd>
+              <dt>AI Model</dt><dd x-text="selectedFile.ai_model || '-'"></dd>
+              <dt>Confidence</dt><dd x-text="selectedFile.ai_confidence ? (selectedFile.ai_confidence * 100).toFixed(0) + '%' : '-'"></dd>
+              <dt>Description</dt><dd x-text="selectedFile.ai_description || '-'"></dd>
+              <dt>Tags</dt><dd x-text="selectedFile.ai_tags ? selectedFile.ai_tags.join(', ') : '-'"></dd>
+            </dl>
+
+            <template x-if="selectedFile.ai_transcript">
+              <div class="mt-2">
+                <strong class="text-sm">Transcript</strong>
+                <p class="text-sm text-dim mt-1" x-text="selectedFile.ai_transcript"></p>
+              </div>
+            </template>
+
+            <template x-if="selectedFile.proposals && selectedFile.proposals.length">
+              <div class="mt-2">
+                <strong class="text-sm">Proposals</strong>
+                <template x-for="p in selectedFile.proposals" :key="p.id">
+                  <div class="mt-1 text-sm" style="padding:6px 10px; background:var(--surface-2); border-radius:6px;">
+                    <span class="badge" :class="'badge-' + p.status" x-text="p.type"></span>
+                    <span class="current-name" x-text="p.current_value || ''"></span>
+                    <span class="proposal-arrow"> -&gt; </span>
+                    <span class="proposed-name" x-text="p.proposed_value || ''"></span>
+                  </div>
+                </template>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+    </section>
+
+    <!-- ====================== PROPOSALS ====================== -->
+    <section x-show="$store.app.tab === 'proposals'" x-data="proposalReview" x-cloak>
+      <div class="page-title">&#9998; Review Proposals</div>
+
+      <!-- Toolbar -->
+      <div class="toolbar">
+        <input type="text" class="input" placeholder="Search..."
+               x-model="search" @input.debounce.350ms="page=1; load()" style="width:200px;">
+        <select class="input" x-model="statusFilter" @change="page=1; load()">
+          <option value="pending">Pending</option>
+          <option value="approved">Approved</option>
+          <option value="rejected">Rejected</option>
+          <option value="modified">Modified</option>
+          <option value="applied">Applied</option>
+          <option value="">All</option>
+        </select>
+        <select class="input" x-model="typeFilter" @change="page=1; load()">
+          <option value="">All types</option>
+          <option value="rename">Rename</option>
+          <option value="add_tags">Tags</option>
+          <option value="mark_duplicate">Duplicates</option>
+        </select>
+
+        <!-- Results management -->
+        <select class="input" x-model="currentResult" @change="loadResult()" style="font-size:0.85rem;">
+          <option value="">Load results...</option>
+          <template x-for="r in savedResults" :key="r.filename">
+            <option :value="r.filename" x-text="r.filename + ' (' + new Date(r.saved_at).toLocaleString() + ')'"></option>
+          </template>
+        </select>
+        <button class="btn btn-outline btn-sm" @click="saveResults('proposals')" title="Save current results">Save</button>
+
+        <div class="spacer"></div>
+
+        <!-- Bulk approve -->
+        <div class="flex items-center gap-2" style="gap:8px">
+          <label class="text-sm text-dim">Min confidence:</label>
+          <input type="number" class="input input-sm" x-model.number="bulkConfidence"
+                 min="0" max="100" style="width:60px;"> <span class="text-sm text-dim">%</span>
+          <button class="btn btn-success btn-sm" @click="bulkApprove()">Approve All</button>
+        </div>
+      </div>
+
+      <!-- Table -->
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Type</th>
+              <th>Current</th>
+              <th></th>
+              <th>Proposed</th>
+              <th>Confidence</th>
+              <th>Status</th>
+              <th style="width:180px">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="p in proposals" :key="p.id">
+              <tr>
+                <td><span class="badge badge-enriched" x-text="p.proposal_type"></span></td>
+                <td class="current-name truncate" x-text="p.current_value" :title="p.current_value"></td>
+                <td class="proposal-arrow">-&gt;</td>
+                <td>
+                  <template x-if="editingId !== p.id">
+                    <span class="proposed-name truncate" x-text="p.proposed_value" :title="p.proposed_value"></span>
+                  </template>
+                  <template x-if="editingId === p.id">
+                    <div class="flex items-center" style="gap:6px">
+                      <input type="text" class="input input-sm" x-model="editValue" style="width:240px"
+                             @keyup.enter="saveEdit(p.id)" @keyup.escape="cancelEdit()">
+                      <button class="btn btn-success btn-sm" @click="saveEdit(p.id)">Save</button>
+                      <button class="btn btn-ghost btn-sm" @click="cancelEdit()">Cancel</button>
+                    </div>
+                  </template>
+                </td>
+                <td>
+                  <span :style="'color:' + confColor(p.confidence)"
+                        x-text="p.confidence ? (p.confidence * 100).toFixed(0) + '%' : '?'"></span>
+                </td>
+                <td><span class="badge" :class="'badge-' + p.status" x-text="p.status"></span></td>
+                <td>
+                  <div class="btn-group">
+                    <template x-if="p.status === 'pending' || p.status === 'modified'">
+                      <button class="btn btn-success btn-sm" @click="approve(p.id)" title="Approve">&#10003;</button>
+                    </template>
+                    <template x-if="p.status === 'pending' || p.status === 'modified'">
+                      <button class="btn btn-danger btn-sm" @click="reject(p.id)" title="Reject">&#10005;</button>
+                    </template>
+                    <template x-if="p.status === 'pending' || p.status === 'modified'">
+                      <button class="btn btn-outline btn-sm" @click="startEdit(p)" title="Edit">&#9998;</button>
+                    </template>
+                  </div>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+        <div class="pagination">
+          <span x-text="total.toLocaleString() + ' proposals'"></span>
+          <div>
+            <span class="text-dim text-sm" x-text="'Page ' + page + ' / ' + totalPages()"></span>
+            <button class="btn btn-outline btn-sm" :disabled="page <= 1" @click="prevPage()">Prev</button>
+            <button class="btn btn-outline btn-sm" :disabled="page >= totalPages()" @click="nextPage()">Next</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ====================== DUPLICATES ===================== -->
+    <section x-show="$store.app.tab === 'duplicates'" x-data="duplicates" x-cloak>
+      <div class="page-title">&#128203; Duplicate Groups</div>
+
+      <!-- Toolbar -->
+      <div class="toolbar" style="margin-bottom:12px;">
+        <div class="spacer"></div>
+        <select class="input" x-model="currentResult" @change="loadResult()" style="font-size:0.85rem;">
+          <option value="">Load results...</option>
+          <template x-for="r in savedResults" :key="r.filename">
+            <option :value="r.filename" x-text="r.filename + ' (' + new Date(r.saved_at).toLocaleString() + ')'"></option>
+          </template>
+        </select>
+        <button class="btn btn-outline btn-sm" @click="saveResults('duplicates')" title="Save current results">Save</button>
+      </div>
+
+      <p class="text-dim mb-2" x-text="total + ' duplicate groups found'"></p>
+
+      <template x-for="g in groups" :key="g.id">
+        <div class="dupe-group">
+          <div class="dupe-header">
+            <div>
+              <span class="badge" :class="'badge-' + g.dupe_type" x-text="g.dupe_type"></span>
+              <strong x-text="g.count + ' files'"></strong>
+              <span class="text-dim text-sm" x-text="'Wasted: ' + formatBytes(g.wasted_bytes)"></span>
+            </div>
+          </div>
+          <div class="dupe-files">
+            <template x-for="f in g.files" :key="f.id">
+              <div class="dupe-file" :class="{ keeper: f.is_keeper }">
+                <template x-if="isImage(f)">
+                  <img :src="'/api/files/' + f.id + '/thumbnail?size=44'" class="thumb" loading="lazy" alt="">
+                </template>
+                <template x-if="!isImage(f)">
+                  <div class="thumb" style="display:flex;align-items:center;justify-content:center;font-size:.7rem;color:var(--text-dim)">FILE</div>
+                </template>
+                <div style="flex:1;min-width:0;">
+                  <div class="truncate text-mono text-sm" :title="f.path" x-text="f.filename"></div>
+                  <div class="text-dim text-sm truncate" style="max-width:500px" x-text="f.path"></div>
+                </div>
+                <span class="text-sm" x-text="formatBytes(f.size_bytes)"></span>
+                <template x-if="f.is_keeper">
+                  <span class="keeper-star" title="Keeper">&#9733; Keep</span>
+                </template>
+                <template x-if="!f.is_keeper">
+                  <button class="btn btn-outline btn-sm" @click="setKeeper(g.id, f.id)">Set as keeper</button>
+                </template>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+
+      <!-- Pagination -->
+      <template x-if="totalPages() > 1">
+        <div class="pagination" style="border:1px solid var(--border); border-radius:var(--radius); margin-top:12px;">
+          <button class="btn btn-outline btn-sm" :disabled="page <= 1" @click="prevPage()">&#8592; Prev</button>
+          <span x-text="'Page ' + page + ' of ' + totalPages()"></span>
+          <button class="btn btn-outline btn-sm" :disabled="page >= totalPages()" @click="nextPage()">Next &#8594;</button>
+        </div>
+      </template>
+
+      <template x-if="groups.length === 0">
+        <p class="text-dim">No duplicate groups found. Run <code>datahoarder dedup</code> or use the Pipeline tab.</p>
+      </template>
+    </section>
+
+    <!-- ====================== PIPELINE ======================= -->
+    <section x-show="$store.app.tab === 'pipeline'" x-data="pipeline" x-cloak>
+      <div class="page-title">&#9881; Pipeline</div>
+
+      <!-- Current settings summary -->
+      <div class="card mb-2" style="max-width:600px">
+        <div class="card-label">Active Settings <span class="text-dim text-sm">(change in Setup tab)</span></div>
+        <div class="mt-1 text-sm" style="display:grid; grid-template-columns:100px 1fr; gap:4px 12px;">
+          <strong>Folder:</strong> <span class="text-mono" x-text="getSettings().rootPath || '(not set)'"></span>
+          <strong>Analyze Model:</strong> <span class="text-mono" :style="!getSettings().analyzeModel ? 'color:var(--danger)' : ''" x-text="getSettings().analyzeModel || '(not selected)'"></span>
+          <strong>Propose Model:</strong> <span class="text-mono" :style="!getSettings().proposeModel ? 'color:var(--danger)' : ''" x-text="getSettings().proposeModel || '(not selected)'"></span>
+          <strong>Backend:</strong> <span x-text="getSettings().backend"></span>
+          <strong>Workers:</strong> <span x-text="getSettings().workers"></span>
+        </div>
+      </div>
+
+      <!-- Model selection warning -->
+      <template x-if="!getSettings().analyzeModel && !getSettings().proposeModel">
+        <div style="background:var(--danger-bg); border:1px solid var(--danger); border-radius:6px; padding:12px; margin-bottom:16px; max-width:600px;">
+          <div style="display:flex; gap:8px; align-items:flex-start;">
+            <span style="font-size:1.2rem; flex-shrink:0;">⚠</span>
+            <div>
+              <div style="color:var(--danger); font-weight:600;">No models selected</div>
+              <div class="text-sm" style="color:var(--text-dim); margin-top:4px;">
+                Go to <strong>Setup</strong> tab and select AI models before running Analyze or Organize.
+              </div>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <!-- Steps -->
+      <div class="pipeline-steps">
+        <div class="pipeline-step">
+          <div class="step-num" :class="{ active: running === 'scan', 'step-done': isStepDone('scan') }" x-text="isStepDone('scan') ? '✓' : '1'"></div>
+          <div class="step-info">
+            <div class="step-name">Scan</div>
+            <div class="step-desc">Recursively walk filesystem and index all files and folders</div>
+          </div>
+          <button class="btn btn-primary btn-sm" :disabled="running" @click="runStep('scan')">
+            <span x-text="running === 'scan' ? 'Scanning...' : 'Run'"></span>
+          </button>
+        </div>
+        <div class="pipeline-step">
+          <div class="step-num" :class="{ active: running === 'enrich', 'step-done': isStepDone('enrich') }" x-text="isStepDone('enrich') ? '✓' : '2'"></div>
+          <div class="step-info">
+            <div class="step-name">Enrich</div>
+            <div class="step-desc">Extract metadata, hashes, EXIF dates</div>
+            <!-- Live progress counter -->
+            <template x-if="enrichProgress">
+              <div class="mt-1">
+                <div class="text-sm" style="color:var(--primary); font-weight:600;"
+                     x-text="'Enriching: ' + enrichProgress.current + ' / ' + enrichProgress.total + ' files' + (filesPerMin(enrichProgress) ? ' (' + filesPerMin(enrichProgress) + ' files/min)' : '')"></div>
+                <div style="margin-top:4px; background:var(--surface-2); border-radius:4px; height:6px; overflow:hidden;">
+                  <div style="height:100%; background:var(--primary); border-radius:4px; transition:width .3s;"
+                       :style="'width:' + (enrichProgress.total ? (enrichProgress.current / enrichProgress.total * 100) : 0) + '%'"></div>
+                </div>
+                <div class="text-dim text-sm mt-1"
+                     x-text="'Done: ' + (enrichProgress.enriched || 0) + ' | Errors: ' + (enrichProgress.errors || 0)"></div>
+              </div>
+            </template>
+          </div>
+          <div class="btn-group">
+            <button class="btn btn-primary btn-sm" :disabled="running" @click="runStep('enrich')"
+                    x-show="!(activeJobType === 'enrich' && (jobState === 'running' || jobState === 'paused'))">
+              <span x-text="running === 'enrich' ? 'Starting...' : 'Run'"></span>
+            </button>
+            <button class="btn btn-outline btn-sm" @click="pauseJob()"
+                    x-show="activeJobType === 'enrich' && jobState === 'running'">Pause</button>
+            <button class="btn btn-primary btn-sm" @click="resumeJob()"
+                    x-show="activeJobType === 'enrich' && jobState === 'paused'">Resume</button>
+            <button class="btn btn-danger btn-sm" @click="cancelJob()"
+                    x-show="activeJobType === 'enrich' && (jobState === 'running' || jobState === 'paused')">Cancel</button>
+          </div>
+        </div>
+        <div class="pipeline-step">
+          <div class="step-num" :class="{ active: running === 'dedup', 'step-done': isStepDone('dedup') }" x-text="isStepDone('dedup') ? '✓' : '3'"></div>
+          <div class="step-info">
+            <div class="step-name">Deduplicate</div>
+            <div class="step-desc">Find exact and near-duplicate files</div>
+          </div>
+          <button class="btn btn-primary btn-sm" :disabled="running" @click="runStep('dedup')">
+            <span x-text="running === 'dedup' ? 'Deduplicating...' : 'Run'"></span>
+          </button>
+        </div>
+        <div class="pipeline-step">
+          <div class="step-num" :class="{ active: running === 'relate', 'step-done': isStepDone('relate') }" x-text="isStepDone('relate') ? '✓' : '4'"></div>
+          <div class="step-info">
+            <div class="step-name">Relate</div>
+            <div class="step-desc">LLM groups conceptually-related files (CAD source + backups + exports, photo sets, font families)</div>
+          </div>
+          <button class="btn btn-primary btn-sm" :disabled="running || !getSettings().analyzeModel" @click="runStep('relate')"
+                  :title="!getSettings().analyzeModel ? 'Select an analysis model in Setup first' : ''">
+            <span x-text="running === 'relate' ? 'Grouping...' : 'Run'"></span>
+          </button>
+        </div>
+        <div class="pipeline-step">
+          <div class="step-num" :class="{ active: running === 'analyze', 'step-done': isStepDone('analyze') }" x-text="isStepDone('analyze') ? '✓' : '5'"></div>
+          <div class="step-info">
+            <div class="step-name">Analyze</div>
+            <div class="step-desc">AI analysis (vision + text) of all files</div>
+            <!-- Live progress counter -->
+            <template x-if="analyzeProgress">
+              <div class="mt-1">
+                <div class="text-sm" style="color:var(--primary); font-weight:600;"
+                     x-text="'Analyzing: ' + analyzeProgress.current + ' / ' + analyzeProgress.total + ' files' + (filesPerMin(analyzeProgress) ? ' (' + filesPerMin(analyzeProgress) + ' files/min)' : '')"></div>
+                <div style="margin-top:4px; background:var(--surface-2); border-radius:4px; height:6px; overflow:hidden;">
+                  <div style="height:100%; background:var(--primary); border-radius:4px; transition:width .3s;"
+                       :style="'width:' + (analyzeProgress.total ? (analyzeProgress.current / analyzeProgress.total * 100) : 0) + '%'"></div>
+                </div>
+                <div class="text-dim text-sm mt-1"
+                     x-text="'Done: ' + (analyzeProgress.analyzed || 0) + ' | Skipped: ' + (analyzeProgress.skipped || 0) + ' | Errors: ' + (analyzeProgress.errors || 0)"></div>
+              </div>
+            </template>
+            <template x-if="activeJobType === 'analyze' && jobState === 'paused' && !analyzeProgress">
+              <div class="text-sm mt-1" style="color:var(--warning); font-weight:600;">Paused</div>
+            </template>
+          </div>
+          <div class="btn-group">
+            <button class="btn btn-primary btn-sm" :disabled="running || !getSettings().analyzeModel" @click="runStep('analyze')"
+                    :title="!getSettings().analyzeModel ? 'Select an analysis model in Setup first' : ''"
+                    x-show="!(activeJobType === 'analyze' && (jobState === 'running' || jobState === 'paused'))">
+              <span x-text="running === 'analyze' ? 'Starting...' : 'Run'"></span>
+            </button>
+            <button class="btn btn-outline btn-sm" @click="pauseJob()"
+                    x-show="activeJobType === 'analyze' && jobState === 'running'">Pause</button>
+            <button class="btn btn-primary btn-sm" @click="resumeJob()"
+                    x-show="activeJobType === 'analyze' && jobState === 'paused'">Resume</button>
+            <button class="btn btn-danger btn-sm" @click="cancelJob()"
+                    x-show="activeJobType === 'analyze' && (jobState === 'running' || jobState === 'paused')">Cancel</button>
+          </div>
+        </div>
+        <div class="pipeline-step">
+          <div class="step-num" :class="{ active: running === 'propose', 'step-done': isStepDone('propose') }" x-text="isStepDone('propose') ? '✓' : '6'"></div>
+          <div class="step-info">
+            <div class="step-name">Propose</div>
+            <div class="step-desc">Generate rename/tag proposals</div>
+          </div>
+          <button class="btn btn-primary btn-sm" :disabled="running" @click="runStep('propose')">
+            <span x-text="running === 'propose' ? 'Proposing...' : 'Run'"></span>
+          </button>
+        </div>
+        <div class="pipeline-step">
+          <div class="step-num" :class="{ active: running === 'organize', 'step-done': isStepDone('organize') }" x-text="isStepDone('organize') ? '✓' : '7'"></div>
+          <div class="step-info">
+            <div class="step-name">Organize</div>
+            <div class="step-desc">AI suggests folder reorganization based on file analysis</div>
+          </div>
+          <button class="btn btn-primary btn-sm" :disabled="running" @click="runStep('organize')">
+            <span x-text="running === 'organize' ? 'Organizing...' : 'Run'"></span>
+          </button>
+        </div>
+
+        <div class="sidebar-sep" style="margin:4px 0"></div>
+
+        <div class="pipeline-step">
+          <div class="step-num" :class="{ 'step-done': isStepDone('execute') }" x-text="isStepDone('execute') ? '✓' : '8'"></div>
+          <div class="step-info">
+            <div class="step-name">Execute</div>
+            <div class="step-desc">Apply approved proposals to disk</div>
+          </div>
+          <div class="btn-group">
+            <button class="btn btn-outline btn-sm" :disabled="running" @click="runStep('execute-dry')">Dry Run</button>
+            <button class="btn btn-danger btn-sm" :disabled="running" @click="runStep('execute-commit')">Commit</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Result display -->
+      <template x-if="result">
+        <div class="mt-2" style="max-width:900px">
+          <!-- Tree visualization for organize results -->
+          <template x-if="result.before_tree || result.after_tree">
+            <div style="display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:16px;">
+              <div class="card" style="min-width:0; overflow:hidden;" x-show="result.before_tree">
+                <div class="card-label">Current Structure</div>
+                <div class="tree-view mt-1" x-html="renderTree(result.before_tree)"></div>
+              </div>
+              <div class="card" style="min-width:0; overflow:hidden;" x-show="result.after_tree">
+                <div class="card-label">Proposed Structure</div>
+                <div class="tree-view mt-1" x-html="renderTree(result.after_tree)"></div>
+              </div>
+            </div>
+          </template>
+          <!-- JSON fallback for other results -->
+          <template x-if="!result.before_tree && !result.after_tree">
+            <div class="card">
+              <div class="card-label">Result</div>
+              <pre class="text-sm text-mono mt-1" style="white-space:pre-wrap; color:var(--text-dim)" x-text="JSON.stringify(result, null, 2)"></pre>
+            </div>
+          </template>
+        </div>
+      </template>
+    </section>
+
+    <!-- ====================== SETUP ========================= -->
+    <section x-show="$store.app.tab === 'setup'" x-data="setup" x-cloak>
+      <div class="page-title">&#9965; Setup & Configuration</div>
+
+      <!-- Folder Selection -->
+      <div class="card mb-2">
+        <div class="card-label">Root Folder</div>
+        <div class="mt-1" style="display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center;">
+          <input type="text" class="input" x-model="selectedFolder" readonly placeholder="Select a folder...">
+          <button class="btn btn-primary btn-sm" @click="showBrowser = true">Browse</button>
+        </div>
+        <p class="text-dim text-sm mt-1" x-text="selectedFolder ? 'Selected: ' + selectedFolder : 'Click Browse to select a folder to organize'"></p>
+
+        <!-- Subfolder skip selection -->
+        <template x-if="subfolders.length > 0">
+          <div class="mt-2">
+            <div class="text-sm mb-1" style="font-weight:600;">Skip Subfolders:</div>
+            <div style="max-height:200px; overflow-y:auto; border:1px solid var(--border); border-radius:6px; padding:8px;">
+              <template x-for="sf in subfolders" :key="sf.path">
+                <label style="display:flex; align-items:center; gap:8px; padding:4px 0; font-size:.86rem; cursor:pointer;">
+                  <input type="checkbox" :checked="skippedFolders.includes(sf.path)" @change="toggleSkipFolder(sf.path); $store.session.skip_dirs = [...skippedFolders]">
+                  <span x-text="sf.name"></span>
+                  <span class="badge badge-applied" x-show="sf.completed" style="font-size:.65rem;">completed</span>
+                </label>
+              </template>
+            </div>
+            <p class="text-dim text-sm mt-1">Check folders to skip during Scan. Previously completed folders are pre-checked.</p>
+          </div>
+        </template>
+      </div>
+
+      <!-- Folder Browser Modal -->
+      <template x-if="showBrowser">
+        <div class="modal-backdrop" @click.self="showBrowser = false">
+          <div class="modal" style="max-width:600px;">
+            <button class="modal-close" @click="showBrowser = false">&#10005;</button>
+            <div class="modal-title">Select Folder</div>
+            <div class="mt-1" x-show="!currentPath">
+              <p class="text-dim text-sm mb-1">Available Drives:</p>
+              <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(140px, 1fr)); gap:8px;">
+                <template x-for="drive in drives" :key="drive.name">
+                  <button class="btn btn-outline" @click="browsePath(drive.name)" style="text-align:left; padding:8px;">
+                    <div x-text="drive.name" style="font-weight:600"></div>
+                    <div class="text-dim text-sm" x-text="drive.free_bytes ? (drive.free_bytes/1024/1024/1024).toFixed(1) + ' GB free' : ''"></div>
+                  </button>
+                </template>
+              </div>
+            </div>
+            <div x-show="currentPath">
+              <div style="margin-bottom:12px;">
+                <button class="btn btn-outline btn-sm" @click="goBack()" x-show="parentPath">← Back</button>
+                <div class="text-sm text-mono mt-1" x-text="currentPath"></div>
+              </div>
+              <div style="border:1px solid var(--border); border-radius:6px; max-height:300px; overflow-y:auto;">
+                <template x-for="folder in folders" :key="folder.path">
+                  <div style="padding:8px 12px; border-bottom:1px solid var(--border); cursor:pointer; display:flex; align-items:center; gap:8px; hover:background:var(--surface-2);"
+                       @click="browsePath(folder.path)" @dblclick="selectFolder(folder.path)">
+                    <span>&#128193;</span>
+                    <div style="flex:1;">
+                      <div class="text-sm" x-text="folder.name"></div>
+                    </div>
+                    <span class="text-dim text-sm" x-show="folder.locked">🔒</span>
+                  </div>
+                </template>
+              </div>
+              <button class="btn btn-success mt-1 btn-sm" @click="selectFolder(currentPath)">Select this folder</button>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <!-- Pipeline Settings -->
+      <div class="card mb-2">
+        <div class="card-label">Pipeline Settings</div>
+        <div class="mt-1" style="display:grid; grid-template-columns:120px 1fr; gap:8px 12px; align-items:center; max-width:400px;">
+          <label class="text-sm">AI Backend</label>
+          <select class="input" x-model="selectedBackend" @change="saveSettings()">
+            <option value="ollama">Ollama (local)</option>
+            <option value="gemini">Gemini (cloud)</option>
+            <option value="auto">Auto</option>
+          </select>
+          <label class="text-sm">Workers</label>
+          <input type="number" class="input" x-model.number="selectedWorkers" @change="saveSettings()" min="1" max="8" style="width:80px">
+          <div></div>
+          <p class="text-dim text-sm">Parallel worker threads for analysis (1–8). Workers overlap file prep (text extraction, Whisper, image resize) while LLM calls remain serial. Higher values improve throughput for mixed archives, but use more RAM.</p>
+          <label class="text-sm">Ollama Parallel</label>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <input type="number" class="input" x-model.number="numParallel" @change="saveSettings()" min="1" max="8" style="width:80px">
+            <button class="btn btn-outline btn-sm" @click="restartOllama()" x-show="ollamaStatus && ollamaStatus.running"
+                    title="Restart Ollama to apply parallel setting">Apply</button>
+          </div>
+          <div></div>
+          <p class="text-dim text-sm">Ollama concurrent requests (OLLAMA_NUM_PARALLEL). Requires Ollama restart. Uses more VRAM.</p>
+          <label class="text-sm">Filename Language</label>
+          <select class="input" x-model="preferredLanguage" @change="saveSettings()">
+            <option value="leave_as_is">Leave as-is</option>
+            <option value="english">Translate to English</option>
+            <option value="hebrew">Translate to Hebrew</option>
+          </select>
+          <div></div>
+          <p class="text-dim text-sm">Optionally translate proposed filenames during the Propose step. Helps unify language across mixed-language collections.</p>
+          <label class="text-sm">Relate Scope</label>
+          <select class="input" x-model="relateScope" @change="saveSettings()">
+            <option value="per_directory">Per-directory (default)</option>
+            <option value="cross_directory">Cross-directory (whole tree)</option>
+          </select>
+          <div></div>
+          <p class="text-dim text-sm">Per-directory is cheaper and catches most clusters. Cross-directory sends every filename in one LLM call — useful when related files are spread across folders.</p>
+        </div>
+      </div>
+
+      <!-- Ollama Management -->
+      <div class="card">
+        <div class="card-label">AI Model (Ollama)</div>
+
+        <!-- Status -->
+        <div class="mt-1 p-2" style="background:var(--surface-2); border-radius:6px;">
+          <template x-if="ollamaStatus">
+            <div>
+              <div style="display:grid; grid-template-columns:140px 1fr; gap:8px 12px; font-size:.88rem;">
+                <strong>Installed:</strong>
+                <span x-text="ollamaStatus.installed ? '✓ Yes' : '✗ No'" :style="'color:' + (ollamaStatus.installed ? 'var(--success)' : 'var(--danger)')"></span>
+                <strong>Running:</strong>
+                <span x-text="ollamaStatus.running ? '✓ Yes' : '✗ No'" :style="'color:' + (ollamaStatus.running ? 'var(--success)' : 'var(--danger)')"></span>
+                <template x-if="ollamaStatus.version">
+                  <strong>Version:</strong>
+                  <span class="text-mono" x-text="ollamaStatus.version"></span>
+                </template>
+              </div>
+              <template x-if="!ollamaStatus.installed">
+                <div class="mt-1">
+                  <a href="https://ollama.com/download" target="_blank" class="btn btn-primary btn-sm">Download Ollama</a>
+                </div>
+              </template>
+              <template x-if="ollamaStatus.installed && !ollamaStatus.running">
+                <button class="btn btn-primary btn-sm mt-1" @click="startOllama()">Start Ollama</button>
+              </template>
+            </div>
+          </template>
+        </div>
+
+        <!-- Model Selection — Dual -->
+        <div class="mt-2">
+          <label class="text-sm mb-1" style="display:block; font-weight:600;">Analysis Model <span class="text-dim">(vision-capable, for Analyze step)</span>:</label>
+          <div style="display:grid; grid-template-columns:1fr 100px; gap:8px;">
+            <select class="input" x-model="selectedAnalyzeModel" @change="saveSettings()">
+              <option value="">-- Choose a model --</option>
+              <template x-for="m in installedModels.filter(m => m.vision)" :key="'a-'+m.name">
+                <option :value="m.name" x-text="m.name + ' (vision)'"></option>
+              </template>
+            </select>
+            <button class="btn btn-outline btn-sm" @click="showCustomModel = 'analyze'">Custom</button>
+          </div>
+        </div>
+        <div class="mt-2">
+          <label class="text-sm mb-1" style="display:block; font-weight:600;">Proposal Model <span class="text-dim">(for Propose & Organize steps)</span>:</label>
+          <div style="display:grid; grid-template-columns:1fr 100px; gap:8px;">
+            <select class="input" x-model="selectedProposeModel" @change="saveSettings()">
+              <option value="">-- Choose a model --</option>
+              <template x-for="m in installedModels" :key="'p-'+m.name">
+                <option :value="m.name" x-text="m.name + (m.vision ? ' (vision)' : '')"></option>
+              </template>
+            </select>
+            <button class="btn btn-outline btn-sm" @click="showCustomModel = 'propose'">Custom</button>
+          </div>
+        </div>
+        <template x-if="showCustomModel">
+          <div class="mt-2">
+            <input type="text" class="input" x-model="customModel" :placeholder="showCustomModel === 'propose' ? 'e.g., llama3.2:3b' : 'e.g., gemma4:27b'"
+                   @keyup.enter="selectCustomModel(showCustomModel)" style="margin-bottom:6px;">
+            <button class="btn btn-primary btn-sm" @click="selectCustomModel(showCustomModel)">Use Custom Model</button>
+            <button class="btn btn-ghost btn-sm" @click="showCustomModel = false">Cancel</button>
+          </div>
+        </template>
+
+        <!-- Available Models -->
+        <div class="mt-2">
+          <div class="text-sm mb-1" style="font-weight:600;">Available Models to Install:</div>
+          <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); gap:12px;">
+            <template x-for="rec in recommendedModels" :key="rec.name">
+              <div style="border:1px solid var(--border); border-radius:6px; padding:12px;">
+                <div class="text-sm" style="font-weight:600;" x-text="rec.name"></div>
+                <div class="text-dim text-sm mt-1" x-text="rec.desc"></div>
+                <div class="text-dim text-sm mt-1">Size: <span x-text="rec.size"></span></div>
+                <div class="mt-2">
+                  <template x-if="!isInstalled(rec.name)">
+                    <button class="btn btn-primary btn-sm" @click="pullModel(rec.name)" :disabled="pulling === rec.name">
+                      <span x-text="pulling === rec.name ? 'Pulling...' : 'Pull'"></span>
+                    </button>
+                  </template>
+                  <template x-if="isInstalled(rec.name)">
+                    <div style="display:flex; gap:6px; align-items:center;">
+                      <span class="badge badge-success">✓ Installed</span>
+                      <button class="btn btn-danger btn-sm" @click="deleteModel(rec.name)" title="Delete model">Remove</button>
+                    </div>
+                  </template>
+                  <!-- Progress bar when pulling -->
+                  <template x-if="pulling === rec.name">
+                    <div style="margin-top:8px;">
+                      <div style="margin-bottom:4px; background:var(--surface-2); border-radius:4px; height:8px; overflow:hidden;">
+                        <div style="height:100%; background:var(--primary); border-radius:4px; transition:width .3s;" :style="'width:' + (pullProgress[rec.name] || 0) + '%'"></div>
+                      </div>
+                      <div class="text-sm text-dim" x-text="(pullProgress[rec.name] || 0) + '%'"></div>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+
+      <!-- Database Path -->
+      <div class="card mt-2">
+        <div class="card-label">Database Path</div>
+        <div class="mt-1" style="display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center; max-width:500px;">
+          <input type="text" class="input" x-model="dbPath" placeholder="ddh.db">
+          <button class="btn btn-primary btn-sm" @click="saveDbPath()">Save</button>
+        </div>
+        <p class="text-dim text-sm mt-1">Path to the SQLite database file. Restart the server after changing.</p>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- Toast container -->
+<div class="toast-container">
+  <template x-for="t in $store.app.toasts" :key="t.id">
+    <div class="toast" :class="'toast-' + t.type"
+         x-transition.opacity.duration.300ms
+         style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+      <span x-text="t.msg"></span>
+      <button @click="$store.app.dismissToast(t.id)"
+              style="background:none; border:none; color:inherit; cursor:pointer; font-size:18px; padding:0 4px; opacity:0.7; flex-shrink:0;"
+              title="Dismiss">&times;</button>
+    </div>
+  </template>
+</div>
+
+</body>
+</html>
