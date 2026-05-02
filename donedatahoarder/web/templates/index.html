@@ -17,7 +17,7 @@
 
   <!-- Header -->
   <header class="app-header">
-    <h1 style="cursor:pointer" @click="goHome()"><span>Data</span>Hoarder</h1>
+    <h1 style="cursor:pointer" @click="goHome()"><span>Done</span>DataHoarder</h1>
     <div class="header-right" style="display:flex; align-items:center; gap:12px;">
       <!-- Session info when active -->
       <template x-if="$store.session.active">
@@ -528,7 +528,7 @@
       </template>
 
       <template x-if="groups.length === 0">
-        <p class="text-dim">No duplicate groups found. Run <code>datahoarder dedup</code> or use the Pipeline tab.</p>
+        <p class="text-dim">No duplicate groups found. Run <code>ddh dedup</code> or use the Pipeline tab.</p>
       </template>
     </section>
 
