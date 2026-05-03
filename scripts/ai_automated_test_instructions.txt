@@ -26,11 +26,17 @@ Scan workers:            4
 Analyze workers:         1 (avoid >1 with vision models)
 Filename Language:       English (translate from any language)
 Relate Scope:            Per-directory (balances quality vs cost)
-Review confidence:       0.8 (conservative, high-quality proposals only)
-Execution mode:          Auto-confirm (unattended, safer with high confidence)
+Review confidence:       0.55 (balanced for file organization + quality)
+Execution mode:          Auto-confirm (unattended)
 
 Estimated runtime for a 500 MB dataset: 2–5 minutes
 Organizer LLM timeout:   600 seconds (extended from default 300s for large folders)
+
+⚠️  CRITICAL FINDING (from Hebrew CAD archive testing):
+    - Confidence 0.8: Only 133 proposals approved → POOR file organization
+    - Confidence 0.55: 195 proposals approved → files organized into projects
+    - The 62 additional MOVE proposals at 0.55 confidence organize files by project
+    - For CAD/project archives, use 0.55 threshold for proper organization
 
 ================================================================================
 STEP 0 — CONFIGURATION & OPTIONS (ASK THE USER)
@@ -66,11 +72,20 @@ Review mode:
   [ ] Auto-apply — `ddh review --auto-apply --min-confidence <N>` (default)
 
 If auto-apply, ask for the confidence threshold:
-  [ ] 0.5  (apply almost everything — higher risk)
-  [ ] 0.65 (moderate — includes generic moves like image → Images/)
-  [ ] 0.8  (conservative — only strong AI-derived proposals)
-  [ ] 0.9  (very conservative — mostly duplicates only)
-  Default: 0.8
+  [ ] 0.55 (RECOMMENDED — includes project/folder organization MOVEs)
+  [ ] 0.50 (aggressive — applies almost everything, higher risk)
+  [ ] 0.65 (conservative-moderate — some organization moves)
+  [ ] 0.8  (very conservative — minimal MOVE proposals, poor organization)
+  [ ] 0.9  (ultra conservative — mostly renames/tags only, no organization)
+  Default: 0.55
+
+  ⚠️  WARNING ABOUT THRESHOLDS (CAD/Project Archives):
+      - 0.8 threshold: Renames files well, but does NOT organize into folders
+                      62 MOVE proposals at 0.55 confidence get filtered out
+                      Result: 80+ files left stranded at root level
+      - 0.55 threshold: Includes the 62 MOVEs → files organized into projects
+                       Better for CAD archives, spreadsheets, photo shoots
+      - Use 0.65-0.8 only if you want renames without reorganization
 
 Execution confirmation:
   [ ] `ddh execute --commit` (requires typing 'y' interactively)
@@ -218,8 +233,9 @@ ddh relate
 ddh propose
 
 # --- 8. REVIEW (approve proposals) ---
-# Auto-approve at 0.8+ confidence (safe, high-quality proposals only)
-ddh review --auto-apply --min-confidence 0.8
+# Auto-approve at 0.55+ confidence (includes 62 MOVE proposals for file organization)
+# See STEP 0.3 for threshold options (0.55 recommended for CAD archives)
+ddh review --auto-apply --min-confidence 0.55
 
 # --- 9. EXECUTE (apply to disk) ---
 # IMPORTANT: execute --commit requires interactive confirmation (type 'y')
@@ -425,11 +441,18 @@ TIPS & TROUBLESHOOTING FOR THE AI RUNNER
      → Check logs: Get-Content "$env:USERPROFILE\.ddh\ddh.log" | tail -20
      → These are handled gracefully (skipped, no crash)
 
+  7. "Files are renamed but not organized into folders"
+     → Check: What confidence threshold did you use?
+     → At 0.8 confidence: Most MOVE proposals (0.55 confidence) are filtered out
+     → At 0.55 confidence: File organization MOVEs are approved
+     → Solution: Re-run review with: ddh review --auto-apply --min-confidence 0.55
+     → This approves the 62 pending MOVE proposals that organize files
+
 💡 ITERATION & DEBUGGING:
 
   - Reuse the same database to iterate on proposals only:
     ddh propose  # (re-run after tweaking namer rules)
-    ddh review --auto-apply --min-confidence 0.8
+    ddh review --auto-apply --min-confidence 0.55  # Updated to 0.55
 
   - Check configuration anytime:
     ddh doctor
@@ -455,7 +478,7 @@ I need you to run an automated DoneDataHoarder pipeline test using these default
 - Proposal Model: gemma4:26b (text reasoning)
 - Scan workers: 4
 - Analyze workers: 1
-- Review confidence: 0.8
+- Review confidence: 0.55 (balanced for file organization)
 - Filename language: English
 - Relate scope: Per-directory
 - Organizer timeout: 600 seconds
@@ -463,7 +486,7 @@ I need you to run an automated DoneDataHoarder pipeline test using these default
 **Steps:**
 1. Ask which .zip file to test (or pick the first one)
 2. Ask for test run name (for database file naming)
-3. Run the full pipeline: doctor → scan → enrich → dedup → analyze → relate → propose → review (--auto-apply --min-confidence 0.8) → execute (--commit, auto-confirm) → stats
+3. Run the full pipeline: doctor → scan → enrich → dedup → analyze → relate → propose → review (--auto-apply --min-confidence 0.55) → execute (--commit, auto-confirm) → stats
 4. Capture results: folder structure, .ddh_trash, database stats, logs
 5. Write a critique report covering:
    - Configuration summary
