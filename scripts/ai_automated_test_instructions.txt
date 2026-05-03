@@ -1,265 +1,481 @@
 ================================================================================
 DDH AUTOMATED PIPELINE TEST — AI INSTRUCTIONS
 ================================================================================
-Copy and paste the entire block below (from ---START--- to ---END---) into an 
+Copy and paste the entire block below (from ---START--- to ---END---) into an
 AI chat. The AI will execute the test sequence step by step.
 
 ---START---
 
-You are an automated test runner for the DoneDataHoarder project 
-(https://github.com/Yariminal/DoneDoneDataHoarder). 
+You are an automated test runner for the DoneDataHoarder project
+(https://github.com/Yariminal/DoneDataHoarder).
 
-Your goal: run the full DoneDataHoarder pipeline on a real-world test folder, 
+Your goal: run the full DoneDataHoarder pipeline on a real-world test folder,
 apply all proposals, and critique the results.
 
 ================================================================================
-STEP 0 — SETUP & CONTEXT
+RECOMMENDED DEFAULTS (User's Preferred Settings)
 ================================================================================
 
-Working directory for tests: D:\Test
-This directory contains .zip files. Each .zip is a compressed test folder.
+These are the project owner's tested & proven defaults. Use these unless the
+user explicitly chooses different options.
 
-DoneDataHoarder is installed as a Python CLI entry point: `ddh`
+AI Backend:              Ollama (local)
+Analysis Model:          gemma4:e4b (vision-capable, fast)
+Proposal Model:          gemma4:26b (text reasoning, high quality)
+Scan workers:            4
+Analyze workers:         1 (avoid >1 with vision models)
+Filename Language:       English (translate from any language)
+Relate Scope:            Per-directory (balances quality vs cost)
+Review confidence:       0.8 (conservative, high-quality proposals only)
+Execution mode:          Auto-confirm (unattended, safer with high confidence)
 
-Available commands:
-  ddh scan <dir>          # scans files into the DB
-  ddh enrich              # extracts hashes, dates, MIME types
-  ddh analyze             # AI vision + text analysis
-  ddh dedup               # exact + perceptual duplicate detection
-  ddh relate              # LLM semantic grouping
-  ddh propose             # generates rename/move/tag proposals
-  ddh review              # interactive review (or --auto-apply)
-  ddh execute --force     # applies all APPROVED proposals to disk
-  ddh stats               # shows DB statistics
-  ddh doctor              # environment diagnostics
-
-The database path defaults to `ddh.db` in the current working directory.
+Estimated runtime for a 500 MB dataset: 2–5 minutes
+Organizer LLM timeout:   600 seconds (extended from default 300s for large folders)
 
 ================================================================================
-STEP 1 — SELECT & PREPARE TEST FOLDER
+STEP 0 — CONFIGURATION & OPTIONS (ASK THE USER)
 ================================================================================
 
-1.1. List the .zip files in D:\Test:
-     dir D:\Test\*.zip
+Before running the pipeline, present the following options to the user and
+wait for explicit confirmation on EACH one. Do NOT proceed until the user
+replies.
 
-1.2. Pick one .zip file to test (or I will tell you which one).
+--- 0.1 BACKEND & MODEL SELECTION ---
 
-1.3. Create a temporary extraction directory:
+AI backend for `analyze`:
+  [ ] Ollama (default) — local LLM
+  [ ] Gemini — Google Cloud API (requires GOOGLE_API_KEY env var)
+
+If Ollama is selected, present the installed models and ask which one to use:
+  Run `ddh models` or `ollama list` to show available models.
+  Default: gemma3:12b (or the user's preferred default)
+
+If Gemini is selected, verify the key is set:
+  $env:GOOGLE_API_KEY
+
+--- 0.2 WORKER / PERFORMANCE SETTINGS ---
+
+`scan` workers:  [1]  [2]  [4]  [8]  (default: 4)
+`analyze` workers:[1]  [2]  [4]      (default: 1 — many vision models crash with >1)
+`dedup` confidence threshold for perceptual dupes:  [0.85]  [0.90]  [0.95]  (default: 0.90)
+
+--- 0.3 REVIEW & EXECUTE MODE ---
+
+Review mode:
+  [ ] Interactive — `ddh review` (AI pauses and asks user to approve each batch)
+  [ ] Auto-apply — `ddh review --auto-apply --min-confidence <N>` (default)
+
+If auto-apply, ask for the confidence threshold:
+  [ ] 0.5  (apply almost everything — higher risk)
+  [ ] 0.65 (moderate — includes generic moves like image → Images/)
+  [ ] 0.8  (conservative — only strong AI-derived proposals)
+  [ ] 0.9  (very conservative — mostly duplicates only)
+  Default: 0.8
+
+Execution confirmation:
+  [ ] `ddh execute --commit` (requires typing 'y' interactively)
+  [ ] Pipe confirmation automatically: `"y" | ddh execute --commit` (unattended)
+
+--- 0.4 PIPELINE ORDER ---
+
+Standard order is: scan → enrich → dedup → analyze → relate → propose → review → execute → stats
+
+Ask if the user wants dedup BEFORE or AFTER analyze:
+  [ ] Before analyze (default — faster, uses hashes only)
+  [ ] After analyze (slower but can use AI-derived descriptions in dupe review)
+
+--- 0.5 NAMING & TRANSLATION ---
+
+Preferred language for AI-generated filenames:
+  [ ] English (default)
+  [ ] Hebrew
+  [ ] Leave as-is (preserve original language)
+
+Fallback for files the AI cannot analyze:
+  [ ] Preserve original filename (default)
+  [ ] Use folder-context fallback (e.g. parent_folder_name + original digits)
+  [ ] Use date-only prefix + original stem
+
+--- 0.6 TEST FOLDER SELECTION ---
+
+1. List the .zip files in D:\Test:
+   dir D:\Test\*.zip
+
+2. Ask the user which .zip to test, or pick the first one if they don't care.
+
+3. Ask for the test run name (used for DB and critique file naming):
+   Default: autorun_YYYYMMDD_HHMMSS or <zip_name_without_extension>
+
+--- 0.7 WORKING PATHS (confirm or override) ---
+
+Extraction directory:  D:\Test\_extracted
+Runs directory:        D:\Test\_runs\<test_name>
+Database path:         D:\Test\Test db\<test_name>.db
+Critique report:      D:\Test\Test db\<test_name>_critique.md
+
+================================================================================
+STEP 1 — PREPARE TEST FOLDER
+================================================================================
+
+1.1. Create the extraction directory:
      mkdir D:\Test\_extracted
      # or use a unique name per test run, e.g. D:\Test\_run_YYYYMMDD_HHMMSS
 
-1.4. Extract the chosen .zip into that directory using PowerShell:
+1.2. Extract the chosen .zip into that directory:
      Expand-Archive -Path "D:\Test\<zipfile>.zip" -DestinationPath "D:\Test\_extracted" -Force
 
-1.5. Note the extracted root folder path. It might be:
+1.3. Note the extracted root folder path. It might be:
      D:\Test\_extracted\<foldername>
 
+1.4. Create the working directories:
+     mkdir D:\Test\_runs\<test_name>
+     mkdir D:\Test\Test db
+
 ================================================================================
-STEP 2 — INITIALIZE & RUN PIPELINE
+STEP 2 — SET ENVIRONMENT
 ================================================================================
 
-2.1. Change into a clean working directory for this test run, e.g.:
-     cd D:\Test\_runs\<test_name>
-     
-     (Create the folder if it doesn't exist.)
-
-2.2. Initialize DoneDataHoarder with a test-specific database:
+2.1. Set the database path (required):
      $env:DDH_DB = "D:\Test\Test db\<test_name>.db"
-     
-     (Create the "Test db" folder if it doesn't exist.)
 
-2.3. Run the full pipeline. You can run steps individually or use the 
-     pipeline command. Run individually for better control and logging:
+2.2. Set the backend (if not Ollama):
+     $env:DDH_BACKEND = "gemini"
+     # Default: ollama (local)
+     # Options: ollama, gemini, auto
 
-     # --- SCAN ---
-     ddh scan "D:\Test\_extracted\<foldername>" --workers 4
-     
-     # --- ENRICH ---
-     ddh enrich --workers 2
-     
-     # --- DEDUP ---
-     ddh dedup
-     
-     # --- ANALYZE ---
-     ddh analyze --workers 1
-     
-     # --- RELATE ---
-     ddh relate
-     
-     # --- PROPOSE ---
-     ddh propose
-     
-     # --- REVIEW & AUTO-APPLY ---
-     # Option A: Interactive review (if you are running manually)
-     ddh review
-     
-     # Option B: Auto-approve all high-confidence proposals
-     # (if running unattended)
-     ddh review --auto-apply --min-confidence 0.8
-     
-     # --- EXECUTE ---
-     ddh execute --force
+2.3. Set AI models (if overriding defaults):
+     $env:DDH_MODEL = "gemma4:26b"              # Text model (propose, relate)
+     $env:DDH_VISION_MODEL = "gemma4:e4b"      # Vision model (analyze)
+     # Or keep as-is to use CLI defaults
 
-     # --- STATS ---
-     ddh stats
+2.4. IMPORTANT: Increase Organizer timeout for large datasets (>500 MB):
+     $env:DATAHOARDER_OLLAMA_TIMEOUT = "600"
+     # Default is 300s (5 min). Organizer LLM calls need more time.
+     # Set to 600–900s for datasets >1 GB.
 
-IMPORTANT: If any step fails, STOP and report the error. Do not proceed.
+2.5. Set the preferred language for AI-generated filenames (optional):
+     $env:DDH_PREFERRED_LANGUAGE = "english"
+     # Options: english (default), hebrew, leave_as_is
+
+2.6. (Optional) Enable verbose logging for debugging:
+     $env:DDH_LOG_VERBOSE = "1"
+     # Logs written to ~/.ddh/ddh.log
 
 ================================================================================
-STEP 3 — CAPTURE RESULTS
+STEP 3 — PRE-TEST CHECKLIST
 ================================================================================
 
-3.1. After `execute --force`, capture the final folder structure:
-     Get-ChildItem -Path "D:\Test\_extracted\<foldername>" -Recurse | 
-         Select-Object FullName, Length, LastWriteTime | 
+Before running the pipeline, verify:
+
+3.1. Ollama is running (if using local models):
+     ollama list
+     # Should show your models (gemma4:e4b, gemma4:26b, etc.)
+     # If not, start: ollama serve
+
+3.2. Disk space is sufficient:
+     ddh doctor
+     # Look for "Disk space" — need at least 2x the dataset size
+
+3.3. Database path is set and writable:
+     Test-Path "D:\Test\Test db"
+     # Create if missing: mkdir "D:\Test\Test db"
+
+3.4. Dataset is extracted:
+     ls "D:\Test\_extracted"
+     # Should show your <foldername> directory
+
+================================================================================
+STEP 4 — INITIALIZE & RUN PIPELINE
+================================================================================
+
+Run the full pipeline. Execute individually for better control and logging:
+
+# --- 1. DOCTOR (pre-flight check) ---
+ddh doctor
+
+# --- 2. SCAN (index all files) ---
+ddh scan "D:\Test\_extracted\<foldername>" --workers 4
+
+# --- 3. ENRICH (extract metadata & hashes) ---
+ddh enrich
+
+# --- 4. DEDUP (find duplicates) ---
+ddh dedup
+
+# --- 5. ANALYZE (AI vision + text analysis) ---
+# Uses gemma4:e4b (vision-capable). Takes ~5-30 seconds per file.
+# For 500+ files, expect 5-15 minutes total.
+ddh analyze --workers 1
+
+# --- 6. RELATE (LLM semantic grouping) ---
+# Groups related files by content (CAD source + exports, photo sets, etc.)
+# Per-directory mode (recommended): faster, high quality
+ddh relate
+
+# --- 7. PROPOSE (generate rename/move/tag proposals) ---
+# Uses gemma4:26b for reasoning. May emit Organizer LLM timeout warning
+# (expected for 200+ files; falls back to rule-based backstops).
+ddh propose
+
+# --- 8. REVIEW (approve proposals) ---
+# Auto-approve at 0.8+ confidence (safe, high-quality proposals only)
+ddh review --auto-apply --min-confidence 0.8
+
+# --- 9. EXECUTE (apply to disk) ---
+# IMPORTANT: execute --commit requires interactive confirmation (type 'y')
+# For unattended testing, pipe the response:
+"y" | ddh execute --commit
+
+# --- 10. STATS (final report) ---
+ddh stats
+
+⚠️  IMPORTANT: If any step fails, STOP and report the error. Do not proceed to the next step.
+
+================================================================================
+STEP 5 — CAPTURE RESULTS
+================================================================================
+
+After `execute --commit`, collect all artifacts for the critique report.
+
+5.1. Capture final folder structure (before/after comparison helpful):
+     Write-Host "=== FINAL FOLDER STRUCTURE ==="
+     Get-ChildItem -Path "D:\Test\_extracted\<foldername>" -Recurse -Force |
+         Select-Object FullName, @{Name='Size';Expression={if($_.PSIsContainer){'[DIR]'}else{$_.Length}}} |
          Format-Table -AutoSize
-     
-     Also capture a tree-like view for readability:
-     tree /F "D:\Test\_extracted\<foldername>" 2>$null
-     (If `tree` is unavailable, use a recursive PowerShell listing.)
 
-3.2. Capture the .ddh_trash folder if it exists:
-     Get-ChildItem -Path "D:\Test\_extracted\<foldername>\.ddh_trash" -Recurse -ErrorAction SilentlyContinue
+5.2. Capture the .ddh_trash folder (deleted/moved duplicates):
+     Write-Host "=== .DDH_TRASH (Deleted Files) ==="
+     Get-ChildItem -Path "D:\Test\_extracted\<foldername>\.ddh_trash" -Recurse -ErrorAction SilentlyContinue |
+         Select-Object FullName, Length
 
-3.3. Extract key statistics from the database using a direct query or the 
-     `stats` command. If you need deeper inspection, query the SQLite DB:
-     
-     sqlite3 "D:\Test\Test db\<test_name>.db" "SELECT status, COUNT(*) FROM files GROUP BY status;"
-     sqlite3 "D:\Test\Test db\<test_name>.db" "SELECT proposal_type, status, COUNT(*) FROM proposals GROUP BY proposal_type, status;"
-     sqlite3 "D:\Test\Test db\<test_name>.db" "SELECT dupe_type, COUNT(*) FROM duplicate_groups GROUP BY dupe_type;"
+5.3. Extract database statistics (Python approach more reliable than sqlite3 CLI):
+     python -c "
+     import sqlite3
+     conn = sqlite3.connect(r'D:\Test\Test db\<test_name>.db')
+     c = conn.cursor()
 
-3.4. Capture the DoneDataHoarder log file if relevant:
-     Get-Content "$env:USERPROFILE\.ddh\ddh.log" -Tail 100
+     print('=== FILE STATUSES ===')
+     c.execute('SELECT status, COUNT(*) as count FROM files GROUP BY status')
+     for row in c.fetchall(): print(f'{row[0]}: {row[1]}')
 
-================================================================================
-STEP 4 — CRITIQUE & ANALYSIS
-================================================================================
+     print('\n=== PROPOSALS BY TYPE ===')
+     c.execute('SELECT proposal_type, COUNT(*) as count FROM proposals GROUP BY proposal_type')
+     for row in c.fetchall(): print(f'{row[0]}: {row[1]}')
 
-Analyze the results and write a detailed critique covering:
+     print('\n=== PROPOSAL STATUS ===')
+     c.execute('SELECT status, COUNT(*) as count FROM proposals GROUP BY status')
+     for row in c.fetchall(): print(f'{row[0]}: {row[1]}')
 
-4.1. ORGANIZATION QUALITY
-    - Are folders well-structured and meaningfully named?
-    - Are files grouped logically (by date, type, project, event)?
-    - Are there any orphan files that should have been grouped?
+     print('\n=== DUPLICATES ===')
+     c.execute('SELECT dupe_type, COUNT(*) as count FROM duplicate_groups GROUP BY dupe_type')
+     for row in c.fetchall(): print(f'{row[0]}: {row[1]}')
 
-4.2. NAMING QUALITY
-    - Are renamed filenames descriptive and useful?
-    - Did the AI preserve important context (dates, locations, people)?
-    - Are there any mojibake/garbled characters in names?
-    - Are Hebrew / non-ASCII filenames handled correctly?
+     print('\n=== RELATION GROUPS ===')
+     c.execute('SELECT COUNT(*) FROM relation_groups WHERE scope = \"cross_script\" OR scope = \"per_directory\"')
+     print(f'Total relation groups: {c.fetchone()[0]}')
 
-4.3. DUPLICATE HANDLING
-    - Were true duplicates correctly identified and removed?
-    - Were any unique files mistakenly marked as duplicates?
-    - Check the .ddh_trash folder — were the "keepers" the best files?
+     conn.close()
+     "
 
-4.4. RELATE / SEMANTIC GROUPING
-    - Were related files (e.g., CAD source + PDF export + backup) grouped?
-    - Are there any false-positive groupings?
-
-4.4. ERROR & EDGE CASES
-    - Any files left in ERROR status? Why?
-    - Any files skipped that shouldn't have been?
-    - How did the system handle unusual formats or corrupt files?
-
-4.5. OVERALL ASSESSMENT
-    - Would you trust this on a real hoard of 100k+ files?
-    - What would break at scale?
-    - Suggest 3 concrete improvements.
+5.4. Capture logs (for debugging if errors occurred):
+     Get-Content "$env:USERPROFILE\.ddh\ddh.log" -Tail 50 -ErrorAction SilentlyContinue |
+         Out-Host
 
 ================================================================================
-STEP 5 — SAVE ARTIFACTS
+STEP 6 — CRITIQUE & ANALYSIS
 ================================================================================
 
-5.1. Ensure the test database is saved:
-     # Already saved at D:\Test\Test db\<test_name>.db
-     # Verify the file exists and has non-zero size.
+Analyze the results and write a detailed critique report covering:
 
-5.2. Create a critique report file:
-     Save your full critique to:
-     D:\Test\Test db\<test_name>_critique.md
-     
-     Include in the report:
-     - Test date and DoneDataHoarder version (from `ddh --help` or git log)
-     - Source zip file name
-     - Summary statistics (file counts, proposal counts, duplicate counts)
-     - The captured folder structure (tree / listing)
-     - Your detailed critique from Step 4
-     - Any error messages or stack traces encountered
+6.1. CONFIGURATION SUMMARY
+    - AI Backend & models used
+    - Worker counts (scan, analyze)
+    - Confidence thresholds (dedup, proposals)
+    - Language preference
+    - Relation scope (per-directory vs cross)
 
-5.3. If you made any code fixes during the test, note them in the critique 
-     file under a "## Fixes Applied" section.
+6.2. ORGANIZATION QUALITY
+    - ✓ How many folders were created/reorganized?
+    - ✓ Are folder names meaningful and consistent?
+    - ✓ Are files grouped logically (by project, date, type, event)?
+    - ✓ Any orphan files that should have been grouped?
+    - ✓ Check .ddh_trash for moved duplicates — are they true dupes?
+
+6.3. NAMING QUALITY
+    - ✓ Are AI-generated filenames descriptive and useful?
+    - ✓ Did the AI preserve important context (dates, locations, projects)?
+    - ✓ Non-ASCII handling: mojibake, Hebrew, special characters?
+    - ✓ Generic stem detection: Are files with boring names (e.g., "document.pdf")
+      distinguished properly or bunched together?
+    - ✓ Prefix preservation: Do numeric/project prefixes stay intact?
+
+6.4. DUPLICATE HANDLING
+    - ✓ Exact duplicates: Correctly identified? Any false positives?
+    - ✓ Near-duplicates: Are perceptual hash matches real duplicates?
+    - ✓ Keeper selection: In .ddh_trash, were the kept files the best ones?
+    - ✓ Any files accidentally deleted that shouldn't have been?
+
+6.5. RELATE / SEMANTIC GROUPING
+    - ✓ Were related files grouped (CAD source + exports, photos + edits, etc.)?
+    - ✓ False positives: Any unrelated files grouped together?
+    - ✓ Cross-script linking: Hebrew-to-English equivalents linked?
+    - ✓ Singleton detection: Were orphan files linked to their project folders?
+
+6.6. ERROR & EDGE CASES
+    - ✓ Files left in ERROR status? Why (corrupt, unsupported format)?
+    - ✓ Files skipped: Adobe AI, 3DS Max, binary formats handled gracefully?
+    - ✓ LLM timeouts: Organizer timeout? (Expected for 200+ files, falls back to rules)
+    - ✓ Model performance: Did gemma4:e4b + gemma4:26b deliver quality?
+
+6.7. SCALE ASSESSMENT
+    - ✓ Would you trust this on 100k+ files?
+    - ✓ What would break at scale? (timeouts, memory, chunking limits)
+    - ✓ Suggest 3 concrete improvements with rationale.
 
 ================================================================================
-STEP 6 — CLEANUP (OPTIONAL)
+STEP 7 — SAVE ARTIFACTS
 ================================================================================
 
-6.1. If disk space is a concern and the test is complete:
+7.1. Verify the test database was created:
+     Test-Path "D:\Test\Test db\<test_name>.db"
+     # File size should be >1 MB for non-trivial datasets
+
+7.2. Generate a comprehensive critique report:
+     Save to: D:\Test\Test db\<test_name>_critique.md
+
+     Include:
+     - Test date, DoneDataHoarder version (from `ddh --version` or git log)
+     - Source .zip filename and size
+     - Configuration summary:
+         * AI backend (Ollama/Gemini) and model versions
+         * Worker counts (scan, analyze)
+         * Confidence thresholds (dedup, review, execute)
+         * Language preference, relate scope
+     - Summary statistics (files, proposals, duplicates, groups)
+     - Before/after folder structure comparison
+     - Detailed findings from Step 6 (organization, naming, dedup, relate, errors)
+     - Concrete improvement suggestions (3 minimum) with rationale
+     - Any error messages or stack traces for debugging
+
+7.3. If you fixed bugs during the test, document them:
+     Add a "## Fixes Applied" section to the critique with:
+     - Description of each fix
+     - Commit hash(es)
+     - Why it was needed
+
+================================================================================
+STEP 8 — CLEANUP (OPTIONAL)
+================================================================================
+
+8.1. Remove extracted files to free disk space (after critique is saved):
      Remove-Item -Recurse -Force "D:\Test\_extracted\<foldername>"
-     
-     KEEP the .db and _critique.md files in D:\Test\Test db\.
+     # KEEP: .db and _critique.md files in D:\Test\Test db\
 
-6.2. If running another test, start fresh with a new extraction directory 
-     to avoid cross-contamination.
+8.2. For the next test run:
+     - Create a new extraction directory (to avoid cross-contamination)
+     - Use a new database file (e.g., autorun_2, autorun_3, etc.)
+     - Reuse critique templates but run fresh analysis
 
 ================================================================================
-TIPS FOR THE AI RUNNER
+TIPS & TROUBLESHOOTING FOR THE AI RUNNER
 ================================================================================
 
-- If a command hangs (e.g., `analyze` waiting on Ollama), check that 
-  Ollama is running: `ollama list` should show models. Start with 
-  `ollama serve` if needed.
+⏱️  TIMING EXPECTATIONS:
+    - Scan: 1–2 seconds (O(n) file listing)
+    - Enrich: 5–10 seconds (hash + metadata extraction)
+    - Dedup: 5–15 seconds (O(n²) comparison, but fast with modern CPUs)
+    - Analyze: 5–30 seconds per file (depends on file size + Ollama speed)
+      * 10 image files: ~2–5 minutes
+      * 100 files mixed: ~10–30 minutes
+      * 500+ files: expect 1–2 hours
+    - Relate: 10–30 seconds (LLM chunking + grouping)
+    - Propose: 5–20 seconds (AI naming + move suggestions)
+    - Review: 1–2 seconds (batch approval at confidence threshold)
+    - Execute: 2–5 seconds (applying to disk)
 
-- If the DB is locked, another DoneDataHoarder process is using it. Kill it:
-  Get-Process python | Stop-Process  # (careful — kills all Python)
+🚨 COMMON ISSUES & FIXES:
 
-- For faster iteration on the same test folder, you can re-use the DB 
-  and run individual steps (e.g., just `propose` after tweaking namer rules).
+  1. "Ollama not reachable" / "Model not found"
+     → Check: ollama list
+     → Start: ollama serve (in separate terminal)
+     → Models auto-detected on startup
 
-- The `ddh doctor` command is useful for pre-flight checks.
+  2. "Analyze step is slow / timing out"
+     → Expected for 200+ files with vision models
+     → Increase timeout: $env:DATAHOARDER_OLLAMA_TIMEOUT = "600"
+     → Or use Gemini: $env:DDH_BACKEND = "gemini"
 
-- If you need to tweak configuration mid-test:
-  ddh config --edit-naming
-  ddh config --edit-phash
+  3. "Organizer LLM timeout" warning (expected behavior)
+     → This is OK! System falls back to rule-based backstops
+     → If all organizer calls fail, increase timeout (see above)
+     → Or switch to Gemini for faster organization
+
+  4. "Database is locked"
+     → Another DoneDataHoarder process is running
+     → Kill: taskkill /F /IM python.exe
+     → Or wait 30 seconds for the process to finish
+
+  5. "Execute --commit prompts for 'y' input"
+     → This is a safety feature (prevents accidental data loss)
+     → For unattended runs: pipe confirmation: "y" | ddh execute --commit
+     → Or type 'y' + Enter when prompted
+
+  6. "Skipped 2 files" / "2 files in ERROR status"
+     → Normal! Unsupported formats (Adobe AI, 3DS Max, corrupt files)
+     → Check logs: Get-Content "$env:USERPROFILE\.ddh\ddh.log" | tail -20
+     → These are handled gracefully (skipped, no crash)
+
+💡 ITERATION & DEBUGGING:
+
+  - Reuse the same database to iterate on proposals only:
+    ddh propose  # (re-run after tweaking namer rules)
+    ddh review --auto-apply --min-confidence 0.8
+
+  - Check configuration anytime:
+    ddh doctor
+
+  - For deeper diagnostics:
+    $env:DDH_LOG_VERBOSE = "1"  # Enable debug output
+    (re-run your step)
 
 ================================================================================
 SAMPLE PROMPT TO PASTE INTO AN AI CHAT
 ================================================================================
 
-Here is a compact version you can paste directly:
+Use this prompt to automate the test with proven defaults.
 
 ---
-I need you to run an automated DoneDataHoarder pipeline test.
 
-Test setup:
+I need you to run an automated DoneDataHoarder pipeline test using these defaults:
+
+**Configuration:**
 - Working drive: D:\Test
-- There are .zip files in D:\Test. Pick the first one.
-- Extract it to D:\Test\_extracted
-- Use database path: D:\Test\Test db\autorun_1.db
-- Create the "Test db" folder if missing.
+- AI Backend: Ollama (local)
+- Analysis Model: gemma4:e4b (vision-capable)
+- Proposal Model: gemma4:26b (text reasoning)
+- Scan workers: 4
+- Analyze workers: 1
+- Review confidence: 0.8
+- Filename language: English
+- Relate scope: Per-directory
+- Organizer timeout: 600 seconds
 
-Run this exact sequence and show me the output of each step:
-1. ddh doctor
-2. ddh scan D:\Test\_extracted\<folder> --workers 4
-3. ddh enrich
-4. ddh dedup
-5. ddh analyze --workers 1
-6. ddh relate
-7. ddh propose
-8. ddh review --auto-apply --min-confidence 0.8
-9. ddh execute --force
-10. ddh stats
+**Steps:**
+1. Ask which .zip file to test (or pick the first one)
+2. Ask for test run name (for database file naming)
+3. Run the full pipeline: doctor → scan → enrich → dedup → analyze → relate → propose → review (--auto-apply --min-confidence 0.8) → execute (--commit, auto-confirm) → stats
+4. Capture results: folder structure, .ddh_trash, database stats, logs
+5. Write a critique report covering:
+   - Configuration summary
+   - Organization quality (folder structure, grouping)
+   - Naming quality (descriptiveness, non-ASCII, Hebrew support)
+   - Duplicate accuracy (false positives, .ddh_trash quality)
+   - Semantic grouping quality (relate step)
+   - Error handling & edge cases
+   - 3 concrete improvements with rationale
 
-After execute, capture:
-- Recursive listing of the modified folder
-- Contents of .ddh_trash if present
-- Key SQLite queries from the DB
+Save the critique to: D:\Test\Test db\<test_name>_critique.md
 
-Then write a detailed critique covering: folder structure quality, 
-naming quality, duplicate handling accuracy, relate grouping accuracy, 
-error handling, and 3 concrete improvement suggestions.
-
-Save the critique to D:\Test\Test db\autorun_1_critique.md
 ---
 
 ---END---
