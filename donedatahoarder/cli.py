@@ -120,15 +120,26 @@ def doctor(
     ollama = OllamaClient(host=ollama_host, text_model=model, vision_model=model)
     if ollama.is_available():
         models = ollama.list_models()
-        if model in models:
-            table.add_row("Ollama reachability", "[green]OK[/green]", f"Reachable at {ollama_host}")
-            table.add_row("Ollama model", "[green]OK[/green]", f"{model} is installed")
+        table.add_row("Ollama reachability", "[green]OK[/green]", f"Reachable at {ollama_host}")
+        if models:
+            # Show installed models
+            if len(models) <= 3:
+                models_str = ", ".join(models)
+            else:
+                models_str = f"{len(models)} models installed: {', '.join(models[:3])}…"
+            table.add_row("Ollama models", "[green]OK[/green]", f"Installed: {models_str}")
+            # If default model not installed, note it's optional
+            if model not in models:
+                table.add_row(
+                    "Default model",
+                    "[dim]INFO[/dim]",
+                    f"'{model}' not installed (optional). Install with: [bold]ollama pull {model}[/bold]",
+                )
         else:
-            table.add_row("Ollama reachability", "[green]OK[/green]", f"Reachable at {ollama_host}")
             table.add_row(
-                "Ollama model",
-                "[yellow]MISSING[/yellow]",
-                f"Model '{model}' not found. Install with: [bold]ollama pull {model}[/bold]",
+                "Ollama models",
+                "[yellow]NONE[/yellow]",
+                f"No models installed. Get started: [bold]ollama pull {model}[/bold]",
             )
     else:
         table.add_row(
