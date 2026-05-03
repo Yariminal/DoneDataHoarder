@@ -10,6 +10,7 @@ Supports:
 Ollama API docs: https://github.com/ollama/ollama/blob/main/docs/api.md
 """
 import base64
+import os
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -30,7 +31,7 @@ DEFAULT_HOST = "http://localhost:11434"
 _OLLAMA_REQUEST_LOCK = threading.Semaphore(1)
 DEFAULT_TEXT_MODEL = "gemma3:12b"
 DEFAULT_VISION_MODEL = "gemma3:12b"  # gemma3 is multimodal
-TIMEOUT = 120  # seconds — vision inference can be slow
+TIMEOUT = int(os.environ.get("DATAHOARDER_OLLAMA_TIMEOUT", "300"))  # seconds; env-var override available
 
 # Approximate context lengths for common Ollama models
 _CONTEXT_LENGTHS: dict[str, int] = {

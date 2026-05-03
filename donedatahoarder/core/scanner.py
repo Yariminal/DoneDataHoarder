@@ -58,7 +58,16 @@ SKIP_EXTENSIONS: set[str] = {
     ".sys", ".dll", ".exe", ".com",
     ".ini", ".dat", ".log",
     ".db", ".db-shm", ".db-wal",
+    ".ctb", ".3dmbak", ".plt",
 }
+
+# Filenames that should always be skipped (macOS/Windows metadata, etc.)
+SKIP_FILENAMES: set[str] = {
+    ".DS_Store", "Thumbs.db", "desktop.ini", "._.DS_Store",
+}
+
+# Filename prefixes that indicate system/metadata files (macOS AppleDouble)
+SKIP_FILENAME_PREFIXES: tuple[str, ...] = ("._",)
 
 
 def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[Path]:
@@ -72,6 +81,10 @@ def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[
             if d not in skip and not d.startswith(".")
         ]
         for name in filenames:
+            # Skip by filename pattern (system metadata, macOS AppleDouble, etc.)
+            if name in SKIP_FILENAMES or name.startswith(SKIP_FILENAME_PREFIXES):
+                continue
+            # Skip by extension
             if Path(name).suffix.lower() not in SKIP_EXTENSIONS:
                 yield Path(dirpath) / name
 

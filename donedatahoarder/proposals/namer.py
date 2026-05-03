@@ -60,6 +60,20 @@ def _is_useless_stem(stem: str) -> bool:
     return any(p.match(s) for p in _get_useless_patterns())
 
 
+# Stem tokens that convey only content type with no actual identity
+# Used to detect and disambiguate generic AI-generated names like
+# "architectural_floor_plan_drawing.pdf" that don't distinguish files
+# in the same directory.
+_GENERIC_STEM_TOKENS: frozenset[str] = frozenset({
+    "drawing", "document", "floor_plan", "plan", "scan", "sheet",
+    "architectural_drawing", "architectural_floor_plan",
+    "architectural_floor_plan_drawing", "architectural_floor_plan_layout",
+    "floor_plan_drawing", "floor_plan_layout", "floor_plan_layout_drawing",
+    "site_plan", "section_drawing", "structural_plan_drawing",
+    "building_floor_plans", "elevation", "layout",
+})
+
+
 def _folder_context_fallback(file_rec: File) -> Optional[str]:
     """
     Last-resort name when the stem is useless AND the AI gave us nothing.
@@ -313,6 +327,12 @@ def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str
     # back to the parent folder name + original digits as last-resort context.
     stem_is_useless = _is_useless_stem(path.stem)
 
+    # Additional safety net: if the analyzer reported zero confidence, treat
+    # the description as unreliable (likely a backend failure or "I can't
+    # see anything" response). Never build a stem from a zero-confidence
+    # description — that only produces garbage filenames.
+    zero_confidence = file_rec.ai_confidence == 0.0
+
     if not desc and not tags_str:
         if stem_is_useless:
             fallback = _folder_context_fallback(file_rec)
@@ -332,11 +352,16 @@ def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str
     # Guard: skip if AI description is actually an error message
     _error_keywords = {
         "could not open", "cannot identify", "cannot open", "error",
-        "failed to", "not found", "no such file", "unsupported",
+        "failed to", "failed", "not found", "no such file", "unsupported",
         "unable to", "traceback", "exception",
+        "inference failed", "backend is unhealthy", "circuit breaker",
     }
     desc_lower = desc.lower()
-    if any(kw in desc_lower for kw in _error_keywords):
+    is_error_desc = (
+        any(kw in desc_lower for kw in _error_keywords)
+        or desc.startswith("AI inference failed:")
+    )
+    if is_error_desc or zero_confidence:
         # AI output was garbage — still emit a hygiene fix if the original
         # stem has cosmetic issues. Better than leaving "My File (1).pdf"
         # unchanged just because vision model hallucinated an error string.
@@ -543,6 +568,30 @@ def _extract_distinguishing_prefix(original_stem: str) -> str | None:
     return m.group("num").replace(".", "_")
 
 
+def _ensure_prefix(stem: str, original_stem: str) -> str:
+    """
+    If the original stem had a numeric prefix and the proposed stem lacks
+    any form of it (dot-form or underscore-form), prepend the slugified
+    prefix. Idempotent: safe to call on already-prefixed stems.
+
+    Examples:
+        ('floor_plan_drawing', '10.8-floor_plan')     -> '10_8_floor_plan_drawing'
+        ('10_8_floor_plan', '10.8-something_else')   -> '10_8_floor_plan'  (unchanged)
+        ('drawing', 'plan_final')                     -> 'drawing'  (unchanged, no orig prefix)
+    """
+    prefix = _extract_distinguishing_prefix(original_stem)
+    if not prefix:
+        return stem
+    # Check if stem already has the prefix in any form
+    dot_form = prefix.replace("_", ".")
+    if (stem.startswith(f"{prefix}_") or
+            stem.startswith(f"{dot_form}") or
+            stem.startswith(f"{prefix}-")):
+        return stem
+    # Prepend the prefix
+    return f"{prefix}_{stem}"
+
+
 def _resolve_collision(
     proposed_path: Path,
     original_path: Path,
@@ -729,6 +778,215 @@ def _normalize_spelling_in_proposals(session_id: str | None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Post-pass: disambiguate generic stems in the same directory
+# ---------------------------------------------------------------------------
+
+def _disambiguate_generic_stems_in_dir(session_id: str | None) -> int:
+    """
+    Post-pass: find PENDING RENAME proposals in the same directory whose
+    proposed stem is in _GENERIC_STEM_TOKENS (after stripping any leading
+    digits). For every such proposal, force-prepend the distinguishing
+    prefix derived from the ORIGINAL filename.
+
+    Also catches the case where the LLM produced two different-but-equally-
+    generic stems for sibling files by checking token-set overlap >= 0.8
+    within the directory.
+
+    Returns the number of proposals rewritten.
+    """
+    if not session_id:
+        return 0
+
+    from difflib import SequenceMatcher
+
+    engine = get_engine()
+    rewritten = 0
+
+    with Session(engine) as session:
+        # Group PENDING RENAME proposals by target parent directory
+        proposals_by_dir: dict[str, list] = {}
+        proposals_q = session.query(Proposal).filter(
+            Proposal.file_id.in_(
+                session.query(File.id).filter(File.session_id == session_id)
+            ),
+            Proposal.proposal_type == ProposalType.RENAME,
+            Proposal.status == ProposalStatus.PENDING,
+        )
+
+        for prop in proposals_q.all():
+            parent = str(Path(prop.proposed_value).parent)
+            if parent not in proposals_by_dir:
+                proposals_by_dir[parent] = []
+            proposals_by_dir[parent].append(prop)
+
+        # For each directory, check for generic stems
+        for dir_path, dir_proposals in proposals_by_dir.items():
+            if len(dir_proposals) < 2:
+                continue
+
+            # Get the original stems for these files
+            file_ids = {p.file_id for p in dir_proposals}
+            files_by_id = {
+                f.id: f for f in session.query(File).filter(File.id.in_(file_ids))
+            }
+
+            # Check each proposal for generic stem
+            for prop in dir_proposals:
+                if not prop.proposed_value:
+                    continue
+
+                proposed_stem = Path(prop.proposed_value).stem
+                # Strip leading digits to get the core tokens
+                core_stem = re.sub(r"^\d+[_\.]", "", proposed_stem, count=1)
+
+                # Check if core stem is in generic tokens or if multiple siblings
+                # have very similar stems (80%+ token overlap)
+                is_generic = core_stem in _GENERIC_STEM_TOKENS
+
+                if not is_generic:
+                    # Check for token-set overlap with other proposals in same dir
+                    for other_prop in dir_proposals:
+                        if other_prop.file_id == prop.file_id:
+                            continue
+                        other_core = re.sub(r"^\d+[_\.]", "",
+                                           Path(other_prop.proposed_value).stem, count=1)
+                        if other_core == core_stem:
+                            is_generic = True
+                            break
+                        # Also check similarity
+                        sm = SequenceMatcher(None, core_stem, other_core)
+                        if sm.ratio() >= 0.8:
+                            is_generic = True
+                            break
+
+                if is_generic:
+                    # Prepend the original file's distinguishing prefix
+                    orig_file = files_by_id.get(prop.file_id)
+                    if orig_file:
+                        prefix = _extract_distinguishing_prefix(Path(orig_file.path).stem)
+                        if prefix:
+                            new_stem = f"{prefix}_{core_stem}"
+                            new_name = f"{new_stem}{Path(prop.proposed_value).suffix}"
+                            proposed_path = _resolve_collision(
+                                Path(dir_path) / new_name,
+                                Path(orig_file.path),
+                                reserved_names={Path(p.proposed_value) for p in dir_proposals}
+                            )
+                            prop.proposed_value = str(proposed_path)
+                            rewritten += 1
+
+        if rewritten:
+            session.commit()
+
+    return rewritten
+
+
+# ---------------------------------------------------------------------------
+# Post-pass: flag near-duplicate proposals
+# ---------------------------------------------------------------------------
+
+def _flag_near_duplicate_proposals(session_id: str | None) -> int:
+    """
+    Post-pass: for PENDING RENAME proposals in the same parent directory whose
+    proposed stems are >= 0.92 similar AND share extension AND share size_bytes,
+    reject the later-mtime file's RENAME and add a MARK_DUPLICATE proposal
+    pointing at the earlier-mtime file.
+
+    Returns the number of MARK_DUPLICATE proposals created.
+    """
+    if not session_id:
+        return 0
+
+    from difflib import SequenceMatcher
+
+    engine = get_engine()
+    marked = 0
+
+    with Session(engine) as session:
+        # Get all files in this session with their proposals
+        files_q = session.query(File).filter(File.session_id == session_id)
+        files = {f.id: f for f in files_q}
+
+        # Group PENDING RENAME proposals by directory
+        proposals_by_dir: dict[str, list[Proposal]] = {}
+        for prop in session.query(Proposal).filter(
+            Proposal.file_id.in_(files.keys()),
+            Proposal.proposal_type == ProposalType.RENAME,
+            Proposal.status == ProposalStatus.PENDING,
+        ):
+            parent = str(Path(prop.proposed_value).parent)
+            if parent not in proposals_by_dir:
+                proposals_by_dir[parent] = []
+            proposals_by_dir[parent].append(prop)
+
+        # For each directory, find near-duplicates
+        for dir_path, dir_proposals in proposals_by_dir.items():
+            # Compare all pairs
+            for i, prop1 in enumerate(dir_proposals):
+                file1 = files.get(prop1.file_id)
+                if not file1 or not prop1.proposed_value:
+                    continue
+
+                for prop2 in dir_proposals[i + 1:]:
+                    file2 = files.get(prop2.file_id)
+                    if not file2 or not prop2.proposed_value:
+                        continue
+
+                    path1 = Path(prop1.proposed_value)
+                    path2 = Path(prop2.proposed_value)
+
+                    # Must have same extension and size
+                    if path1.suffix.lower() != path2.suffix.lower():
+                        continue
+                    if file1.size_bytes != file2.size_bytes:
+                        continue
+
+                    # Check stem similarity
+                    stem1 = path1.stem.lower()
+                    stem2 = path2.stem.lower()
+                    sm = SequenceMatcher(None, stem1, stem2)
+                    if sm.ratio() < 0.92:
+                        continue
+
+                    # This is a near-duplicate pair
+                    # Mark the later-mtime file as duplicate of the earlier one
+                    if (file2.modified_at or datetime.min) > (file1.modified_at or datetime.min):
+                        duplicate_file, canonical_file = file2, file1
+                        dup_prop, canon_prop = prop2, prop1
+                    else:
+                        duplicate_file, canonical_file = file1, file2
+                        dup_prop, canon_prop = prop1, prop2
+
+                    # Remove the RENAME proposal from the duplicate file
+                    session.delete(dup_prop)
+
+                    # Add a MARK_DUPLICATE proposal pointing at the canonical file
+                    existing_dup = session.query(Proposal).filter(
+                        Proposal.file_id == duplicate_file.id,
+                        Proposal.proposal_type == ProposalType.MARK_DUPLICATE,
+                    ).first()
+                    if not existing_dup:
+                        session.add(Proposal(
+                            file_id=duplicate_file.id,
+                            proposal_type=ProposalType.MARK_DUPLICATE,
+                            current_value=duplicate_file.path,
+                            proposed_value=canonical_file.path,
+                            reasoning=(
+                                f"Near-duplicate of {Path(canonical_file.path).name} "
+                                f"(stem similarity: {sm.ratio():.1%})"
+                            ),
+                            confidence=0.9,
+                            status=ProposalStatus.PENDING,
+                        ))
+                        marked += 1
+
+        if marked:
+            session.commit()
+
+    return marked
+
+
+# ---------------------------------------------------------------------------
 # Proposal generation
 # ---------------------------------------------------------------------------
 
@@ -818,6 +1076,11 @@ def generate_proposals(
                     # --- RENAME proposal ---
                     new_name = build_new_name(file_rec, root_path=session_root_path)
                     if new_name and new_name != path.name:
+                        # Ensure prefix is preserved if original had one
+                        new_stem = Path(new_name).stem
+                        new_stem = _ensure_prefix(new_stem, path.stem)
+                        new_name = f"{new_stem}{Path(new_name).suffix}"
+
                         # Apply language translation if preferred
                         if preferred_language != "leave_as_is":
                             new_name = translate_filename(new_name, preferred_language)
@@ -897,6 +1160,19 @@ def generate_proposals(
         # Best-effort — never break the pipeline if it errors.
         pass
 
+    # Post-pass 1c: disambiguate generic stems in the same directory. Catches
+    # cases where the LLM emitted a generic name like "architectural_floor_plan"
+    # that doesn't distinguish files in the directory, or two sibling files got
+    # the same generic stem. Re-prepends the distinguishing prefix from the
+    # original filename so each file becomes unique within its directory.
+    try:
+        disambiguated = _disambiguate_generic_stems_in_dir(session_id)
+        if disambiguated:
+            counts["disambiguated_renames"] = disambiguated
+    except Exception:
+        # Best-effort — never break the pipeline if it errors.
+        pass
+
     # Post-pass 2: rescue files that still have a useless stem (1.pdf,
     # IMG_1234.jpg, untitled.docx, etc.) and didn't pick up a RENAME proposal
     # in the main loop or sibling pass. Generates a low-confidence folder-
@@ -931,6 +1207,19 @@ def generate_proposals(
             counts["spelling_normalized"] = spelling_fixed
     except Exception:
         # Normalisation is best-effort — never break the pipeline if it fails.
+        pass
+
+    # Post-pass 5: flag near-duplicate RENAME proposals. For files in the same
+    # directory with stems >= 0.92 similar, same extension, and same size,
+    # replace the later-mtime file's RENAME with a MARK_DUPLICATE proposal.
+    # This catches cases like "3.8 binoy -1.pdf" / "3.8-binoy -1.pdf" that
+    # should be deduplicated rather than both renamed.
+    try:
+        marked = _flag_near_duplicate_proposals(session_id)
+        if marked:
+            counts["marked_duplicates"] = marked
+    except Exception:
+        # Best-effort — never break the pipeline if it errors.
         pass
 
     return counts

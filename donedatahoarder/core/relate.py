@@ -492,6 +492,187 @@ def _save_groups(
 
 
 # ---------------------------------------------------------------------------
+# Cross-script clustering: LLM pass for Hebrew↔English and semantic synonyms
+# ---------------------------------------------------------------------------
+
+def _llm_cross_script_cluster(
+    client,
+    files: list[File],
+    model: Optional[str] = None,
+) -> list[dict]:
+    """
+    Second LLM pass ONLY on files not yet in any group. Prompts the model
+    to emit a canonical English token per filename, then group filenames
+    whose canonical tokens match. Catches Hebrew↔English equivalents
+    (מידול ↔ midul) and semantic synonyms (Plans ↔ Drawings).
+
+    Budget guards:
+    - Skip if singleton count < 5 (nothing meaningful to cluster).
+    - Skip if > 2000 (too expensive; leftover already got prefix backstop).
+    - Chunk at MAX_FILES_PER_CALL (100).
+    - Confidence 0.6 (between main-LLM 0.8 and backstop 0.3).
+
+    Returns: list of group dicts ready for _save_groups.
+    """
+    if not client or not files:
+        return []
+
+    if len(files) < 5 or len(files) > 2000:
+        return []
+
+    # Build prompt asking for canonical tokens
+    filenames = [f.filename for f in files]
+    prompt = """\
+For each filename, emit a canonical English token that captures its semantic
+identity (ignoring file extensions and scripts). Group files whose canonical
+tokens are identical or very similar.
+
+Filenames:
+""" + "\n".join(f"  - {fn}" for fn in filenames) + """
+
+Return STRICT JSON: an array of groups.
+Schema:
+[
+  {
+    "canonical_token": "the_concept",
+    "filenames": ["exact_filename1.ext", "exact_filename2.ext", ...]
+  }
+]
+
+If no meaningful groups found, return [].
+"""
+
+    try:
+        response_text = client.generate(prompt)
+        parsed = json.loads(response_text)
+    except Exception:
+        return []
+
+    if not parsed or not isinstance(parsed, list):
+        return []
+
+    # Convert canonical_token groups to relation group format
+    groups: list[dict] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        filenames = item.get("filenames", [])
+        if len(filenames) < 2:
+            continue
+
+        # Map filenames back to file records
+        fn_to_id = {f.filename: f.id for f in files}
+        members = []
+        for fn in filenames:
+            if fn in fn_to_id:
+                members.append({
+                    "filename": fn,
+                    "role": "sibling",
+                })
+
+        if len(members) >= 2:
+            label = _slugify(item.get("canonical_token", "cross_script_group"))
+            groups.append({
+                "label": label,
+                "reason": f"Cross-script cluster: {item.get('canonical_token')}",
+                "members": members,
+                "_confidence": 0.6,
+            })
+
+    _deduplicate_labels(groups)
+    return groups
+
+
+# ---------------------------------------------------------------------------
+# Singleton-to-folder linkage
+# ---------------------------------------------------------------------------
+
+def _link_singletons_to_folder_groups(
+    session: Session,
+    session_id: str,
+) -> int:
+    """
+    For each singleton file (not in any RelationMember), try to attach it
+    to an existing RelationGroup whose label matches the singleton's
+    distinguishing numeric prefix OR first >=4-char alpha token.
+
+    Returns the number of linkages created.
+    """
+    linked = 0
+
+    # Get singleton files (not in any RelationMember)
+    all_files = session.query(File).filter(File.session_id == session_id).all()
+    file_ids_in_groups = {
+        m.file_id for m in session.query(RelationMember.file_id)
+        .filter(
+            RelationMember.group_id.in_(
+                session.query(RelationGroup.id).filter(
+                    RelationGroup.session_id == session_id
+                )
+            )
+        )
+    }
+    singletons = [f for f in all_files if f.id not in file_ids_in_groups]
+
+    if not singletons:
+        return 0
+
+    # Get candidate groups (confidence >= 0.5)
+    candidate_groups = session.query(RelationGroup).filter(
+        RelationGroup.session_id == session_id,
+        RelationGroup.confidence >= 0.5,
+    ).all()
+
+    if not candidate_groups:
+        return 0
+
+    # For each singleton, try to link it
+    for singleton in singletons:
+        stem = Path(singleton.filename).stem.lower()
+
+        # Extract numeric prefix (e.g. "108" from "108_project_files")
+        numeric_match = re.match(r"^(\d+)", stem)
+        numeric_prefix = numeric_match.group(1) if numeric_match else None
+
+        # Extract first alpha token >= 4 chars
+        alpha_match = re.search(r"\b([a-z]{4,})\b", stem)
+        alpha_token = alpha_match.group(1) if alpha_match else None
+
+        for group in candidate_groups:
+            group_label = group.label.lower()
+
+            # Try numeric prefix match (e.g. "108" in group "project_10_8")
+            if numeric_prefix:
+                underscore_prefix = f"_{numeric_prefix}_"
+                dot_prefix = numeric_prefix.replace("_", ".")
+                if underscore_prefix in group_label or dot_prefix in group_label or \
+                   group_label.startswith(f"project_{numeric_prefix}_"):
+                    # Found a match
+                    session.add(RelationMember(
+                        group_id=group.id,
+                        file_id=singleton.id,
+                        role=RelationRole.SIBLING,
+                    ))
+                    linked += 1
+                    break
+
+            # Try alpha token match (e.g. "fonts" in "font_configurations")
+            if alpha_token and group_label.startswith(alpha_token):
+                session.add(RelationMember(
+                    group_id=group.id,
+                    file_id=singleton.id,
+                    role=RelationRole.SIBLING,
+                ))
+                linked += 1
+                break
+
+    if linked:
+        session.commit()
+
+    return linked
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -629,5 +810,51 @@ def relate(
                     "total": len(call_units),
                     **summary,
                 })
+
+        # Cross-script clustering pass: for singletons (files not in any group yet),
+        # run an LLM pass to find Hebrew↔English equivalents and semantic synonyms.
+        if client is not None:
+            placed_ids = {
+                m.file_id for m in session.query(RelationMember)
+                .filter(
+                    RelationMember.group_id.in_(
+                        session.query(RelationGroup.id).filter(
+                            RelationGroup.session_id == session_id
+                        )
+                    )
+                )
+            }
+            singletons = [f for f in files if f.id not in placed_ids]
+
+            if 5 <= len(singletons) <= 2000:
+                cross_script_groups: list[dict] = []
+                for chunk in _chunk(singletons, MAX_FILES_PER_CALL):
+                    cross_script_groups.extend(
+                        _llm_cross_script_cluster(client, chunk, model=model)
+                    )
+
+                if cross_script_groups:
+                    _deduplicate_labels(cross_script_groups)
+                    # Build filename → file_id map for singletons
+                    fn_to_id_singletons = {f.filename: f.id for f in singletons}
+                    saved_cross = _save_groups(
+                        session, cross_script_groups, session_id, "cross_script",
+                        None, fn_to_id_singletons,
+                    )
+                    summary["llm_groups"] += len(cross_script_groups)
+                    summary["groups"] += saved_cross
+                    summary["members"] += sum(
+                        len(g["members"]) for g in cross_script_groups
+                    )
+
+        # Singleton-to-folder linkage: attach remaining singletons to existing
+        # groups based on numeric prefix or alpha token matching.
+        try:
+            linked = _link_singletons_to_folder_groups(session, session_id)
+            if linked:
+                logger.info("Linked %d singletons to folder groups", linked)
+        except Exception:
+            # Best-effort — don't break the pipeline
+            pass
 
     return summary
