@@ -248,6 +248,188 @@ ddh stats
 ⚠️  IMPORTANT: If any step fails, STOP and report the error. Do not proceed to the next step.
 
 ================================================================================
+STEP 4A — CRITICAL FOLDER ANALYSIS (ESSENTIAL!)
+================================================================================
+
+⚠️  DO NOT SKIP THIS STEP! This is where you identify actual problems.
+
+After execute completes, EXAMINE THE ACTUAL FOLDER STRUCTURE to see if the
+pipeline organized files correctly. Compare what EXISTS on disk vs. what SHOULD
+exist based on the proposal counts.
+
+4A.1. CHECK ROOT LEVEL — Are files properly organized into folders?
+
+Run these PowerShell commands to analyze the actual folder structure:
+
+    $extractedPath = "D:\Test\_extracted\<foldername>"
+    Write-Host "Root-level files (should be minimal):"
+    (Get-ChildItem -Path $extractedPath -File).Count
+
+    Write-Host "`nTop-level directories created:"
+    Get-ChildItem -Path $extractedPath -Directory |
+        Format-Table Name, @{Name='Files';Expression={(Get-ChildItem $_.FullName -File -Recurse).Count}}
+
+CRITICAL QUESTIONS:
+  ✓ How many files are still at ROOT level?
+  ✓ Should they be organized into project folders?
+  ✓ Are there 80+ files stranded (suggests 0.8 threshold was too high)?
+  ✓ If yes, the MOVE proposals (0.55 confidence) were filtered out
+
+4A.2. IDENTIFY ORPHANED FILES BY PROJECT
+
+For each numeric prefix (10.8, 12.9, 18.9, etc.), check:
+  ✓ Are all files for that project in ONE folder?
+  ✓ Or are they split between root and folders?
+  ✓ Files at root = MOVE proposals were rejected
+
+Example (should ALL be in project 10.8 folder):
+  ✗ 10.8.dwg (at root — should be organized!)
+  ✗ 10.8-binoy -1.pdf (at root — should be in folder!)
+  ✓ 10.8.bak (if backup deleted, it's OK)
+
+4A.3. CHECK FOR SYSTEM/JUNK FILES STILL PRESENT
+
+Look for files that should have been deleted/moved:
+
+    Get-ChildItem -Path $extractedPath -File -Recurse |
+        Where-Object {$_.Name -in @('.DS_Store', 'Thumbs.db', 'monochrome henkin.ctb', 'plot.log')}
+
+FINDINGS:
+  ✓ Any system files found = Junk cleanup failed
+  ✓ Should be in .ddh_trash or deleted entirely
+  ✓ If found, it's an EXECUTION problem (cleanup MOVEs not applied)
+
+4A.4. LOOK FOR NEAR-DUPLICATE FILES NOT CONSOLIDATED
+
+Search for similar filenames in SAME directory:
+
+    # Example: Look for multiple binoy files
+    Get-ChildItem -Path $extractedPath -File -Recurse |
+        Where-Object {$_.Name -match 'binoy|ceiling|elect'} |
+        Group-Object -Property @{expression={$_.Directory.FullName}} |
+        Where-Object {$_.Count -gt 1}
+
+ISSUES TO FIND:
+  ✗ 3.8 binoy -1.pdf + 3.8-binoy -1.pdf (same file, different separator!)
+  ✗ 5.9-ceiling.pdf + 5.9-ceiling1.pdf (nearly identical, not consolidated)
+  ✗ 10.8-binoy -1.pdf, -1.1.pdf, -1.2.pdf (variants, should be one entry)
+
+If found: MARK_DUPLICATE proposals existed but weren't all executed
+
+4A.5. CHECK FOR HEBREW FILES (Non-ASCII Organization)
+
+Look for Hebrew files at root that should be organized:
+
+    Get-ChildItem -Path $extractedPath -File |
+        Where-Object {$_.Name -match '[א-ת]'} |
+        Select-Object Name
+
+EXPECTED:
+  ✓ Hebrew files organized into Hebrew-named folders OR
+  ✓ Hebrew files linked to English equivalents in same project folder
+
+PROBLEM IF:
+  ✗ Hebrew files at root level (= not organized)
+  ✗ Example: דור הגשה 3.17.dwg, מידול.dwg at root
+
+4A.6. VERIFY FOLDER ORGANIZATION MATCHES PROPOSALS
+
+Count total files before/after:
+
+    # Before: Original extraction
+    # After: Current organized state
+
+    Before = 596 total files (or whatever was indexed)
+    After = Files distributed across folders
+
+    Check: Are all files accounted for?
+    Missing files = Execution failed
+
+4A.7. ASSESS OVERALL ORGANIZATION QUALITY
+
+Create a SUMMARY of what happened:
+
+    ORGANIZATION SUMMARY:
+
+    Files at Root Level:      [COUNT]  (should be < 10)
+    Top-level Folders:        [COUNT]
+    System Files Found:       [Y/N]    (should be N)
+    Near-Duplicates Found:    [COUNT]  (should be 0)
+    Hebrew Files Organized:   [Y/N]    (should be Y)
+
+    Problems Identified:
+    - [List specific issues found]
+
+    Root Cause Analysis:
+    - If 80+ files at root: 0.8 threshold filtered MOVE proposals
+    - If system files present: Execute didn't apply junk cleanup
+    - If duplicates not consolidated: MARK_DUPLICATE not executed
+    - If Hebrew files orphaned: Cross-script linking not applied
+
+4A.8. COMPARE EXPECTED vs ACTUAL RESULTS
+
+Based on proposal counts, what SHOULD have happened:
+
+    Proposals Generated:
+      - 47 RENAMES → Filenames should be more descriptive
+      - 107 MOVES → Files should be in project folders
+      - 93 MARK_DUPLICATES → Duplicate files should be consolidated
+      - 2 RENAME_FOLDER → Folder names should be updated
+
+    Questions:
+      ✓ Did all proposals execute?
+      ✓ Are 107 files in new project folders?
+      ✓ Are duplicate files moved to trash?
+      ✓ Did folder names update?
+
+    If answers are NO: Investigation needed (see 4A.9)
+
+4A.9. DIAGNOSE EXECUTION FAILURE (If Problems Found)
+
+If files are NOT organized despite many MOVE proposals:
+
+    1. Check confidence threshold used
+       - If used 0.8: Only 133 proposals approved, 184 filtered out
+       - The 62 MOVE proposals at 0.55 confidence were rejected!
+       - SOLUTION: Re-run review with 0.55 threshold
+
+    2. Check database for unapproved proposals
+       python -c "
+       import sqlite3
+       conn = sqlite3.connect(r'<database_path>')
+       c = conn.cursor()
+       c.execute('SELECT proposal_type, status, COUNT(*) FROM proposals GROUP BY proposal_type, status')
+       for row in c.fetchall():
+           print(f'{row[0]}: {row[1]} = {row[2]}')
+       conn.close()
+       "
+
+    3. Look for:
+       - PENDING proposals (= not approved/executed)
+       - PROPOSED files (= not executed yet)
+       - MOVE proposals specifically (these organize files)
+
+4A.10. DOCUMENT FINDINGS
+
+Write a "FOLDER ANALYSIS" section in your critique report with:
+
+    ❌ PROBLEMS FOUND:
+    - [Specific issue 1 with count]
+    - [Specific issue 2 with count]
+    - [Specific issue 3 with count]
+
+    ROOT CAUSE:
+    - [Why it happened - e.g., "0.8 threshold filtered 62 MOVEs"]
+
+    RECOMMENDATION:
+    - [How to fix it - e.g., "Re-run review at 0.55 confidence"]
+
+    COMPARISON:
+    - Expected: 107 MOVEs → files organized into projects
+    - Actual: Only 0 MOVEs applied → files stay at root
+    - Gap: 62 MOVE proposals never approved due to threshold
+
+================================================================================
 STEP 5 — CAPTURE RESULTS
 ================================================================================
 
