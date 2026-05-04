@@ -500,6 +500,9 @@ def execute(
         _cleanup_empty_dirs(move_source_dirs)
 
     # Also sweep the session root for any pre-existing empty directories
+    # AND for known junk files (system metadata, OS thumbnail caches, etc.)
+    # that the scanner correctly excluded from the index but were never
+    # physically removed from disk.
     if not dry_run and session_id:
         from donedatahoarder.db.models import UserSession
         from sqlalchemy.orm import Session as _OrmSession
@@ -507,6 +510,7 @@ def execute(
             with _OrmSession(engine) as _s:
                 us = _s.get(UserSession, session_id)
                 if us and us.root_path:
+                    _cleanup_junk_files(Path(us.root_path), session_id, con)
                     _cleanup_empty_dirs_recursive(Path(us.root_path))
         except Exception:
             pass
@@ -516,6 +520,87 @@ def execute(
         f"{counts['failed']} failed, {counts['skipped']} skipped"
     )
     return counts
+
+
+def _cleanup_junk_files(
+    root: Path, session_id: str | None, con: Console
+) -> int:
+    """
+    Move known junk files (system metadata, OS thumbnail caches, plot logs)
+    to .ddh_trash so they no longer clutter the organized output.
+
+    The scanner correctly excludes these files from the index — but it never
+    physically deletes them from disk. After a successful execute, the root
+    tree often still contains `.DS_Store`, `Thumbs.db`, `monochrome henkin.ctb`,
+    `plot.log`, etc. — files the user did not author and cannot meaningfully
+    review. This pass sweeps them into .ddh_trash where the user can verify
+    and permanently delete on their own schedule.
+
+    Filename rules mirror `donedatahoarder.core.scanner.SKIP_FILENAMES`,
+    `SKIP_FILENAME_PREFIXES`, and `SKIP_EXTENSIONS` so the on-disk cleanup
+    can never trash a file the scanner would've kept.
+
+    Returns the number of junk files moved to trash.
+    """
+    if not root.exists() or not root.is_dir():
+        return 0
+
+    # Mirror the scanner's filter lists so this cleanup never trashes a file
+    # the scanner would have indexed. Importing rather than redefining keeps
+    # the two in lockstep — add a junk type to the scanner and the cleanup
+    # picks it up automatically.
+    from donedatahoarder.core.scanner import (
+        SKIP_FILENAMES, SKIP_FILENAME_PREFIXES, SKIP_EXTENSIONS, SKIP_DIRS,
+    )
+
+    trash_dir = root / ".ddh_trash"
+    moved = 0
+
+    for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False):
+        # Don't descend into trash or other skip dirs
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in SKIP_DIRS
+            and d != ".ddh_trash"
+            and not d.startswith(".")
+        ]
+        for name in filenames:
+            is_junk = (
+                name in SKIP_FILENAMES
+                or name.startswith(SKIP_FILENAME_PREFIXES)
+                or Path(name).suffix.lower() in SKIP_EXTENSIONS
+            )
+            if not is_junk:
+                continue
+            src = Path(dirpath) / name
+            try:
+                trash_dir.mkdir(parents=True, exist_ok=True)
+                dst = trash_dir / name
+                # Resolve collision in trash with a counter suffix.
+                if dst.exists():
+                    stem, suffix = dst.stem, dst.suffix
+                    i = 1
+                    while dst.exists():
+                        dst = trash_dir / f"{stem}_{i}{suffix}"
+                        i += 1
+                shutil.move(str(src), str(dst))
+                # Log so the operation can be undone if the user changes
+                # their mind. No file_id since these were never indexed.
+                log_operation(
+                    operation="JUNK_TRASH",
+                    original_path=str(src),
+                    new_path=str(dst),
+                    session_id=session_id,
+                    extra={"reason": "scanner-skipped junk file"},
+                )
+                moved += 1
+            except OSError:
+                # File in use, permission denied, etc. — best effort only.
+                continue
+
+    if moved:
+        con.print(f"[dim]Cleaned up {moved} junk file(s) to .ddh_trash[/dim]")
+    return moved
 
 
 def _cleanup_empty_dirs_recursive(root: Path) -> None:

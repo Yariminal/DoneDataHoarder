@@ -74,6 +74,45 @@ _GENERIC_STEM_TOKENS: frozenset[str] = frozenset({
 })
 
 
+def _content_type_prefix(extension: str | None) -> str:
+    """
+    Return a generic content-type prefix for a file extension.
+
+    Used as a last-resort name when the file's parent folder is non-Latin
+    (Hebrew/Arabic/CJK) and gets stripped to empty by _safe(). Prevents files
+    like '1.jpg' inside 'הנקין-שביט/' from staying as '1.jpg' just because
+    the parent name has no Latin characters.
+    """
+    if not extension:
+        return "file"
+    ext = extension.lower().lstrip(".")
+    image_exts = {"jpg", "jpeg", "png", "gif", "bmp", "webp", "tif", "tiff", "heic", "raw"}
+    video_exts = {"mp4", "mov", "avi", "mkv", "webm", "wmv", "flv", "m4v"}
+    audio_exts = {"mp3", "wav", "flac", "m4a", "aac", "ogg", "wma"}
+    doc_exts = {"pdf", "doc", "docx", "txt", "rtf", "odt", "tex"}
+    sheet_exts = {"xls", "xlsx", "csv", "ods", "tsv"}
+    slide_exts = {"ppt", "pptx", "odp", "key"}
+    cad_exts = {"dwg", "dxf", "3dm", "3ds", "skp", "step", "stp", "iges", "igs"}
+    archive_exts = {"zip", "rar", "7z", "tar", "gz", "bz2", "xz"}
+    if ext in image_exts:
+        return "image"
+    if ext in video_exts:
+        return "video"
+    if ext in audio_exts:
+        return "audio"
+    if ext in doc_exts:
+        return "document"
+    if ext in sheet_exts:
+        return "spreadsheet"
+    if ext in slide_exts:
+        return "presentation"
+    if ext in cad_exts:
+        return "drawing"
+    if ext in archive_exts:
+        return "archive"
+    return "file"
+
+
 def _folder_context_fallback(file_rec: File) -> Optional[str]:
     """
     Last-resort name when the stem is useless AND the AI gave us nothing.
@@ -81,6 +120,13 @@ def _folder_context_fallback(file_rec: File) -> Optional[str]:
     Combines the parent folder name + original stem digits so the file at
     least gains contextual location info: '1.pdf' inside 'Event_Menus/'
     becomes 'event_menus_1.pdf'. Better than leaving '1.pdf' to languish.
+
+    When the parent folder name strips to empty (e.g. Hebrew/Arabic/CJK
+    folders like 'הנקין-שביט/'), falls back to a content-type prefix derived
+    from the extension ('1.jpg' -> 'image_1.jpg'). Without this fallback,
+    files in non-Latin parent folders end up with the same useless stem as
+    before, and `_generate_fallback_for_useless_stems` skips them because
+    the proposed name equals the original.
 
     Returns the new stem (no extension) or None if even this can't be built.
     """
@@ -95,7 +141,13 @@ def _folder_context_fallback(file_rec: File) -> Optional[str]:
         if original_stem.startswith(parent_name):
             return original_stem
         return f"{parent_name}_{original_stem}"
-    return parent_name or original_stem
+    if parent_name:
+        return parent_name
+    # Parent name was empty (likely non-Latin and stripped). Use the file's
+    # content type as a synthetic prefix so the result differs from the
+    # original stem and the rescue pass actually emits a proposal.
+    type_prefix = _content_type_prefix(file_rec.extension or path.suffix)
+    return f"{type_prefix}_{original_stem}"
 
 
 # ---------------------------------------------------------------------------
@@ -1327,13 +1379,13 @@ def _generate_fallback_for_useless_stems(session_id: str | None) -> int:
     original digits. Better than letting the file ship with a meaningless
     placeholder stem.
 
-    Confidence is intentionally low (0.3) so that:
-    - The UI surfaces it for human review rather than auto-applying.
-    - If analysis is re-run later and produces a real description, the new
-      proposal will be filtered out by the main loop's existence check, so
-      the fallback wins by default. (Trade-off: a future improvement could
-      replace fallback proposals when better data arrives, but for now the
-      conservative bias is to keep the human-reviewable fallback.)
+    Confidence 0.6 — above the recommended 0.55 review threshold so the
+    fallback rename auto-applies under typical settings, but below typical
+    AI-derived confidences (0.7-0.9) so a re-analysis with a real description
+    can override via the main loop's existence check. The fallback is
+    deterministic and structurally grounded (parent folder + original stem,
+    or content-type prefix when the parent name is non-Latin), so it's safe
+    to apply without per-file human review.
 
     Returns the number of fallback proposals created.
     """
@@ -1403,10 +1455,11 @@ def _generate_fallback_for_useless_stems(session_id: str | None) -> int:
                 proposed_value=str(proposed_path),
                 reasoning=(
                     f"Fallback rename — original stem '{path.stem}' carries no "
-                    "information; using parent folder name as context. "
-                    "Re-run analysis if you want a content-derived name."
+                    "information; using parent folder name (or content-type "
+                    "prefix when parent is non-Latin) as context. Re-run "
+                    "analysis if you want a content-derived name."
                 ),
-                confidence=0.3,
+                confidence=0.6,
                 status=ProposalStatus.PENDING,
             ))
             existing_renames.add(f.id)

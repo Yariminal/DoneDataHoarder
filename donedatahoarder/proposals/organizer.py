@@ -1061,7 +1061,321 @@ def generate_reorg_proposals(session_id: str) -> dict:
     except Exception:
         pass
 
+    # Deterministic backstop: propagate MOVE destinations to SKIPPED siblings
+    # whose primary (same stem in the same directory) is being moved. Without
+    # this, files like `10.8.bak` (SKIPPED — backup of `10.8.dwg`) get stranded
+    # at root while `10.8.dwg` ships off to a project folder. The Namer pass
+    # `_propagate_renames_to_siblings` does the same job for RENAME proposals;
+    # this is the MOVE counterpart.
+    try:
+        skipped_sibling_moves = _propagate_moves_to_skipped_siblings(session_id)
+        if skipped_sibling_moves:
+            counts["skipped_sibling_moves"] = skipped_sibling_moves
+            counts["move"] = counts.get("move", 0) + skipped_sibling_moves
+    except Exception:
+        # Best-effort — never break the pipeline if propagation errors.
+        pass
+
+    # Deterministic backstop: emit RENAME_FOLDER for non-Latin folder names
+    # when the user requested English filenames. The LLM is *told* to translate
+    # in the prompt but routinely misses Hebrew/Arabic/CJK directories — we've
+    # observed this on Hebrew CAD archives where folders like `צרפתי/` and
+    # `תכניות עדכניות/` were preserved verbatim. This backstop guarantees a
+    # rename is always proposed when the language preference asks for it.
+    try:
+        nonlatin_fixed = _backstop_nonlatin_folders(
+            session_id, root_path, preferred_language
+        )
+        if nonlatin_fixed:
+            counts["nonlatin_renames"] = nonlatin_fixed
+            counts["rename_folder"] = counts.get("rename_folder", 0) + nonlatin_fixed
+    except Exception:
+        pass
+
     return counts
+
+
+def _propagate_moves_to_skipped_siblings(session_id: str) -> int:
+    """
+    Propagate MOVE destinations from primary files to SKIPPED siblings that
+    share the same stem in the same directory.
+
+    Concrete example: `10.8.dwg` gets a MOVE proposal to `CAD_Drawings/10.8.dwg`.
+    `10.8.bak` lives next to it at root with status=SKIPPED (backup files are
+    indexed but never analyzed). Without this pass, the .bak stays at root
+    while its primary ships off to CAD_Drawings.
+
+    Rules:
+    - Only operates on SKIPPED files. ANALYZED/PROPOSED files have already had
+      their shot at the LLM-driven MOVE pass.
+    - Sibling must share the parent directory AND stem (case-insensitive) with
+      a primary that has a PENDING MOVE proposal.
+    - Sibling must not already have its own MOVE proposal.
+    - The destination is the primary's destination directory + the sibling's
+      original filename (preserves the .bak suffix).
+
+    Returns the number of MOVE proposals created.
+    """
+    engine = get_engine()
+    created = 0
+
+    with Session(engine) as db:
+        # Build a lookup: (parent_dir_lower, stem_lower) -> destination_dir
+        primary_moves: dict[tuple[str, str], str] = {}
+        primary_query = (
+            db.query(Proposal, File)
+            .join(File, Proposal.file_id == File.id)
+            .filter(
+                File.session_id == session_id,
+                Proposal.proposal_type == ProposalType.MOVE,
+                Proposal.status == ProposalStatus.PENDING,
+            )
+        )
+        for prop, primary_file in primary_query:
+            primary_path = Path(primary_file.path)
+            dest_path = Path(prop.proposed_value) if prop.proposed_value else None
+            if not dest_path:
+                continue
+            key = (str(primary_path.parent).lower(), primary_path.stem.lower())
+            # First wins — multiple primaries with the same key shouldn't
+            # happen in practice (same file, same dir), but if they do we
+            # don't want to flap the destination.
+            primary_moves.setdefault(key, str(dest_path.parent))
+        if not primary_moves:
+            return 0
+
+        # Pull SKIPPED siblings — these are the files we want to rescue.
+        skipped_files = (
+            db.query(File)
+            .filter(
+                File.session_id == session_id,
+                File.status == FileStatus.SKIPPED,
+            )
+            .all()
+        )
+        if not skipped_files:
+            return 0
+
+        skipped_ids = [f.id for f in skipped_files]
+
+        # Pre-load existing MOVE proposals so we don't double-propose.
+        existing_moves: set[int] = {
+            file_id
+            for (file_id,) in db.query(Proposal.file_id).filter(
+                Proposal.proposal_type == ProposalType.MOVE,
+                Proposal.file_id.in_(skipped_ids),
+            )
+        }
+
+        for f in skipped_files:
+            if f.id in existing_moves:
+                continue
+            path = Path(f.path)
+            if not path.stem:
+                continue
+            key = (str(path.parent).lower(), path.stem.lower())
+            dest_dir = primary_moves.get(key)
+            if not dest_dir:
+                continue
+            dst_path = Path(dest_dir) / path.name
+            if str(dst_path) == str(path):
+                continue
+            db.add(Proposal(
+                file_id=f.id,
+                proposal_type=ProposalType.MOVE,
+                current_value=str(path),
+                proposed_value=str(dst_path),
+                reasoning=(
+                    "Sibling MOVE — companion file shares stem "
+                    f"'{path.stem}' with a primary moving to '{dest_dir}'; "
+                    "propagating the destination keeps backup/source pairs "
+                    "together after reorganization."
+                ),
+                # Match the rename-sibling pass confidence (0.6): structurally
+                # grounded, deterministic, but flagged as "follower" not primary.
+                confidence=0.6,
+                status=ProposalStatus.PENDING,
+            ))
+            existing_moves.add(f.id)
+            created += 1
+
+        if created:
+            db.commit()
+
+    return created
+
+
+def _backstop_nonlatin_folders(
+    session_id: str,
+    root_path: str,
+    preferred_language: str,
+) -> int:
+    """
+    Emit RENAME_FOLDER proposals for directories whose names are dominated by
+    non-Latin characters (Hebrew, Arabic, CJK, etc.) when the user has asked
+    for English filenames.
+
+    The LLM organizer is *instructed* to translate non-English folder names,
+    but in practice it misses them on dense, already-Hebrew-organized
+    archives. This backstop guarantees a rename proposal exists.
+
+    Strategy:
+    - Walk the root looking for directories with names that lose >= 50% of
+      their characters under `_safe()` (i.e. mostly non-Latin).
+    - Skip the root itself, hidden directories (.ddh_trash, etc.), and any
+      directory that already has a PENDING RENAME_FOLDER proposal.
+    - Build the new name from the directory's largest analyzed file's tags
+      or description, falling back to a transliteration-style placeholder
+      ('non_latin_folder_<n>') if no AI signal exists.
+
+    Returns the number of RENAME_FOLDER proposals created.
+    """
+    if preferred_language != "english":
+        return 0
+    if not root_path:
+        return 0
+    root = Path(root_path)
+    if not root.exists() or not root.is_dir():
+        return 0
+
+    engine = get_engine()
+    created = 0
+
+    with Session(engine) as db:
+        # Existing RENAME_FOLDER targets (so we don't double-propose).
+        existing_targets: set[str] = {
+            (cv or "").rstrip("/\\").lower()
+            for (cv,) in db.query(Proposal.current_value).filter(
+                Proposal.proposal_type == ProposalType.RENAME_FOLDER,
+                Proposal.status == ProposalStatus.PENDING,
+            )
+        }
+
+        placeholder_counter = 0
+
+        # Walk every subdirectory under root (excluding root itself and hidden).
+        for dir_path in sorted(root.rglob("*")):
+            if not dir_path.is_dir():
+                continue
+            # Skip hidden / system directories
+            if dir_path.name.startswith(".") or dir_path.name.startswith("_"):
+                continue
+            # Skip if any ancestor is the trash folder
+            if any(p.name == ".ddh_trash" for p in dir_path.parents):
+                continue
+            if str(dir_path).rstrip("/\\").lower() in existing_targets:
+                continue
+
+            original_name = dir_path.name
+            sanitized = _normalize_folder_name(original_name)
+            # Heuristic: if sanitization keeps >= half the original character
+            # count (alpha-numeric runs), it's mostly Latin → leave it alone.
+            stripped_chars = sum(1 for c in original_name if c.isalnum())
+            kept_chars = sum(1 for c in sanitized if c.isalnum())
+            if stripped_chars == 0:
+                continue  # All-symbol folder name; nothing useful to translate.
+            if kept_chars * 2 >= stripped_chars:
+                continue  # Mostly Latin already; leave it.
+
+            # Pick a representative file inside this directory to anchor the
+            # proposal (the executor's RENAME_FOLDER application uses the
+            # file_id to discover the directory path).
+            anchor_file = (
+                db.query(File)
+                .filter(
+                    File.session_id == session_id,
+                    File.path.like(f"{dir_path}%"),
+                )
+                .first()
+            )
+            if not anchor_file:
+                continue
+
+            # Try to derive a meaningful English name from the directory's
+            # AI-derived tags. Fall back to a sequential placeholder so the
+            # user still sees the proposal in the UI.
+            new_name = _derive_english_folder_name(db, session_id, dir_path)
+            if not new_name:
+                placeholder_counter += 1
+                new_name = f"non_latin_folder_{placeholder_counter}"
+            new_name = _normalize_folder_name(new_name)
+            if not new_name or new_name == original_name:
+                continue
+
+            dst_abs = str(dir_path.parent / new_name)
+            db.add(Proposal(
+                file_id=anchor_file.id,
+                proposal_type=ProposalType.RENAME_FOLDER,
+                current_value=str(dir_path),
+                proposed_value=dst_abs,
+                reasoning=(
+                    f"Non-Latin folder name '{original_name}' translated to "
+                    f"English per session language preference. Re-run with a "
+                    "translation-capable LLM or rename manually for a better "
+                    "result."
+                ),
+                confidence=0.55,
+                status=ProposalStatus.PENDING,
+            ))
+            created += 1
+
+        if created:
+            db.commit()
+
+    return created
+
+
+def _derive_english_folder_name(
+    db: Session, session_id: str, dir_path: Path
+) -> str | None:
+    """
+    Build an English folder name from the AI-derived tags / descriptions of
+    files inside *dir_path*. Returns None if nothing usable is found.
+
+    Strategy: count the most common English-only tokens across all
+    `ai_tags` JSON arrays in the directory, take the top 2-3, and join with
+    underscores. This works because tags are already English (the analyzer
+    runs in English) even when filenames are Hebrew.
+    """
+    files = (
+        db.query(File)
+        .filter(
+            File.session_id == session_id,
+            File.path.like(f"{dir_path}%"),
+            File.ai_tags.isnot(None),
+        )
+        .all()
+    )
+    if not files:
+        return None
+
+    token_counts: Counter[str] = Counter()
+    for f in files:
+        if not f.ai_tags:
+            continue
+        try:
+            tags = json.loads(f.ai_tags)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(tags, list):
+            continue
+        for tag in tags:
+            if not isinstance(tag, str):
+                continue
+            t = re.sub(r"[^a-z0-9_]", "_", tag.lower().replace(" ", "_"))
+            t = re.sub(r"_+", "_", t).strip("_")
+            if not t or len(t) < 3:
+                continue
+            # Skip generic content-type tags that don't add identity
+            if t in {"file", "image", "photo", "document", "drawing", "scan"}:
+                continue
+            token_counts[t] += 1
+
+    if not token_counts:
+        return None
+
+    top = [tok for tok, _ in token_counts.most_common(3)]
+    return "_".join(top) if top else None
 
 
 def _emit_relation_group_moves(session_id: str, root_path: str) -> int:

@@ -433,8 +433,21 @@ def propose(
     _init_db(db)
     console.print(Panel("Generating proposals", style="blue"))
 
+    # Resolve the latest user session up-front. The Namer's post-pass functions
+    # (sibling propagation, useless-stem rescue, hygiene fallback, etc.) all
+    # short-circuit when session_id is None — without this, files like `1.jpg`
+    # whose AI analysis failed never get a fallback rename proposal generated,
+    # leaving them stranded with their original useless stems on disk.
+    from donedatahoarder.db.session import get_engine
+    from donedatahoarder.db.models import UserSession
+    from sqlalchemy.orm import Session
+    engine = get_engine()
+    with Session(engine) as session:
+        latest = session.query(UserSession).order_by(UserSession.updated_at.desc()).first()
+        session_id = latest.id if latest else None
+
     from donedatahoarder.proposals.namer import generate_proposals
-    counts = generate_proposals(limit=limit, offset=offset)
+    counts = generate_proposals(limit=limit, offset=offset, session_id=session_id)
 
     console.print(
         f"\n[bold green]Proposals ready[/bold green] — "
@@ -446,18 +459,10 @@ def propose(
     if not no_organize:
         console.print(Panel("Analyzing folder structure for reorganization…", style="cyan"))
         from donedatahoarder.proposals.organizer import generate_reorg_proposals
-        from donedatahoarder.db.session import get_engine
-        from donedatahoarder.db.models import UserSession
-        from sqlalchemy.orm import Session
 
         # Initialize AI provider for the organizer (uses LLM for reorg suggestions)
         # Default to a small, fast text model; user can override via --model if needed.
         _init_ai("ollama", "http://localhost:11434", "llama3.2:3b")
-
-        engine = get_engine()
-        with Session(engine) as session:
-            latest = session.query(UserSession).order_by(UserSession.updated_at.desc()).first()
-            session_id = latest.id if latest else None
 
         if session_id:
             org_counts = generate_reorg_proposals(session_id=session_id)
