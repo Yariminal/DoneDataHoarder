@@ -858,3 +858,125 @@ def relate(
             pass
 
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Background-job-friendly wrapper
+# ---------------------------------------------------------------------------
+
+class _RelateCancelled(Exception):
+    """Raised inside relate()'s progress_cb to interrupt iteration on cancel."""
+
+
+def relate_with_progress(
+    session_id: str,
+    scope: str = "per_directory",
+    model: Optional[str] = None,
+    pause_event=None,
+    cancel_check=None,
+):
+    """
+    Background-job-friendly wrapper around relate().
+
+    Bridges relate()'s `progress_cb` callback into a generator. The callback
+    runs on the worker thread inside relate(); we use a queue.Queue to hand
+    progress dicts to the consuming generator. Pause is implemented by
+    blocking inside the callback; cancel is implemented by raising an
+    exception from inside the callback (which propagates up out of relate())
+    and the wrapper catches it.
+
+    Yields:
+      {"phase": "running", "dir": str, "done": N, "total": M, ...}  per dir
+      {"cancelled": True, ...}                                       on cancel
+      {"done": True, "directories": ..., "groups": ..., ...}         terminal
+    """
+    import queue
+    import threading
+
+    progress_queue: "queue.Queue[dict]" = queue.Queue(maxsize=500)
+    sentinel_done = object()
+    sentinel_error = object()
+    final_summary: dict = {}
+    error_holder: list = [None]
+
+    def _progress_cb(progress: dict) -> None:
+        """Invoked on worker thread per directory by relate()."""
+        # Block while paused
+        if pause_event is not None:
+            pause_event.wait()
+        # Cancel: raise to abort relate()'s loop
+        if cancel_check and cancel_check():
+            raise _RelateCancelled()
+        try:
+            progress_queue.put_nowait({"phase": "running", **progress})
+        except queue.Full:
+            # Drop oldest to make room
+            try:
+                progress_queue.get_nowait()
+                progress_queue.put_nowait({"phase": "running", **progress})
+            except (queue.Empty, queue.Full):
+                pass
+
+    def _runner():
+        """Worker thread: runs relate() and signals completion."""
+        try:
+            from donedatahoarder.ai.router import get_client
+            try:
+                client = get_client()
+            except RuntimeError:
+                client = None
+            summary = relate(
+                session_id=session_id,
+                scope=scope,
+                client=client,
+                model=model,
+                progress_cb=_progress_cb,
+            )
+            final_summary.update(summary)
+            progress_queue.put(sentinel_done)
+        except _RelateCancelled:
+            progress_queue.put(sentinel_done)  # treat as graceful end
+        except Exception as exc:
+            error_holder[0] = exc
+            progress_queue.put(sentinel_error)
+
+    # Initial yield so subscribers see the job has started
+    yield {"phase": "starting", "directories": 0, "groups": 0}
+
+    # Suppress Rich/log output from inside relate()
+    import contextlib
+    import io
+    with contextlib.redirect_stdout(io.StringIO()):
+        worker = threading.Thread(target=_runner, daemon=True, name="relate-worker")
+        worker.start()
+
+        while True:
+            try:
+                msg = progress_queue.get(timeout=2.0)
+            except queue.Empty:
+                # Periodic cancel check while waiting for first progress
+                if cancel_check and cancel_check():
+                    yield {"cancelled": True, **final_summary}
+                    return
+                # Heartbeat to keep SSE alive
+                yield {"phase": "running", "heartbeat": True, **final_summary}
+                continue
+
+            if msg is sentinel_done:
+                break
+            if msg is sentinel_error:
+                # Re-raise so JobManager marks the job FAILED
+                raise error_holder[0] if error_holder[0] else RuntimeError("relate failed")
+
+            yield msg
+
+        # Wait for worker to finish (it should already have)
+        worker.join(timeout=5.0)
+
+    # Detect cancellation: if cancel_check was true, we raised _RelateCancelled
+    # mid-iteration; the worker put sentinel_done. We still need to surface that.
+    if cancel_check and cancel_check():
+        yield {"cancelled": True, **final_summary}
+        return
+
+    yield {"done": True, **final_summary}

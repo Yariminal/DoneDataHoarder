@@ -931,6 +931,21 @@ def execute_proposals(body: ExecuteRequest):
     if not sid:
         raise HTTPException(400, "No active session. Create or load a session first.")
 
+    # Dry-run is routed through the background-job system so it survives
+    # disconnects (browser refresh / laptop sleep) during long unattended
+    # runs. The destructive --commit path stays synchronous to preserve
+    # the user-visible "Apply changes? y/N" confirmation flow.
+    if body.dry_run:
+        from donedatahoarder.core.jobs import job_manager
+        try:
+            job_id = job_manager.start_execute_dry(
+                session_id=sid,
+                min_confidence=body.min_confidence,
+            )
+            return {"job_id": job_id, "status": "started"}
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc))
+
     counts = do_execute(
         dry_run=body.dry_run,
         min_confidence=body.min_confidence,
@@ -1042,35 +1057,15 @@ def trigger_enrich(body: PipelineRequest = PipelineRequest()):
 
 @router.post("/pipeline/dedup")
 def trigger_dedup(body: PipelineRequest = PipelineRequest()):
-    from donedatahoarder.core.dedup import (
-        find_exact_duplicates, find_perceptual_duplicates,
-        find_semantic_duplicates, find_text_near_duplicates,
-        generate_dedup_proposals,
-    )
-    import io
-    import contextlib
+    """Start a dedup background job. Returns job_id immediately."""
+    from donedatahoarder.core.jobs import job_manager
 
     try:
         sid = _require_session_id(body.session_id)
-
-        # Suppress stdout to prevent Rich progress bar Unicode errors in web context
-        with contextlib.redirect_stdout(io.StringIO()):
-            exact = find_exact_duplicates(session_id=sid)
-            perc = find_perceptual_duplicates(session_id=sid)
-            semantic = find_semantic_duplicates(session_id=sid)  # Stage 3: AI-based semantic duplicates
-            text_near = find_text_near_duplicates(session_id=sid)  # Stage 4: byte-level fuzzy text match
-            # Stage 5: turn detected groups into actionable MARK_DUPLICATE proposals
-            # so the executor / approval UI actually has something to work with.
-            proposals = generate_dedup_proposals(session_id=sid)
-
-        _mark_session_unsaved(sid, step="dedup")
-        return {
-            "exact": exact,
-            "perceptual": perc,
-            "semantic": semantic,
-            "text_near": text_near,
-            "proposals": proposals,
-        }
+        job_id = job_manager.start_dedup(session_id=sid)
+        return {"job_id": job_id, "status": "started"}
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
     except HTTPException:
         raise
     except Exception as exc:
@@ -1080,30 +1075,23 @@ def trigger_dedup(body: PipelineRequest = PipelineRequest()):
 @router.post("/pipeline/relate")
 def trigger_relate(body: PipelineRequest = PipelineRequest()):
     """
-    Run the Relate step: LLM groups conceptually-related files (e.g. a .dwg
-    with its .bak backup and PDF exports), falling back to numeric-prefix
-    regex clustering if the LLM is unavailable. Writes RelationGroups /
-    RelationMembers. Idempotent — re-running wipes and rebuilds groups.
+    Start a Relate background job. Returns job_id immediately.
+
+    LLM groups conceptually-related files (e.g. a .dwg with its .bak backup
+    and PDF exports), falling back to numeric-prefix regex clustering if the
+    LLM is unavailable. Writes RelationGroups / RelationMembers. Idempotent —
+    re-running wipes and rebuilds groups.
 
     Relate is filename-only reasoning (no vision), so it uses the session's
     `propose_model` (reasoning model) rather than `analyze_model` (vision).
-    This is a hard init — previously the step inherited whatever model was
-    last initialised by a prior step, which could be a tiny vision-tuned
-    model incapable of producing valid JSON group output.
     """
-    from donedatahoarder.ai.router import init_ai
-    from donedatahoarder.core.relate import relate
+    from donedatahoarder.core.jobs import job_manager
 
     try:
         sid = _require_session_id(body.session_id)
         # Relate is a reasoning task — use propose_model (fallback chain in
         # _resolve_model covers empty / legacy cases).
         model = _resolve_model(body.model, sid, step="propose")
-        init_ai(
-            backend=body.backend,
-            text_model=model,
-            vision_model=model,
-        )
 
         # Pull the session's relate_scope preference
         scope = "per_directory"
@@ -1112,17 +1100,17 @@ def trigger_relate(body: PipelineRequest = PipelineRequest()):
             if us and getattr(us, "relate_scope", None):
                 scope = us.relate_scope
 
-        summary = relate(session_id=sid, scope=scope, model=model)
-        _mark_session_unsaved(sid, step="relate")
-        return {
-            "scope": scope,
-            "model": model,
-            **summary,
-        }
+        job_id = job_manager.start_relate(
+            session_id=sid,
+            backend=body.backend,
+            model=model,
+            scope=scope,
+        )
+        return {"job_id": job_id, "status": "started", "model": model, "scope": scope}
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
     except HTTPException:
         raise
-    except RuntimeError as exc:
-        raise HTTPException(503, str(exc))
     except Exception as exc:
         raise HTTPException(500, f"Relate failed: {str(exc)}")
 
@@ -1285,18 +1273,15 @@ def cancel_job(job_id: str):
 
 @router.post("/pipeline/propose")
 def trigger_propose(body: PipelineRequest = PipelineRequest()):
-    from donedatahoarder.proposals.namer import generate_proposals
-    import io
-    import contextlib
+    """Start a propose background job. Returns job_id immediately."""
+    from donedatahoarder.core.jobs import job_manager
 
     try:
         sid = _require_session_id(body.session_id)
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            counts = generate_proposals(session_id=sid)
-
-        _mark_session_unsaved(sid, step="propose")
-        return counts
+        job_id = job_manager.start_propose(session_id=sid)
+        return {"job_id": job_id, "status": "started"}
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
     except HTTPException:
         raise
     except Exception as exc:
@@ -1510,42 +1495,57 @@ def _build_proposed_tree(session_id: str, before_summaries, root_path: str) -> d
 
 @router.post("/pipeline/organize")
 def trigger_organize(body: PipelineRequest = PipelineRequest()):
-    """Use LLM to suggest folder reorganization based on file analysis."""
-    from donedatahoarder.ai.router import init_ai
-    from donedatahoarder.proposals.organizer import generate_reorg_proposals
+    """
+    Start an organize background job. Returns job_id immediately.
+
+    Uses LLM to suggest folder reorganization based on file analysis. The
+    before/after folder trees are computed on completion and available via
+    the GET /pipeline/organize/trees/{session_id} endpoint after the job
+    finishes. (For backward UI compat the trees can also be re-fetched.)
+    """
+    from donedatahoarder.core.jobs import job_manager
 
     try:
         sid = _require_session_id(body.session_id)
         model = _resolve_model(body.model, sid, step="propose")
-        init_ai(
+        job_id = job_manager.start_organize(
+            session_id=sid,
             backend=body.backend,
-            text_model=model,
-            vision_model=model,
+            model=model,
         )
+        return {"job_id": job_id, "status": "started", "model": model}
     except RuntimeError as exc:
-        raise HTTPException(503, str(exc))
-
-    try:
-        from donedatahoarder.proposals.organizer import build_folder_tree
-
-        # Capture current folder structure BEFORE generating proposals
-        with Session(get_engine()) as db:
-            us = db.get(UserSession, sid)
-            root_path = us.root_path if us else ""
-        before_summaries = build_folder_tree(sid, root_path)
-        before_tree = _folder_summaries_to_tree(before_summaries, root_path)
-
-        counts = generate_reorg_proposals(session_id=sid)
-        _mark_session_unsaved(sid, step="organize")
-
-        # Build proposed "after" tree using the new MOVE/RENAME_FOLDER proposals
-        after_tree = _build_proposed_tree(sid, before_summaries, root_path)
-
-        return {**counts, "before_tree": before_tree, "after_tree": after_tree}
+        raise HTTPException(409, str(exc))
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(500, f"Organize failed: {str(exc)}")
+
+
+@router.get("/pipeline/organize/trees/{session_id}")
+def get_organize_trees(session_id: str):
+    """
+    Build the before/after folder trees for a session that has organize
+    proposals. Computed on demand after an organize background job finishes
+    so the frontend can render the visual diff.
+    """
+    from donedatahoarder.proposals.organizer import build_folder_tree
+
+    try:
+        with Session(get_engine()) as db:
+            us = db.get(UserSession, session_id)
+            if not us:
+                raise HTTPException(404, "Session not found")
+            root_path = us.root_path or ""
+
+        before_summaries = build_folder_tree(session_id, root_path)
+        before_tree = _folder_summaries_to_tree(before_summaries, root_path)
+        after_tree = _build_proposed_tree(session_id, before_summaries, root_path)
+        return {"before_tree": before_tree, "after_tree": after_tree}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"Tree build failed: {str(exc)}")
 
 
 # ---------------------------------------------------------------------------

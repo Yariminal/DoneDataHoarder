@@ -627,6 +627,100 @@ def execute(
     return counts
 
 
+# ---------------------------------------------------------------------------
+# Background-job-friendly wrapper (DRY-RUN ONLY)
+# ---------------------------------------------------------------------------
+# Note: execute --commit deliberately stays synchronous so the user-visible
+# "Apply changes? y/N" confirmation flow is preserved. Only execute --dry-run
+# (used by the unattended runner) becomes a background job, since the
+# dry-run is the step that benefits from disconnect resilience.
+
+def execute_with_progress(
+    min_confidence: float = 0.7,
+    proposal_ids: Optional[list[int]] = None,
+    proposal_types: Optional[list[ProposalType]] = None,
+    session_id: str | None = None,
+    pause_event=None,
+    cancel_check=None,
+):
+    """
+    Background-job-friendly wrapper around execute(dry_run=True).
+
+    Runs execute() in a worker thread and emits periodic heartbeats while
+    the consumer waits for the final summary. dry_run is hard-coded to True
+    here — the destructive commit path stays synchronous and is reached
+    through the existing /execute endpoint when dry_run=False.
+
+    Pause is honored before launching the worker; once the worker is running
+    it cannot be interrupted (dry-run is read-only and typically completes in
+    seconds to minutes, so this is acceptable).
+
+    Yields:
+      {"phase": "starting"}
+      {"phase": "running", "heartbeat": True}                every ~2s
+      {"cancelled": True}                                     on cancel (before start)
+      {"done": True, "applied": ..., "failed": ..., ...}     terminal
+    """
+    import contextlib
+    import io
+    import queue
+    import threading
+
+    if pause_event is not None:
+        pause_event.wait()
+    if cancel_check and cancel_check():
+        yield {"cancelled": True}
+        return
+
+    yield {"phase": "starting"}
+
+    result_queue: "queue.Queue" = queue.Queue(maxsize=4)
+    sentinel_done = object()
+    sentinel_error = object()
+    final_result: dict = {}
+    error_holder: list = [None]
+
+    def _runner():
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                summary = execute(
+                    dry_run=True,
+                    min_confidence=min_confidence,
+                    proposal_ids=proposal_ids,
+                    proposal_types=proposal_types,
+                    session_id=session_id,
+                    _console=_make_quiet_console(),
+                )
+            final_result.update(summary)
+            result_queue.put(sentinel_done)
+        except Exception as exc:
+            error_holder[0] = exc
+            result_queue.put(sentinel_error)
+
+    worker = threading.Thread(target=_runner, daemon=True, name="execute-dry-worker")
+    worker.start()
+
+    while True:
+        try:
+            msg = result_queue.get(timeout=2.0)
+        except queue.Empty:
+            if cancel_check and cancel_check():
+                # Worker can't be cleanly interrupted mid-run; let it finish
+                # in the background. Dry-run is read-only so this is safe.
+                yield {"cancelled": True, "phase": "running"}
+                return
+            yield {"phase": "running", "heartbeat": True}
+            continue
+
+        if msg is sentinel_done:
+            break
+        if msg is sentinel_error:
+            raise error_holder[0] if error_holder[0] else RuntimeError("execute failed")
+
+    worker.join(timeout=5.0)
+    yield {"done": True, **final_result}
+
+
 def _cleanup_junk_files(
     root: Path, session_id: str | None, con: Console
 ) -> int:

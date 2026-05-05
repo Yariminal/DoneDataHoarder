@@ -229,6 +229,171 @@ class JobManager:
         thread.start()
         return job.job_id
 
+    # ------------------------------------------------------------------
+    # New background jobs (dedup, relate, propose, organize, execute-dry)
+    # ------------------------------------------------------------------
+
+    def _generic_runner(
+        self,
+        job: JobInfo,
+        gen_factory,  # callable returning a fresh generator
+        step_name: str,
+        init_ai_kwargs: Optional[dict] = None,
+    ):
+        """
+        Shared worker for all background jobs that follow the
+        `*_with_progress(pause_event, cancel_check)` contract.
+
+        Mirrors the start_analyze/start_enrich pattern: drive the generator,
+        push progress, finalize state, mark session unsaved.
+        """
+        try:
+            if init_ai_kwargs:
+                from donedatahoarder.ai.router import init_ai
+                init_ai(**init_ai_kwargs)
+
+            for progress in gen_factory():
+                if progress.get("done") or progress.get("cancelled"):
+                    # Push the terminal payload too so subscribers see counts
+                    job.push_progress(progress)
+                    break
+                job.push_progress(progress)
+
+            if job.cancel_flag:
+                self._finish_job(job, JobState.CANCELLED)
+            else:
+                self._finish_job(job, JobState.COMPLETED)
+
+            try:
+                from donedatahoarder.web.api import _mark_session_unsaved
+                _mark_session_unsaved(job.session_id, step=step_name)
+            except Exception:
+                pass
+
+        except Exception as exc:
+            self._finish_job(job, JobState.FAILED, str(exc))
+
+    def start_dedup(self, session_id: str) -> str:
+        """Start a dedup job in a background thread. Returns job_id."""
+        job = self._create_job("dedup", session_id)
+
+        def run():
+            from donedatahoarder.core.dedup import dedup_with_progress
+            self._generic_runner(
+                job=job,
+                gen_factory=lambda: dedup_with_progress(
+                    session_id=session_id,
+                    pause_event=job.pause_event,
+                    cancel_check=lambda: job.cancel_flag,
+                ),
+                step_name="dedup",
+            )
+
+        threading.Thread(target=run, daemon=True, name=f"job-{job.job_id}").start()
+        return job.job_id
+
+    def start_relate(
+        self,
+        session_id: str,
+        backend: str = "ollama",
+        model: str = "gemma3:12b",
+        scope: str = "per_directory",
+    ) -> str:
+        """Start a relate job in a background thread. Returns job_id."""
+        job = self._create_job("relate", session_id)
+
+        def run():
+            from donedatahoarder.core.relate import relate_with_progress
+            self._generic_runner(
+                job=job,
+                gen_factory=lambda: relate_with_progress(
+                    session_id=session_id,
+                    scope=scope,
+                    model=model,
+                    pause_event=job.pause_event,
+                    cancel_check=lambda: job.cancel_flag,
+                ),
+                step_name="relate",
+                init_ai_kwargs={"backend": backend, "text_model": model, "vision_model": model},
+            )
+
+        threading.Thread(target=run, daemon=True, name=f"job-{job.job_id}").start()
+        return job.job_id
+
+    def start_propose(self, session_id: str) -> str:
+        """Start a propose job in a background thread. Returns job_id."""
+        job = self._create_job("propose", session_id)
+
+        def run():
+            from donedatahoarder.proposals.namer import generate_proposals_with_progress
+            self._generic_runner(
+                job=job,
+                gen_factory=lambda: generate_proposals_with_progress(
+                    session_id=session_id,
+                    pause_event=job.pause_event,
+                    cancel_check=lambda: job.cancel_flag,
+                ),
+                step_name="propose",
+            )
+
+        threading.Thread(target=run, daemon=True, name=f"job-{job.job_id}").start()
+        return job.job_id
+
+    def start_organize(
+        self,
+        session_id: str,
+        backend: str = "ollama",
+        model: str = "gemma3:12b",
+    ) -> str:
+        """Start an organize job in a background thread. Returns job_id."""
+        job = self._create_job("organize", session_id)
+
+        def run():
+            from donedatahoarder.proposals.organizer import generate_reorg_proposals_with_progress
+            self._generic_runner(
+                job=job,
+                gen_factory=lambda: generate_reorg_proposals_with_progress(
+                    session_id=session_id,
+                    pause_event=job.pause_event,
+                    cancel_check=lambda: job.cancel_flag,
+                ),
+                step_name="organize",
+                init_ai_kwargs={"backend": backend, "text_model": model, "vision_model": model},
+            )
+
+        threading.Thread(target=run, daemon=True, name=f"job-{job.job_id}").start()
+        return job.job_id
+
+    def start_execute_dry(
+        self,
+        session_id: str,
+        min_confidence: float = 0.7,
+    ) -> str:
+        """
+        Start an execute --dry-run job in a background thread. Returns job_id.
+
+        IMPORTANT: this is dry-run only. The destructive --commit path stays
+        synchronous through the existing /execute endpoint to preserve the
+        user-visible "Apply changes? y/N" confirmation flow.
+        """
+        job = self._create_job("execute", session_id)
+
+        def run():
+            from donedatahoarder.executor import execute_with_progress
+            self._generic_runner(
+                job=job,
+                gen_factory=lambda: execute_with_progress(
+                    min_confidence=min_confidence,
+                    session_id=session_id,
+                    pause_event=job.pause_event,
+                    cancel_check=lambda: job.cancel_flag,
+                ),
+                step_name="execute",
+            )
+
+        threading.Thread(target=run, daemon=True, name=f"job-{job.job_id}").start()
+        return job.job_id
+
     def pause(self, job_id: str):
         job = self._get_job(job_id)
         if job.state != JobState.RUNNING:

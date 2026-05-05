@@ -614,6 +614,84 @@ def generate_dedup_proposals(session_id: str | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Background-job-friendly wrapper
+# ---------------------------------------------------------------------------
+
+def dedup_with_progress(
+    session_id: str | None = None,
+    pause_event=None,
+    cancel_check=None,
+):
+    """
+    Like running the dedup endpoint sequentially, but yields progress dicts
+    suitable for the JobManager's SSE streaming. Survives browser disconnect.
+
+    Phases (cancel-checkable between each):
+      1. exact         — hash-based exact duplicates
+      2. perceptual    — pHash near-duplicate images/videos
+      3. semantic      — AI-description / tag similarity
+      4. text_near     — byte-level fuzzy text match
+      5. proposals     — emit MARK_DUPLICATE proposals
+
+    Yields:
+      {"phase": str, "current": N, "total": 5, **counts}  per phase
+      {"cancelled": True, ...}                             if cancel_check fires
+      {"done": True, "exact": ..., "perceptual": ..., ...} terminal
+    """
+    import contextlib
+    import io
+
+    PHASES = ["exact", "perceptual", "semantic", "text_near", "proposals"]
+    TOTAL = len(PHASES)
+    results: dict[str, dict] = {}
+
+    def _check_pause_cancel() -> bool:
+        """Return True if cancellation requested. Block on pause."""
+        if pause_event is not None:
+            pause_event.wait()
+        return bool(cancel_check and cancel_check())
+
+    # Initial yield so subscribers see the job has started
+    yield {"phase": "starting", "current": 0, "total": TOTAL}
+
+    # Suppress Rich Progress output (each find_* uses its own progress bar)
+    with contextlib.redirect_stdout(io.StringIO()):
+        for idx, phase in enumerate(PHASES, start=1):
+            if _check_pause_cancel():
+                yield {"cancelled": True, "phase": phase, "current": idx - 1, "total": TOTAL, **results}
+                return
+
+            # Announce phase start
+            yield {"phase": phase, "current": idx - 1, "total": TOTAL, "status": "running", **results}
+
+            try:
+                if phase == "exact":
+                    results["exact"] = find_exact_duplicates(session_id=session_id)
+                elif phase == "perceptual":
+                    results["perceptual"] = find_perceptual_duplicates(session_id=session_id)
+                elif phase == "semantic":
+                    results["semantic"] = find_semantic_duplicates(session_id=session_id)
+                elif phase == "text_near":
+                    results["text_near"] = find_text_near_duplicates(session_id=session_id)
+                elif phase == "proposals":
+                    proposal_counts = generate_dedup_proposals(session_id=session_id)
+                    # generate_dedup_proposals returns int OR dict depending on
+                    # version; normalise to dict for the UI
+                    if isinstance(proposal_counts, int):
+                        results["proposals"] = {"created": proposal_counts}
+                    else:
+                        results["proposals"] = proposal_counts
+            except Exception as exc:
+                # Surface phase failure but keep going to next phase
+                results[phase] = {"error": str(exc)[:200]}
+
+            # Phase done — emit completion progress
+            yield {"phase": phase, "current": idx, "total": TOTAL, "status": "complete", **results}
+
+    yield {"done": True, "current": TOTAL, "total": TOTAL, **results}
+
+
+# ---------------------------------------------------------------------------
 # Summary query
 # ---------------------------------------------------------------------------
 

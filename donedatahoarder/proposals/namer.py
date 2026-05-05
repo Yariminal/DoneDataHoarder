@@ -1839,3 +1839,88 @@ def _propagate_renames_via_relation_groups(session_id: str | None) -> int:
             session.commit()
 
     return created
+
+
+# ---------------------------------------------------------------------------
+# Background-job-friendly wrapper
+# ---------------------------------------------------------------------------
+
+def generate_proposals_with_progress(
+    session_id: str | None = None,
+    pause_event=None,
+    cancel_check=None,
+):
+    """
+    Background-job-friendly wrapper around generate_proposals().
+
+    generate_proposals() is a single coarse-grained operation (typically
+    10–60 s on 10K files because it's reformatting existing analysis,
+    not calling the LLM). We run it in a worker thread and yield periodic
+    heartbeats while the consumer waits for the final summary.
+
+    Pause is implemented by checking pause_event before launching the
+    worker (so the user can pause the unattended run before propose
+    starts). Cancel works similarly — once the worker is running, it
+    cannot be interrupted mid-batch (the operation is short enough that
+    coarse-grained cancel between phases is acceptable).
+
+    Yields:
+      {"phase": "starting"}
+      {"phase": "running", "heartbeat": True}              every ~2s
+      {"cancelled": True}                                  on cancel (before start)
+      {"done": True, "rename": ..., "tags": ..., ...}     terminal
+    """
+    import contextlib
+    import io
+    import queue
+    import threading
+
+    # Honor pause/cancel BEFORE the long-running work begins
+    if pause_event is not None:
+        pause_event.wait()
+    if cancel_check and cancel_check():
+        yield {"cancelled": True}
+        return
+
+    yield {"phase": "starting"}
+
+    result_queue: "queue.Queue" = queue.Queue(maxsize=4)
+    sentinel_done = object()
+    sentinel_error = object()
+    final_result: dict = {}
+    error_holder: list = [None]
+
+    def _runner():
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                summary = generate_proposals(session_id=session_id)
+            final_result.update(summary)
+            result_queue.put(sentinel_done)
+        except Exception as exc:
+            error_holder[0] = exc
+            result_queue.put(sentinel_error)
+
+    worker = threading.Thread(target=_runner, daemon=True, name="propose-worker")
+    worker.start()
+
+    while True:
+        try:
+            msg = result_queue.get(timeout=2.0)
+        except queue.Empty:
+            # Heartbeat — keeps SSE alive and lets cancel propagate
+            if cancel_check and cancel_check():
+                # Worker can't be interrupted mid-flight; just stop streaming
+                # and let it finish in the background. The proposals it wrote
+                # before cancel are still valid.
+                yield {"cancelled": True, "phase": "running"}
+                return
+            yield {"phase": "running", "heartbeat": True}
+            continue
+
+        if msg is sentinel_done:
+            break
+        if msg is sentinel_error:
+            raise error_holder[0] if error_holder[0] else RuntimeError("propose failed")
+
+    worker.join(timeout=5.0)
+    yield {"done": True, **final_result}

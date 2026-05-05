@@ -1878,3 +1878,79 @@ def _backstop_generic_folders(session_id: str, root_path: str) -> dict[str, int]
             db.commit()
 
     return {"renames": created_renames, "moves": created_moves}
+
+
+# ---------------------------------------------------------------------------
+# Background-job-friendly wrapper
+# ---------------------------------------------------------------------------
+
+def generate_reorg_proposals_with_progress(
+    session_id: str,
+    pause_event=None,
+    cancel_check=None,
+):
+    """
+    Background-job-friendly wrapper around generate_reorg_proposals().
+
+    Organize is dominated by a single LLM call (fold tree → reorg suggestions),
+    so we run it in a worker thread and emit periodic heartbeats while waiting.
+    Pause/cancel is honored before launching the worker; once the LLM call is
+    in flight we can't cleanly interrupt it (Ollama HTTP request).
+
+    Yields:
+      {"phase": "starting"}
+      {"phase": "running", "heartbeat": True}              every ~2s
+      {"cancelled": True}                                   on cancel (before start)
+      {"done": True, "move": ..., "folder_rename": ..., ...} terminal
+    """
+    import contextlib
+    import io
+    import queue
+    import threading
+
+    if pause_event is not None:
+        pause_event.wait()
+    if cancel_check and cancel_check():
+        yield {"cancelled": True}
+        return
+
+    yield {"phase": "starting"}
+
+    result_queue: "queue.Queue" = queue.Queue(maxsize=4)
+    sentinel_done = object()
+    sentinel_error = object()
+    final_result: dict = {}
+    error_holder: list = [None]
+
+    def _runner():
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                summary = generate_reorg_proposals(session_id=session_id)
+            final_result.update(summary)
+            result_queue.put(sentinel_done)
+        except Exception as exc:
+            error_holder[0] = exc
+            result_queue.put(sentinel_error)
+
+    worker = threading.Thread(target=_runner, daemon=True, name="organize-worker")
+    worker.start()
+
+    while True:
+        try:
+            msg = result_queue.get(timeout=2.0)
+        except queue.Empty:
+            if cancel_check and cancel_check():
+                # Worker (LLM call) can't be cleanly interrupted; let it finish
+                # in the background and just stop streaming.
+                yield {"cancelled": True, "phase": "running"}
+                return
+            yield {"phase": "running", "heartbeat": True}
+            continue
+
+        if msg is sentinel_done:
+            break
+        if msg is sentinel_error:
+            raise error_holder[0] if error_holder[0] else RuntimeError("organize failed")
+
+    worker.join(timeout=5.0)
+    yield {"done": True, **final_result}

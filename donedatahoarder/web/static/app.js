@@ -994,9 +994,14 @@ document.addEventListener('alpine:init', () => {
   Alpine.data('pipeline', () => ({
     running: null,
     result: null,
-    // Progress tracking for analyze and enrich (background jobs)
+    // Progress tracking for background jobs (one per type)
     analyzeProgress: null,
     enrichProgress: null,
+    dedupProgress: null,
+    relateProgress: null,
+    proposeProgress: null,
+    organizeProgress: null,
+    executeProgress: null,
     progressStartTime: null,
     // Background job state
     activeJobId: null,
@@ -1011,6 +1016,11 @@ document.addEventListener('alpine:init', () => {
     unattendedCompletedSteps: [],
     unattendedFailedStep: null,
     _unattendedStepResolve: null,
+    // Wake Lock state — prevents the system from sleeping during unattended runs
+    _wakeLock: null,
+    _wakeLockSupported: typeof navigator !== 'undefined' && 'wakeLock' in navigator,
+    _onVisibilityChange: null,
+    wakeLockActive: false,
 
     async init() {
       // Check for an active background job (reconnect after page refresh)
@@ -1027,8 +1037,9 @@ document.addEventListener('alpine:init', () => {
           this.running = data.job_type;
           this.progressStartTime = Date.now();
           if (data.progress) {
-            if (data.job_type === 'analyze') this.analyzeProgress = data.progress;
-            else if (data.job_type === 'enrich') this.enrichProgress = data.progress;
+            // Route the in-flight progress to the right state var so the UI
+            // re-renders with the existing snapshot while we reconnect SSE.
+            this._setProgressForType(data.job_type, data.progress);
           }
           // Reconnect SSE stream
           this._connectJobStream(data.job_id, data.job_type);
@@ -1137,6 +1148,12 @@ document.addEventListener('alpine:init', () => {
       return html;
     },
 
+    // Steps that run as background jobs (resilient to disconnects).
+    // Everything except 'scan' and 'execute-commit' is a background job now.
+    _BACKGROUND_STEPS: new Set([
+      'enrich', 'dedup', 'relate', 'analyze', 'propose', 'organize', 'execute-dry',
+    ]),
+
     async runStep(step) {
       // Prevent starting a new step while a job is active
       if (this.activeJobId && (this.jobState === 'running' || this.jobState === 'paused')) {
@@ -1148,6 +1165,11 @@ document.addEventListener('alpine:init', () => {
       this.result = null;
       this.analyzeProgress = null;
       this.enrichProgress = null;
+      this.dedupProgress = null;
+      this.relateProgress = null;
+      this.proposeProgress = null;
+      this.organizeProgress = null;
+      this.executeProgress = null;
       this.progressStartTime = null;
       this.activeJobId = null;
       this.activeJobType = null;
@@ -1169,21 +1191,22 @@ document.addEventListener('alpine:init', () => {
             Alpine.store('app').toast(`Scan complete: ${data.new || 0} new files, ${data.skipped || 0} skipped`, 'success');
             break;
           case 'enrich':
-            data = await this._startBackgroundJob('enrich', settings);
-            return;  // _connectJobStream handles the rest
           case 'dedup':
-            data = await api.post('/pipeline/dedup', { session_id: settings.session_id });
-            const exactGroups = data.exact?.groups || 0;
-            const percGroups = data.perceptual?.groups || 0;
-            Alpine.store('app').toast(`Dedup complete: ${exactGroups} exact + ${percGroups} perceptual groups`, 'success');
-            break;
+          case 'propose':
+          case 'execute-dry':
+            // Steps with no extra prerequisite checks
+            data = await this._startBackgroundJob(step, settings);
+            return;  // _connectJobStream handles the rest
           case 'relate':
-            data = await api.post('/pipeline/relate', { session_id: settings.session_id });
-            Alpine.store('app').toast(
-              `Relate complete: ${data.groups || 0} groups (${data.llm_groups || 0} LLM + ${data.backstop_groups || 0} backstop) across ${data.directories || 0} dirs`,
-              'success',
-            );
-            break;
+            // Relate uses propose_model for reasoning
+            if (!settings.proposeModel || settings.proposeModel === '') {
+              Alpine.store('app').toast('Please select a proposal model in the Setup tab before relating', 'error');
+              this.running = null;
+              Alpine.store('app').loading = false;
+              return;
+            }
+            data = await this._startBackgroundJob(step, settings);
+            return;
           case 'analyze':
             if (!settings.analyzeModel || settings.analyzeModel === '') {
               Alpine.store('app').toast('Please select an analysis model in the Setup tab before analyzing', 'error');
@@ -1191,12 +1214,8 @@ document.addEventListener('alpine:init', () => {
               Alpine.store('app').loading = false;
               return;
             }
-            data = await this._startBackgroundJob('analyze', settings);
-            return;  // _connectJobStream handles the rest
-          case 'propose':
-            data = await api.post('/pipeline/propose', { session_id: settings.session_id });
-            Alpine.store('app').toast(`Propose complete: ${data.rename || 0} renames + ${data.tags || 0} tags`, 'success');
-            break;
+            data = await this._startBackgroundJob(step, settings);
+            return;
           case 'organize':
             if (!settings.proposeModel || settings.proposeModel === '') {
               Alpine.store('app').toast('Please select a proposal model in the Setup tab before organizing', 'error');
@@ -1204,18 +1223,11 @@ document.addEventListener('alpine:init', () => {
               Alpine.store('app').loading = false;
               return;
             }
-            data = await api.post('/pipeline/organize', {
-              session_id: settings.session_id,
-              backend: settings.backend,
-              model: settings.proposeModel,
-            });
-            Alpine.store('app').toast(`Organize complete: ${data.move || 0} move proposals generated`, 'success');
-            break;
-          case 'execute-dry':
-            data = await api.post('/execute', { session_id: settings.session_id, dry_run: true });
-            Alpine.store('app').toast('Dry run complete — review results below', 'success');
-            break;
+            data = await this._startBackgroundJob(step, settings);
+            return;
           case 'execute-commit':
+            // Commit STAYS SYNCHRONOUS so the user-visible "Apply changes? y/N"
+            // confirmation flow is preserved. Only execute-dry runs in background.
             if (!confirm('Apply all approved changes to disk? This cannot be undone.')) {
               this.running = null;
               Alpine.store('app').loading = false;
@@ -1230,7 +1242,9 @@ document.addEventListener('alpine:init', () => {
         Alpine.store('app').toast(`${step} failed: ${e.message}`, 'error');
         this.result = { error: e.message };
       } finally {
-        if (step !== 'analyze' && step !== 'enrich') {
+        // Only reset for synchronous steps (scan, execute-commit). Background
+        // steps return early; their cleanup happens in _onJobComplete.
+        if (!this._BACKGROUND_STEPS.has(step)) {
           this.running = null;
           Alpine.store('app').loading = false;
           await this._refreshAfterStep();
@@ -1241,12 +1255,23 @@ document.addEventListener('alpine:init', () => {
     async _startBackgroundJob(type, settings) {
       // Start the background job via POST — returns immediately with job_id
       const body = { session_id: settings.session_id || '' };
+      // Per-type request body extras
       if (type === 'analyze') {
         body.backend = settings.backend;
         body.model = settings.analyzeModel || settings.model;
         body.workers = settings.workers;
+      } else if (type === 'relate' || type === 'organize') {
+        body.backend = settings.backend;
+        body.model = settings.proposeModel || settings.model;
+      } else if (type === 'execute-dry') {
+        body.dry_run = true;
+        body.min_confidence = settings.minConfidence ?? 0.7;
       }
-      const res = await api.post(`/pipeline/${type}`, body);
+      // Map step name to API endpoint path. Most steps use /pipeline/<type>,
+      // but execute-dry is special: the existing endpoint is /execute and
+      // the body's dry_run flag selects the background path.
+      const url = (type === 'execute-dry') ? '/execute' : `/pipeline/${type}`;
+      const res = await api.post(url, body);
       this.activeJobId = res.job_id;
       this.activeJobType = type;
       this.jobState = 'running';
@@ -1256,6 +1281,20 @@ document.addEventListener('alpine:init', () => {
       // Connect to the SSE stream for progress
       this._connectJobStream(res.job_id, type);
       return res;
+    },
+
+    _setProgressForType(type, data) {
+      // Route progress dict to the right state var so UI bindings stay clean.
+      switch (type) {
+        case 'analyze':    this.analyzeProgress = data; break;
+        case 'enrich':     this.enrichProgress = data; break;
+        case 'dedup':      this.dedupProgress = data; break;
+        case 'relate':     this.relateProgress = data; break;
+        case 'propose':    this.proposeProgress = data; break;
+        case 'organize':   this.organizeProgress = data; break;
+        case 'execute-dry':
+        case 'execute':    this.executeProgress = data; break;
+      }
     },
 
     _connectJobStream(jobId, type) {
@@ -1272,12 +1311,11 @@ document.addEventListener('alpine:init', () => {
         try {
           const data = JSON.parse(event.data);
 
-          // Skip heartbeats
-          if (data.heartbeat) return;
+          // Skip pure heartbeats (no useful payload)
+          if (data.heartbeat && !data.done && !data.cancelled && !data.state) return;
 
           // Update progress
-          if (type === 'analyze') this.analyzeProgress = data;
-          else if (type === 'enrich') this.enrichProgress = data;
+          this._setProgressForType(type, data);
 
           // Update job state if provided
           if (data.state) this.jobState = data.state;
@@ -1306,13 +1344,55 @@ document.addEventListener('alpine:init', () => {
       this.jobState = state;
 
       if (state === 'completed') {
-        if (type === 'analyze') {
-          Alpine.store('app').toast(
-            `Analyze complete: ${data.analyzed || 0} analyzed, ${data.skipped || 0} skipped, ${data.errors || 0} errors`,
-            'success'
-          );
-        } else if (type === 'enrich') {
-          Alpine.store('app').toast(`Enrich complete: ${data.enriched || 0} files enriched`, 'success');
+        // Per-type success toast
+        switch (type) {
+          case 'analyze':
+            Alpine.store('app').toast(
+              `Analyze complete: ${data.analyzed || 0} analyzed, ${data.skipped || 0} skipped, ${data.errors || 0} errors`,
+              'success',
+            );
+            break;
+          case 'enrich':
+            Alpine.store('app').toast(`Enrich complete: ${data.enriched || 0} files enriched`, 'success');
+            break;
+          case 'dedup': {
+            const exact = data.exact?.groups || 0;
+            const perc = data.perceptual?.groups || 0;
+            const props = (data.proposals && (data.proposals.created ?? data.proposals.proposals)) || 0;
+            Alpine.store('app').toast(
+              `Dedup complete: ${exact} exact + ${perc} perceptual groups, ${props} proposals`,
+              'success',
+            );
+            break;
+          }
+          case 'relate':
+            Alpine.store('app').toast(
+              `Relate complete: ${data.groups || 0} groups (${data.llm_groups || 0} LLM + ${data.backstop_groups || 0} backstop) across ${data.directories || 0} dirs`,
+              'success',
+            );
+            break;
+          case 'propose':
+            Alpine.store('app').toast(`Propose complete: ${data.rename || 0} renames + ${data.tags || 0} tags`, 'success');
+            break;
+          case 'organize':
+            Alpine.store('app').toast(`Organize complete: ${data.moves || data.move || 0} move proposals generated`, 'success');
+            // Fetch the before/after trees on demand for the result panel
+            try {
+              const sid = Alpine.store('session').current_session_id;
+              if (sid) {
+                const trees = await api.get(`/pipeline/organize/trees/${sid}`);
+                data.before_tree = trees.before_tree;
+                data.after_tree = trees.after_tree;
+              }
+            } catch (_) { /* tree fetch is best-effort */ }
+            break;
+          case 'execute-dry':
+          case 'execute':
+            Alpine.store('app').toast(
+              `Dry run complete: ${data.applied || 0} would apply, ${data.failed || 0} failed, ${data.skipped || 0} skipped`,
+              'success',
+            );
+            break;
         }
       } else if (state === 'failed') {
         Alpine.store('app').toast(`${type} failed: ${data.error || 'Unknown error'}`, 'error');
@@ -1324,8 +1404,14 @@ document.addEventListener('alpine:init', () => {
       this.running = null;
       this.activeJobId = null;
       this.activeJobType = null;
+      // Reset all progress vars
       this.analyzeProgress = null;
       this.enrichProgress = null;
+      this.dedupProgress = null;
+      this.relateProgress = null;
+      this.proposeProgress = null;
+      this.organizeProgress = null;
+      this.executeProgress = null;
       this.progressStartTime = null;
 
       await this._refreshAfterStep();
@@ -1513,25 +1599,27 @@ document.addEventListener('alpine:init', () => {
 
     async _runUnattendedStep(step) {
       // Returns Promise<boolean> — true if step succeeded, false otherwise.
-      // Handles both synchronous steps and background jobs (analyze/enrich).
+      // Handles both synchronous steps and background jobs.
+      //
+      // After the v0.6 resilience refactor, ALL pipeline steps except 'scan'
+      // and 'execute-commit' run as background jobs. The unattended path uses
+      // 'execute-dry' (which is a background job), so the only sync step we
+      // hit here is 'scan'. Everything else resolves via _onJobComplete →
+      // _unattendedStepResolve.
       return new Promise(async (resolve) => {
         this._unattendedStepResolve = resolve;
 
         try {
-          // Snapshot result so we can detect failure for sync steps
-          const beforeResult = this.result;
           await this.runStep(step);
 
-          // For background jobs, runStep returns early — wait for _onJobComplete
-          // to call our resolver. For sync steps, runStep awaits completion, so
-          // we resolve here unless a job was started.
-          if (step !== 'analyze' && step !== 'enrich') {
-            // Sync step: check if it failed by examining result
+          // Sync step (scan, execute-commit): runStep awaits completion.
+          // Resolve here based on result.error.
+          if (!this._BACKGROUND_STEPS.has(step)) {
             const failed = this.result && this.result.error;
             this._unattendedStepResolve = null;
             resolve(!failed);
           }
-          // For async steps, _onJobComplete will call resolver with success/failure
+          // For background steps, _onJobComplete will resolve our promise.
         } catch (e) {
           this._unattendedStepResolve = null;
           resolve(false);
