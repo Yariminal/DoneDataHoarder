@@ -1003,6 +1003,14 @@ document.addEventListener('alpine:init', () => {
     activeJobType: null,
     jobState: null,  // 'running', 'paused', 'completed', 'failed', 'cancelled'
     _eventSource: null,
+    // Unattended mode state
+    unattendedMode: false,
+    unattendedQueue: [],
+    unattendedCurrentStep: null,
+    unattendedStartTime: null,
+    unattendedCompletedSteps: [],
+    unattendedFailedStep: null,
+    _unattendedStepResolve: null,
 
     async init() {
       // Check for an active background job (reconnect after page refresh)
@@ -1321,6 +1329,13 @@ document.addEventListener('alpine:init', () => {
       this.progressStartTime = null;
 
       await this._refreshAfterStep();
+
+      // If running in unattended mode, signal step completion
+      if (this._unattendedStepResolve) {
+        const resolver = this._unattendedStepResolve;
+        this._unattendedStepResolve = null;
+        resolver(state === 'completed');
+      }
     },
 
     async _refreshAfterStep() {
@@ -1372,6 +1387,156 @@ document.addEventListener('alpine:init', () => {
       const elapsed = (Date.now() - this.progressStartTime) / 1000;
       if (elapsed < 1) return null;
       return (progress.current / elapsed * 60).toFixed(1);
+    },
+
+    // ==========================================================================
+    // UNATTENDED MODE
+    // Runs the entire pipeline (scan → enrich → dedup → relate → analyze →
+    // propose → organize → execute-dry) automatically, waiting for each step
+    // to finish before starting the next. Does NOT auto-commit changes.
+    // Use case: leave running overnight, review proposals in the morning.
+    // ==========================================================================
+
+    formatElapsed(ms) {
+      const totalSec = Math.round(ms / 1000);
+      const h = Math.floor(totalSec / 3600);
+      const m = Math.floor((totalSec % 3600) / 60);
+      const s = totalSec % 60;
+      if (h > 0) return `${h}h ${m}m`;
+      if (m > 0) return `${m}m ${s}s`;
+      return `${s}s`;
+    },
+
+    unattendedElapsed() {
+      if (!this.unattendedStartTime) return '';
+      return this.formatElapsed(Date.now() - this.unattendedStartTime);
+    },
+
+    async runUnattended() {
+      // If already running, treat click as cancel request
+      if (this.unattendedMode) {
+        if (!confirm('Cancel the unattended run?\n\nThe current step will be cancelled (if possible).')) return;
+        this.unattendedMode = false;
+        this.unattendedQueue = [];
+        this.unattendedCurrentStep = null;
+        // Cancel current background job if active
+        if (this.activeJobId) {
+          try {
+            await api.post(`/pipeline/jobs/${this.activeJobId}/cancel`);
+          } catch (e) { /* ignore */ }
+        }
+        // Resolve any pending step promise as failure
+        if (this._unattendedStepResolve) {
+          const resolver = this._unattendedStepResolve;
+          this._unattendedStepResolve = null;
+          resolver(false);
+        }
+        Alpine.store('app').toast('Unattended run cancelled', 'info');
+        return;
+      }
+
+      // Validate prerequisites before starting
+      const settings = this.getSettings();
+      if (!settings.rootPath) {
+        Alpine.store('app').toast('Select a folder in Setup tab first', 'error');
+        return;
+      }
+      if (!settings.analyzeModel) {
+        Alpine.store('app').toast('Select an analyze model in Setup tab first', 'error');
+        return;
+      }
+      if (!settings.proposeModel) {
+        Alpine.store('app').toast('Select a propose model in Setup tab first', 'error');
+        return;
+      }
+      // Prevent overlap with existing running step
+      if (this.running || this.activeJobId) {
+        Alpine.store('app').toast('Wait for the current step to finish first', 'error');
+        return;
+      }
+
+      const confirmMsg =
+        'Start unattended run?\n\n' +
+        'Will run: scan → enrich → dedup → relate → analyze → propose → organize → dry run\n\n' +
+        'NO changes will be committed to disk. You can review proposals\n' +
+        'and click "Commit" manually when you return.\n\n' +
+        'Estimated time for 500 files: 30-90 minutes';
+      if (!confirm(confirmMsg)) return;
+
+      // Initialize state
+      this.unattendedMode = true;
+      this.unattendedStartTime = Date.now();
+      this.unattendedCompletedSteps = [];
+      this.unattendedFailedStep = null;
+      this.unattendedQueue = [
+        'scan', 'enrich', 'dedup', 'relate', 'analyze',
+        'propose', 'organize', 'execute-dry'
+      ];
+
+      Alpine.store('app').toast('Unattended run started — feel free to step away', 'info');
+
+      // Run each step sequentially
+      while (this.unattendedMode && this.unattendedQueue.length > 0) {
+        const step = this.unattendedQueue.shift();
+        this.unattendedCurrentStep = step;
+
+        const success = await this._runUnattendedStep(step);
+
+        // Check if user cancelled mid-run
+        if (!this.unattendedMode) break;
+
+        if (!success) {
+          this.unattendedFailedStep = step;
+          this.unattendedMode = false;
+          this.unattendedCurrentStep = null;
+          Alpine.store('app').toast(`Unattended run stopped at "${step}"`, 'error');
+          return;
+        }
+
+        this.unattendedCompletedSteps.push(step);
+      }
+
+      // Completed successfully
+      const wasCancelled = !this.unattendedMode && this.unattendedFailedStep === null && this.unattendedQueue.length > 0;
+      this.unattendedMode = false;
+      this.unattendedCurrentStep = null;
+      const elapsedMs = Date.now() - this.unattendedStartTime;
+      const elapsedStr = this.formatElapsed(elapsedMs);
+
+      if (!wasCancelled && this.unattendedFailedStep === null) {
+        Alpine.store('app').toast(
+          `Unattended run complete! (${elapsedStr})\nReview proposals in Proposals tab, then click Commit.`,
+          'success'
+        );
+      }
+    },
+
+    async _runUnattendedStep(step) {
+      // Returns Promise<boolean> — true if step succeeded, false otherwise.
+      // Handles both synchronous steps and background jobs (analyze/enrich).
+      return new Promise(async (resolve) => {
+        this._unattendedStepResolve = resolve;
+
+        try {
+          // Snapshot result so we can detect failure for sync steps
+          const beforeResult = this.result;
+          await this.runStep(step);
+
+          // For background jobs, runStep returns early — wait for _onJobComplete
+          // to call our resolver. For sync steps, runStep awaits completion, so
+          // we resolve here unless a job was started.
+          if (step !== 'analyze' && step !== 'enrich') {
+            // Sync step: check if it failed by examining result
+            const failed = this.result && this.result.error;
+            this._unattendedStepResolve = null;
+            resolve(!failed);
+          }
+          // For async steps, _onJobComplete will call resolver with success/failure
+        } catch (e) {
+          this._unattendedStepResolve = null;
+          resolve(false);
+        }
+      });
     },
   }));
 

@@ -563,6 +563,51 @@
         </div>
       </template>
 
+      <!-- Unattended Mode Card -->
+      <div class="card mb-2" style="max-width:600px; border:2px solid var(--primary);">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+          <div style="flex:1; min-width:200px;">
+            <div class="card-label" style="color:var(--primary);">🌙 Unattended Run</div>
+            <div class="text-sm text-dim mt-1">
+              Runs scan → enrich → dedup → relate → analyze → propose → organize → dry run automatically.
+              <strong>No commit</strong> — review proposals when you return.
+            </div>
+            <!-- Progress display when running -->
+            <template x-if="unattendedMode">
+              <div class="mt-1 text-sm">
+                <div style="color:var(--primary); font-weight:600;">
+                  ⏱ Running: <span x-text="unattendedCurrentStep"></span>
+                  <span class="text-dim" x-text="'(' + unattendedElapsed() + ' elapsed)'"></span>
+                </div>
+                <div class="text-dim mt-1">
+                  Completed:
+                  <template x-for="s in unattendedCompletedSteps" :key="s">
+                    <span style="margin-right:6px;">✓ <span x-text="s"></span></span>
+                  </template>
+                  <template x-if="unattendedCompletedSteps.length === 0"><span>(none yet)</span></template>
+                </div>
+                <div class="text-dim mt-1" x-text="'Remaining: ' + unattendedQueue.length + ' step(s)'"></div>
+              </div>
+            </template>
+            <!-- Show last failure -->
+            <template x-if="!unattendedMode && unattendedFailedStep">
+              <div class="mt-1 text-sm" style="color:var(--danger);">
+                ⚠ Last unattended run stopped at: <strong x-text="unattendedFailedStep"></strong>
+              </div>
+            </template>
+          </div>
+          <div>
+            <button
+              class="btn btn-primary"
+              :class="{ 'btn-danger': unattendedMode }"
+              @click="runUnattended()"
+              :disabled="(running || activeJobId) && !unattendedMode">
+              <span x-text="unattendedMode ? '⏹ Cancel' : '▶ Start Unattended Run'"></span>
+            </button>
+          </div>
+        </div>
+      </div>
+
       <!-- Steps -->
       <div class="pipeline-steps">
         <div class="pipeline-step">
