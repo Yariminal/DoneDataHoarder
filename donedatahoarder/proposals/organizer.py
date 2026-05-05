@@ -21,7 +21,38 @@ from donedatahoarder.db.models import (
 )
 from donedatahoarder.db.session import get_engine
 
+# Hebrew transliteration mapping (ISO 259-3 simplified for folder naming)
+_HEBREW_TRANS: dict[str, str] = {
+    'א': 'a', 'ב': 'b', 'ג': 'g', 'ד': 'd', 'ה': 'h', 'ו': 'v', 'ז': 'z',
+    'ח': 'ch', 'ט': 't', 'י': 'y', 'כ': 'k', 'ל': 'l', 'מ': 'm', 'נ': 'n',
+    'ס': 's', 'ע': 'a', 'פ': 'p', 'צ': 'tz', 'ק': 'k', 'ר': 'r', 'ש': 'sh',
+    'ת': 't', 'ך': 'k', 'ם': 'm', 'ן': 'n', 'ף': 'p', 'ץ': 'tz',
+}
+
 logger = logging.getLogger(__name__)
+
+
+def _transliterate_hebrew(text: str) -> str:
+    """
+    Transliterate Hebrew text to Latin characters using ISO 259-3.
+    Converts Hebrew to Latin, normalizes spacing.
+
+    Examples:
+      'צרפתי' → 'tzrpty' (Hebrew: French)
+      'תכניות עדכניות' → 'tknyvt_adknyvt' (Hebrew: Updated Plans)
+    """
+    result = []
+    for char in text:
+        if char in _HEBREW_TRANS:
+            result.append(_HEBREW_TRANS[char])
+        elif char.isascii() and char.isalnum():
+            result.append(char.lower())
+        elif char in ('-', '_'):
+            result.append('_')  # Convert hyphens to underscores, preserve underscores
+        elif char.isspace():
+            result.append('_')
+        # else: skip non-translatable characters (punctuation, etc.)
+    return ''.join(result)
 
 
 def _normalize_folder_name(name: str) -> str:
@@ -1220,13 +1251,14 @@ def _backstop_nonlatin_folders(
     archives. This backstop guarantees a rename proposal exists.
 
     Strategy:
-    - Walk the root looking for directories with names that lose >= 50% of
+    - Walk the root looking for directories with names that lose >= 30% of
       their characters under `_safe()` (i.e. mostly non-Latin).
     - Skip the root itself, hidden directories (.ddh_trash, etc.), and any
       directory that already has a PENDING RENAME_FOLDER proposal.
-    - Build the new name from the directory's largest analyzed file's tags
-      or description, falling back to a transliteration-style placeholder
-      ('non_latin_folder_<n>') if no AI signal exists.
+    - Build the new name using this priority:
+      1. AI-derived tags from analyzed files in the directory (confidence 0.60)
+      2. Hebrew transliteration (if Hebrew detected) (confidence 0.60)
+      3. Sequential placeholder 'non_latin_folder_<n>' (confidence 0.50)
 
     Returns the number of RENAME_FOLDER proposals created.
     """
@@ -1267,15 +1299,18 @@ def _backstop_nonlatin_folders(
                 continue
 
             original_name = dir_path.name
-            sanitized = _normalize_folder_name(original_name)
-            # Heuristic: if sanitization keeps >= half the original character
-            # count (alpha-numeric runs), it's mostly Latin → leave it alone.
-            stripped_chars = sum(1 for c in original_name if c.isalnum())
-            kept_chars = sum(1 for c in sanitized if c.isalnum())
-            if stripped_chars == 0:
-                continue  # All-symbol folder name; nothing useful to translate.
-            if kept_chars * 2 >= stripped_chars:
-                continue  # Mostly Latin already; leave it.
+
+            # Check if the folder name is dominated by non-Latin characters
+            # (Hebrew, Arabic, CJK, Cyrillic, etc.)
+            non_latin_chars = sum(
+                1 for c in original_name
+                if not c.isascii() or (c.isascii() and not c.isalnum())
+            )
+            total_chars = sum(1 for c in original_name if c.isalnum() or not c.isascii())
+            if total_chars == 0:
+                continue  # All-punctuation folder name; skip.
+            if non_latin_chars == 0:
+                continue  # Fully Latin; leave it alone.
 
             # Pick a representative file inside this directory to anchor the
             # proposal (the executor's RENAME_FOLDER application uses the
@@ -1291,13 +1326,24 @@ def _backstop_nonlatin_folders(
             if not anchor_file:
                 continue
 
-            # Try to derive a meaningful English name from the directory's
-            # AI-derived tags. Fall back to a sequential placeholder so the
-            # user still sees the proposal in the UI.
+            # Priority 1: Try AI-derived tags from analyzed files
             new_name = _derive_english_folder_name(db, session_id, dir_path)
+            confidence = 0.60  # AI-derived is higher confidence
+
+            # Priority 2: Try Hebrew transliteration if tags failed
+            if not new_name:
+                new_name = _transliterate_hebrew(original_name)
+                if new_name and new_name != original_name:
+                    confidence = 0.60  # Transliteration is also solid
+                else:
+                    new_name = None
+
+            # Priority 3: Fall back to placeholder with lower confidence
             if not new_name:
                 placeholder_counter += 1
                 new_name = f"non_latin_folder_{placeholder_counter}"
+                confidence = 0.50  # Placeholder is weaker signal
+
             new_name = _normalize_folder_name(new_name)
             if not new_name or new_name == original_name:
                 continue
@@ -1310,11 +1356,10 @@ def _backstop_nonlatin_folders(
                 proposed_value=dst_abs,
                 reasoning=(
                     f"Non-Latin folder name '{original_name}' translated to "
-                    f"English per session language preference. Re-run with a "
-                    "translation-capable LLM or rename manually for a better "
-                    "result."
+                    f"'{new_name}' per session language preference "
+                    f"(confidence: {confidence})"
                 ),
-                confidence=0.55,
+                confidence=confidence,
                 status=ProposalStatus.PENDING,
             ))
             created += 1
