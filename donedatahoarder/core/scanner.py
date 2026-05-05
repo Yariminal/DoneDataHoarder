@@ -3,6 +3,8 @@ Filesystem scanner — walks a directory tree and populates the file index.
 
 Designed to be resumable: already-indexed files are skipped by default.
 All writes are batched (BATCH_SIZE) to keep SQLite happy on large drives.
+
+Respects .ddhignore files in the root directory (gitignore-style patterns).
 """
 import os
 import sys
@@ -19,6 +21,7 @@ from sqlalchemy.orm import Session
 from donedatahoarder.db.models import File, FileStatus, ScanSession
 from donedatahoarder.db.session import get_engine
 from donedatahoarder.logging import get_logger
+from donedatahoarder.core.ignore import load_ddhignore
 
 logger = get_logger(__name__)
 
@@ -71,22 +74,45 @@ SKIP_FILENAME_PREFIXES: tuple[str, ...] = ("._",)
 
 
 def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[Path]:
-    """Yield Path objects for every regular file under *root*."""
+    """
+    Yield Path objects for every regular file under *root*.
+
+    Respects:
+    - Built-in skip lists (SKIP_DIRS, SKIP_EXTENSIONS, SKIP_FILENAMES)
+    - .ddhignore file in root (gitignore-style patterns)
+    - extra_skip_dirs parameter
+    """
     skip = SKIP_DIRS | (extra_skip_dirs or set())
+    ddhignore = load_ddhignore(root)
 
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirpath_obj = Path(dirpath)
+
         # Prune unwanted dirs in-place so os.walk won't descend into them
-        dirnames[:] = [
-            d for d in dirnames
-            if d not in skip and not d.startswith(".")
-        ]
+        dirnames_filtered = []
+        for d in dirnames:
+            if d in skip or d.startswith("."):
+                continue
+            # Check .ddhignore patterns
+            dir_path = dirpath_obj / d
+            if ddhignore.should_ignore(dir_path, is_dir=True):
+                continue
+            dirnames_filtered.append(d)
+
+        dirnames[:] = dirnames_filtered
+
         for name in filenames:
             # Skip by filename pattern (system metadata, macOS AppleDouble, etc.)
             if name in SKIP_FILENAMES or name.startswith(SKIP_FILENAME_PREFIXES):
                 continue
             # Skip by extension
-            if Path(name).suffix.lower() not in SKIP_EXTENSIONS:
-                yield Path(dirpath) / name
+            if Path(name).suffix.lower() in SKIP_EXTENSIONS:
+                continue
+            # Check .ddhignore patterns
+            file_path = dirpath_obj / name
+            if ddhignore.should_ignore(file_path, is_dir=False):
+                continue
+            yield file_path
 
 
 # ---------------------------------------------------------------------------
