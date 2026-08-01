@@ -595,6 +595,13 @@ If no meaningful groups found, return [].
 # Singleton-to-folder linkage
 # ---------------------------------------------------------------------------
 
+def _singularize(token: str) -> str:
+    """Naive plural normalization: 'fonts' -> 'font'. Leaves short tokens alone."""
+    if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
 def _link_singletons_to_folder_groups(
     session: Session,
     session_id: str,
@@ -649,23 +656,30 @@ def _link_singletons_to_folder_groups(
         for group in candidate_groups:
             group_label = group.label.lower()
 
-            # Try numeric prefix match (e.g. "108" in group "project_10_8")
+            # Numeric prefix match: the prefix must appear as a whole token
+            # in the label ("_108_" boundary), or equal the label's digits
+            # with separators stripped ("108" vs "project_10_8" -> "108").
+            # Plain substring matching would falsely link "108" to labels
+            # like "drawings_1080p".
+            matched = False
             if numeric_prefix:
-                underscore_prefix = f"_{numeric_prefix}_"
-                dot_prefix = numeric_prefix.replace("_", ".")
-                if underscore_prefix in group_label or dot_prefix in group_label or \
-                   group_label.startswith(f"project_{numeric_prefix}_"):
-                    # Found a match
-                    session.add(RelationMember(
-                        group_id=group.id,
-                        file_id=singleton.id,
-                        role=RelationRole.SIBLING,
-                    ))
-                    linked += 1
-                    break
+                bounded_label = f"_{group_label}_"
+                label_digits = re.sub(r"\D", "", group_label)
+                if (
+                    f"_{numeric_prefix}_" in bounded_label
+                    or (label_digits and label_digits == numeric_prefix)
+                ):
+                    matched = True
 
-            # Try alpha token match (e.g. "fonts" in "font_configurations")
-            if alpha_token and group_label.startswith(alpha_token):
+            # Alpha token match: compare against the label's first token with
+            # naive plural normalization so "fonts" links to
+            # "font_configurations".
+            if not matched and alpha_token:
+                first_label_token = group_label.split("_", 1)[0]
+                if len(first_label_token) >= 4 and _singularize(first_label_token) == _singularize(alpha_token):
+                    matched = True
+
+            if matched:
                 session.add(RelationMember(
                     group_id=group.id,
                     file_id=singleton.id,
@@ -863,7 +877,7 @@ def relate(
                 logger.info("Linked %d singletons to folder groups", linked)
         except Exception:
             # Best-effort — don't break the pipeline
-            pass
+            logger.warning("Singleton-to-folder linkage failed", exc_info=True)
 
     return summary
 

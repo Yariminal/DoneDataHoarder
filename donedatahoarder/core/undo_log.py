@@ -233,21 +233,24 @@ def undo_operations(
                 counts["undone"] += 1
                 undone_entries.append(entry)
 
-            elif op == "DELETE" or op == "TRASH":
-                # Reverse: move from trash back to original location
-                # Trash files are stored in .ddh_trash folder
-                trash_dir = original.parent / ".ddh_trash"
-                trash_path = trash_dir / original.name
-
-                # Try to find the file in trash
+            elif op in ("DELETE", "TRASH", "JUNK_TRASH"):
+                # Reverse: move from trash back to original location.
+                # The log's new_path records the exact trash destination
+                # (session-root .ddh_trash, possibly with a collision suffix)
+                # — prefer it over re-deriving the location.
+                trash_path = new
                 if not trash_path.exists():
-                    # Look for numbered variants
-                    stem, suffix = original.stem, original.suffix
-                    for i in range(1, 100):
-                        alt = trash_dir / f"{stem}_{i}{suffix}"
-                        if alt.exists():
-                            trash_path = alt
-                            break
+                    # Fallback for old log entries: look next to the original
+                    trash_dir = original.parent / ".ddh_trash"
+                    trash_path = trash_dir / original.name
+                    if not trash_path.exists():
+                        # Look for numbered variants
+                        stem, suffix = original.stem, original.suffix
+                        for i in range(1, 100):
+                            alt = trash_dir / f"{stem}_{i}{suffix}"
+                            if alt.exists():
+                                trash_path = alt
+                                break
 
                 if not trash_path.exists():
                     con.print(f"  [red]✗[/red] {op}: File not in trash {original.name}")

@@ -54,6 +54,28 @@ def save_results(result_type: str, data: Dict[str, Any], name: Optional[str] = N
     return filename
 
 
+def _safe_result_path(filename: str) -> Optional[Path]:
+    """
+    Resolve *filename* to a path inside RESULTS_DIR, or None if it is unsafe.
+
+    Rejects path separators, parent references, and non-.json names so a
+    crafted filename from the web API can never escape the results folder.
+    """
+    if (
+        not filename
+        or filename != Path(filename).name
+        or "/" in filename
+        or "\\" in filename
+        or filename.startswith(".")
+        or not filename.endswith(".json")
+    ):
+        return None
+    filepath = (RESULTS_DIR / filename).resolve()
+    if filepath.parent != RESULTS_DIR.resolve():
+        return None
+    return filepath
+
+
 def load_results(filename: str) -> Optional[Dict[str, Any]]:
     """
     Load a previously saved result snapshot.
@@ -64,9 +86,9 @@ def load_results(filename: str) -> Optional[Dict[str, Any]]:
     Returns:
         The result data, or None if file not found
     """
-    filepath = RESULTS_DIR / filename
+    filepath = _safe_result_path(filename)
 
-    if not filepath.exists():
+    if filepath is None or not filepath.exists():
         return None
 
     with open(filepath, "r") as f:
@@ -110,9 +132,9 @@ def delete_results(filename: str) -> bool:
     Returns:
         True if deleted, False if not found
     """
-    filepath = RESULTS_DIR / filename
+    filepath = _safe_result_path(filename)
 
-    if not filepath.exists():
+    if filepath is None or not filepath.exists():
         return False
 
     filepath.unlink()

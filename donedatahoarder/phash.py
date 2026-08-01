@@ -187,7 +187,10 @@ def hash_distance(hash_a: str, hash_b: str) -> Optional[int]:
     try:
         a = imagehash.hex_to_hash(hash_a)
         b = imagehash.hex_to_hash(hash_b)
-        return abs(a - b)
+        # imagehash subtraction returns a numpy integer — convert to a native
+        # int so callers (JSON serialization, DB writes, comparisons) never
+        # see numpy types.
+        return int(abs(a - b))
     except Exception:
         return None
 
@@ -203,4 +206,4 @@ def is_near_duplicate(hash_a: str, hash_b: str, threshold: Optional[int] = None)
     dist = hash_distance(hash_a, hash_b)
     if dist is None:
         return False
-    return dist <= threshold
+    return bool(dist <= threshold)

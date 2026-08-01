@@ -69,6 +69,12 @@ SKIP_FILENAMES: set[str] = {
     ".DS_Store", "Thumbs.db", "desktop.ini", "._.DS_Store",
 }
 
+# Subset of SKIP_EXTENSIONS that is safe to physically move to trash during
+# post-execute cleanup. SKIP_EXTENSIONS exists to keep files out of the AI
+# pipeline — it includes .exe, .db, .ini, .dat, .log, which are legitimate
+# archive content that must never be swept off disk automatically.
+JUNK_FILE_EXTENSIONS: set[str] = {".tmp", ".part", ".ctb", ".plt"}
+
 # Filename prefixes that indicate system/metadata files (macOS AppleDouble)
 SKIP_FILENAME_PREFIXES: tuple[str, ...] = ("._",)
 

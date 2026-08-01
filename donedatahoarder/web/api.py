@@ -1646,9 +1646,8 @@ def list_subfolders(root_path: str):
     completed_paths: set[str] = set()
     try:
         with Session(engine) as db:
-            if "completed_folders" in [t.name for t in db.get_bind().dialect.get_table_names(db.get_bind()) if False] or True:
-                rows = db.query(CF.folder_path).filter(CF.root_path == root_path).all()
-                completed_paths = {r.folder_path for r in rows}
+            rows = db.query(CF.folder_path).filter(CF.root_path == root_path).all()
+            completed_paths = {r.folder_path for r in rows}
     except Exception:
         pass
 

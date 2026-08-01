@@ -126,33 +126,10 @@ def _write_windows_properties(path: Path, tags: list[str], description: str) -> 
         except ImportError:
             pass
 
-        # Attempt 2: PowerShell fallback (available on all Windows systems)
-        # Uses Set-ItemProperty to write extended attributes
-        if description or tags:
-            keywords = "; ".join(tags) if tags else ""
-            title = " | ".join(tags[:3]) if tags else (description[:50] if description else "")
-
-            ps_cmd = (
-                f'Set-ItemProperty -LiteralPath "{path}" -Name "System.Subject" '
-                f'-Value "{title.replace(chr(34), chr(34) + chr(34))}" -ErrorAction SilentlyContinue; '
-                f'Set-ItemProperty -LiteralPath "{path}" -Name "System.Keywords" '
-                f'-Value "{keywords.replace(chr(34), chr(34) + chr(34))}" -ErrorAction SilentlyContinue; '
-                f'Set-ItemProperty -LiteralPath "{path}" -Name "System.Comment" '
-                f'-Value "{description.replace(chr(34), chr(34) + chr(34))}" -ErrorAction SilentlyContinue'
-            )
-
-            import subprocess
-            try:
-                subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", ps_cmd],
-                    capture_output=True,
-                    timeout=5,
-                    check=False,
-                )
-                return True
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                pass
-
+        # No PowerShell fallback: Set-ItemProperty cannot write shell
+        # properties (System.Subject etc.) on regular files, and building a
+        # command string from filenames / AI-generated text is a command
+        # injection risk. Tags are always preserved in the database.
         return False
     except Exception:
         # Silently fail — Windows property writing is opportunistic
@@ -162,6 +139,19 @@ def _write_windows_properties(path: Path, tags: list[str], description: str) -> 
 # ---------------------------------------------------------------------------
 # Core execution
 # ---------------------------------------------------------------------------
+
+def _replace_path_prefix(value: str, old_prefix: str, new_prefix: str) -> str:
+    """
+    Replace *old_prefix* at the start of *value* only when it ends on a path
+    boundary. Returns *value* unchanged otherwise — so `C:\\x\\ab` never
+    matches inside `C:\\x\\abc\\file.txt`.
+    """
+    if value == old_prefix:
+        return new_prefix
+    for sep in ("\\", "/"):
+        if value.startswith(old_prefix + sep):
+            return new_prefix + value[len(old_prefix):]
+    return value
 
 def _apply_rename(
     proposal: Proposal, dry_run: bool, session_id: str | None = None
@@ -308,19 +298,26 @@ def _apply_rename_folder(
     except OSError as exc:
         return False, f"Rename failed: {exc}"
 
-    # Update all File records whose paths start with the old folder path
+    # Update all File records whose paths start with the old folder path.
+    # The LIKE is only a prefilter (its wildcards can over-match); the real
+    # path-boundary check happens in Python so a rename of `...\ab` never
+    # rewrites files under a sibling `...\abc`.
     src_str = str(src)
     dst_str = str(dst)
-    files_in_folder = (
+    candidates = (
         db_session.query(File)
         .filter(File.path.like(f"{src_str}%"))
         .all()
     )
-    for f in files_in_folder:
-        f.path = f.path.replace(src_str, dst_str, 1)
-        f.filename = Path(f.path).name
+    updated = 0
+    for f in candidates:
+        new_path = _replace_path_prefix(f.path, src_str, dst_str)
+        if new_path != f.path:
+            f.path = new_path
+            f.filename = Path(new_path).name
+            updated += 1
 
-    return True, f"Renamed folder: {src.name} -> {dst.name} ({len(files_in_folder)} files updated)"
+    return True, f"Renamed folder: {src.name} -> {dst.name} ({updated} files updated)"
 
 
 def _delete_duplicate(
@@ -456,7 +453,6 @@ def execute(
     con = _console or console
     engine = get_engine()
     counts = {"applied": 0, "failed": 0, "skipped": 0}
-    move_source_dirs: set[Path] = set()
 
     if dry_run:
         con.print("[bold yellow]DRY RUN -- no files will be changed[/bold yellow]\n")
@@ -534,10 +530,10 @@ def execute(
                         for other in proposals:
                             if other is prop or other.status == ProposalStatus.APPLIED:
                                 continue
-                            if other.current_value and old_prefix in other.current_value:
-                                other.current_value = other.current_value.replace(old_prefix, new_prefix, 1)
-                            if other.proposed_value and old_prefix in other.proposed_value:
-                                other.proposed_value = other.proposed_value.replace(old_prefix, new_prefix, 1)
+                            if other.current_value:
+                                other.current_value = _replace_path_prefix(other.current_value, old_prefix, new_prefix)
+                            if other.proposed_value:
+                                other.proposed_value = _replace_path_prefix(other.proposed_value, old_prefix, new_prefix)
                         # Pre-mark any MOVE proposals that became no-ops after the rename
                         # (source == destination means the file is already where it should be)
                         for other in proposals:
@@ -747,9 +743,11 @@ def _cleanup_junk_files(
     # Mirror the scanner's filter lists so this cleanup never trashes a file
     # the scanner would have indexed. Importing rather than redefining keeps
     # the two in lockstep — add a junk type to the scanner and the cleanup
-    # picks it up automatically.
+    # picks it up automatically. Note: JUNK_FILE_EXTENSIONS (not
+    # SKIP_EXTENSIONS) — skipping a file from indexing is a much weaker
+    # statement than physically moving it off disk.
     from donedatahoarder.core.scanner import (
-        SKIP_FILENAMES, SKIP_FILENAME_PREFIXES, SKIP_EXTENSIONS, SKIP_DIRS,
+        SKIP_FILENAMES, SKIP_FILENAME_PREFIXES, JUNK_FILE_EXTENSIONS, SKIP_DIRS,
     )
 
     trash_dir = root / ".ddh_trash"
@@ -767,7 +765,7 @@ def _cleanup_junk_files(
             is_junk = (
                 name in SKIP_FILENAMES
                 or name.startswith(SKIP_FILENAME_PREFIXES)
-                or Path(name).suffix.lower() in SKIP_EXTENSIONS
+                or Path(name).suffix.lower() in JUNK_FILE_EXTENSIONS
             )
             if not is_junk:
                 continue

@@ -31,7 +31,12 @@ DEFAULT_HOST = "http://localhost:11434"
 _OLLAMA_REQUEST_LOCK = threading.Semaphore(1)
 DEFAULT_TEXT_MODEL = "gemma3:12b"
 DEFAULT_VISION_MODEL = "gemma3:12b"  # gemma3 is multimodal
-TIMEOUT = int(os.environ.get("DATAHOARDER_OLLAMA_TIMEOUT", "300"))  # seconds; env-var override available
+# Seconds; overridable via DATAHOARDER_OLLAMA_TIMEOUT. A malformed value
+# must not crash the app at import time — fall back to the default.
+try:
+    TIMEOUT = int(os.environ.get("DATAHOARDER_OLLAMA_TIMEOUT", "300"))
+except ValueError:
+    TIMEOUT = 300
 
 # Approximate context lengths for common Ollama models
 _CONTEXT_LENGTHS: dict[str, int] = {

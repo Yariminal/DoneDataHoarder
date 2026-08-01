@@ -140,13 +140,19 @@ class JobManager:
         return job
 
     def _finish_job(self, job: JobInfo, state: JobState, error: str | None = None):
-        job.state = state
-        job.error = error
-        job.finished_at = datetime.utcnow()
-        # Clear active job ID so new jobs can start
+        # Idempotent: force_cancel() finishes the job immediately, then the
+        # worker thread calls this again when its generator unwinds. Finishing
+        # twice would double-release the wake lock (killing the lock held by a
+        # newer job) and clobber the CANCELLED state.
         with self._lock:
+            if job.finished_at is not None:
+                return
+            job.finished_at = datetime.utcnow()
+            # Clear active job ID so new jobs can start
             if self._active_job_id == job.job_id:
                 self._active_job_id = None
+        job.state = state
+        job.error = error
         # Release the system wake lock acquired in _create_job.
         from donedatahoarder.core import wake_lock
         wake_lock.release()
