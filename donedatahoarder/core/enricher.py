@@ -8,6 +8,7 @@ import hashlib
 import mimetypes
 import threading
 from datetime import datetime
+from donedatahoarder.timeutils import utcnow
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -228,7 +229,7 @@ def enrich(workers: int = 1, limit: Optional[int] = None, session_id: str | None
                         )
 
                         file_rec.status = FileStatus.ENRICHED
-                        file_rec.enriched_at = datetime.utcnow()
+                        file_rec.enriched_at = utcnow()
                         counts["enriched"] += 1
 
                     except Exception as exc:
@@ -338,7 +339,7 @@ def enrich_with_progress(
                     )
 
                     file_rec.status = FileStatus.ENRICHED
-                    file_rec.enriched_at = datetime.utcnow()
+                    file_rec.enriched_at = utcnow()
                     counts["enriched"] += 1
                 except Exception as exc:
                     file_rec.status = FileStatus.ERROR

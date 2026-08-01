@@ -11,6 +11,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from donedatahoarder.timeutils import utcnow
+
 
 class Base(DeclarativeBase):
     pass
@@ -34,9 +36,9 @@ class UserSession(Base):
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
     )
     name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime, default=utcnow, onupdate=utcnow
     )
     last_saved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
@@ -210,7 +212,7 @@ class Proposal(Base):
     )
     user_notes: Mapped[Optional[str]] = mapped_column(Text)
 
-    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=utcnow)
     applied_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     file: Mapped["File"] = relationship("File", back_populates="proposals")
@@ -276,7 +278,7 @@ class ScanSession(Base):
         nullable=True, index=True,
     )
     root_path: Mapped[str] = mapped_column(String, nullable=False)
-    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     files_found: Mapped[int] = mapped_column(Integer, default=0)
     files_new: Mapped[int] = mapped_column(Integer, default=0)
@@ -320,7 +322,7 @@ class RelationGroup(Base):
     scope: Mapped[str] = mapped_column(String, default="per_directory")
     # Parent directory for per_directory groups (null for cross_directory).
     dir_path: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     members: Mapped[list["RelationMember"]] = relationship(
         "RelationMember", back_populates="group", cascade="all, delete-orphan"
@@ -361,5 +363,5 @@ class CompletedFolder(Base):
         String(36), ForeignKey("sessions.id", ondelete="SET NULL"),
         nullable=True, index=True,
     )
-    completed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    completed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     root_path: Mapped[str] = mapped_column(String, nullable=False)

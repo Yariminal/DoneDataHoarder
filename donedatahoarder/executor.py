@@ -9,6 +9,7 @@ import os
 import sys
 import shutil
 from datetime import datetime
+from donedatahoarder.timeutils import utcnow
 from pathlib import Path
 from typing import Optional
 
@@ -38,21 +39,21 @@ def _make_quiet_console() -> Console:
 # ---------------------------------------------------------------------------
 
 def _write_exif_comment(path: Path, comment: str) -> bool:
-    """Embed a comment/description into image EXIF using Pillow."""
+    """Embed a comment/description into image EXIF without re-encoding pixels."""
     try:
-        from PIL import Image
         import piexif
 
-        with Image.open(path) as img:
-            exif_bytes = img.info.get("exif", b"")
-            if exif_bytes:
-                exif_dict = piexif.load(exif_bytes)
-            else:
-                exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
+        try:
+            exif_dict = piexif.load(str(path))
+        except Exception:
+            exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
 
-            exif_dict["0th"][piexif.ImageIFD.ImageDescription] = comment.encode("utf-8", errors="replace")
-            new_exif = piexif.dump(exif_dict)
-            img.save(path, exif=new_exif)
+        exif_dict["0th"][piexif.ImageIFD.ImageDescription] = comment.encode("utf-8", errors="replace")
+        new_exif = piexif.dump(exif_dict)
+        # piexif.insert rewrites only the EXIF segment in place — unlike
+        # Image.save(), it never re-encodes the JPEG data, so repeated tag
+        # writes cause no generation loss.
+        piexif.insert(new_exif, str(path))
         return True
     except Exception:
         return False
@@ -545,7 +546,7 @@ def execute(
                                 and other.current_value == other.proposed_value
                             ):
                                 other.status = ProposalStatus.APPLIED
-                                other.applied_at = datetime.utcnow()
+                                other.applied_at = utcnow()
                                 counts["applied"] += 1
                                 con.print(f"  [dim]Skipped no-op move (folder renamed in-place): {Path(other.current_value).name}[/dim]")
 
@@ -568,7 +569,7 @@ def execute(
                     counts["applied"] += 1
                     if not dry_run:
                         prop.status = ProposalStatus.APPLIED
-                        prop.applied_at = datetime.utcnow()
+                        prop.applied_at = utcnow()
                         if file_rec and prop.proposal_type in (ProposalType.RENAME, ProposalType.MOVE, ProposalType.RENAME_FOLDER):
                             file_rec.status = FileStatus.APPLIED
                     color = "green"

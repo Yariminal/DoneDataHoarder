@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 from datetime import datetime, timedelta
+from donedatahoarder.timeutils import utcnow
 from typing import Optional
 
 
@@ -57,7 +58,7 @@ class CircuitBreaker:
                 return True
             if self._state == "open":
                 if self._last_failure_time and (
-                    datetime.utcnow() - self._last_failure_time >= self.recovery_timeout
+                    utcnow() - self._last_failure_time >= self.recovery_timeout
                 ):
                     self._state = "half-open"
                     return True
@@ -78,7 +79,7 @@ class CircuitBreaker:
     def record_failure(self) -> None:
         with self._lock:
             self._failures += 1
-            self._last_failure_time = datetime.utcnow()
+            self._last_failure_time = utcnow()
             if self._state == "half-open":
                 # Test call failed → back to open
                 self._state = "open"

@@ -11,6 +11,7 @@ import shutil
 import string
 import subprocess
 from datetime import datetime
+from donedatahoarder.timeutils import utcnow
 from pathlib import Path
 from typing import Optional
 
@@ -337,7 +338,7 @@ def update_session_settings(session_id: str, body: UpdateSessionSettingsRequest)
             user_session.relate_scope = body.relate_scope
 
         user_session.is_unsaved = True
-        user_session.updated_at = datetime.utcnow()
+        user_session.updated_at = utcnow()
         session.commit()
 
         return {"status": "ok"}
@@ -365,8 +366,8 @@ def save_session(session_id: str, body: SaveSessionRequest):
             user_session.name = body.name.strip()
 
         user_session.is_unsaved = False
-        user_session.last_saved_at = datetime.utcnow()
-        user_session.updated_at = datetime.utcnow()
+        user_session.last_saved_at = utcnow()
+        user_session.updated_at = utcnow()
         session.commit()
 
         return {
@@ -387,7 +388,7 @@ def mark_session_dirty(session_id: str):
             raise HTTPException(404, "Session not found")
 
         user_session.is_unsaved = True
-        user_session.updated_at = datetime.utcnow()
+        user_session.updated_at = utcnow()
         session.commit()
 
     return {"id": session_id, "is_unsaved": True}
@@ -458,7 +459,7 @@ def _mark_session_unsaved(session_id: str, step: str | None = None) -> None:
         user_session = session.get(UserSession, session_id)
         if user_session:
             user_session.is_unsaved = True
-            user_session.updated_at = datetime.utcnow()
+            user_session.updated_at = utcnow()
             if user_session.status == SessionStatus.NEW:
                 user_session.status = SessionStatus.ACTIVE
             if step:

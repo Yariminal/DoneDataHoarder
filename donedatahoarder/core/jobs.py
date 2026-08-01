@@ -13,6 +13,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from donedatahoarder.timeutils import utcnow
 from typing import Generator, Optional
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,7 @@ class JobInfo:
     state: JobState = JobState.RUNNING
     progress: dict = field(default_factory=dict)
     error: Optional[str] = None
-    started_at: datetime = field(default_factory=datetime.utcnow)
+    started_at: datetime = field(default_factory=utcnow)
     finished_at: Optional[datetime] = None
 
     # Threading controls
@@ -117,6 +118,10 @@ class JobManager:
         self._active_job_id: Optional[str] = None
         self._lock = threading.Lock()
 
+    # Finished jobs kept for status queries; older ones are evicted so the
+    # registry doesn't grow unboundedly in a long-lived server process.
+    MAX_FINISHED_JOBS = 20
+
     def _create_job(self, job_type: str, session_id: str) -> JobInfo:
         with self._lock:
             # Prevent starting a new job while one is active
@@ -127,6 +132,14 @@ class JobManager:
                         f"A {active.job_type} job is already {active.state.value}. "
                         "Pause or cancel it first."
                     )
+
+            # Evict oldest finished jobs beyond the retention cap
+            finished = sorted(
+                (j for j in self._jobs.values() if j.finished_at is not None),
+                key=lambda j: j.finished_at,
+            )
+            for old in finished[: max(0, len(finished) - self.MAX_FINISHED_JOBS)]:
+                del self._jobs[old.job_id]
 
             job_id = str(uuid.uuid4())[:8]
             job = JobInfo(job_id=job_id, job_type=job_type, session_id=session_id)
@@ -147,7 +160,7 @@ class JobManager:
         with self._lock:
             if job.finished_at is not None:
                 return
-            job.finished_at = datetime.utcnow()
+            job.finished_at = utcnow()
             # Clear active job ID so new jobs can start
             if self._active_job_id == job.job_id:
                 self._active_job_id = None

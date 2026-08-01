@@ -3,6 +3,7 @@ import json
 import re
 from abc import ABC, abstractmethod
 from datetime import datetime
+from donedatahoarder.timeutils import utcnow
 from pathlib import Path as _Path
 from typing import Optional
 
@@ -211,5 +212,5 @@ class BaseAnalyzer(ABC):
                 f.date_best = result.detected_date
                 # Do NOT set date_exif — that column is reserved for real EXIF metadata
             f.status = FileStatus.ANALYZED
-            f.analyzed_at = datetime.utcnow()
+            f.analyzed_at = utcnow()
             session.commit()

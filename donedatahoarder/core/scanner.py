@@ -9,6 +9,7 @@ Respects .ddhignore files in the root directory (gitignore-style patterns).
 import os
 import sys
 from datetime import datetime
+from donedatahoarder.timeutils import utcnow
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -259,7 +260,7 @@ def _collect_file_stat(
             date_created=date_created,
             date_created_source=date_created_source,
             status=FileStatus.PENDING,
-            scanned_at=datetime.utcnow(),
+            scanned_at=utcnow(),
         )
         if date_warning:
             record["error_message"] = date_warning
@@ -297,7 +298,7 @@ def scan(
     with Session(engine) as session:
         sess_kwargs = dict(
             root_path=str(root.resolve()),
-            started_at=datetime.utcnow(),
+            started_at=utcnow(),
         )
         if session_id:
             sess_kwargs["session_id"] = session_id
@@ -440,7 +441,7 @@ def scan(
     with Session(engine) as session:
         sess_record = session.get(ScanSession, scan_session_id)
         if sess_record:
-            sess_record.finished_at = datetime.utcnow()
+            sess_record.finished_at = utcnow()
             sess_record.files_new = counts["new"]
             sess_record.files_skipped = counts["skipped"]
             sess_record.files_error = counts["errors"]
