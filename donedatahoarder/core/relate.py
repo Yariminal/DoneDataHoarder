@@ -912,6 +912,7 @@ def relate_with_progress(
       {"cancelled": True, ...}                                       on cancel
       {"done": True, "directories": ..., "groups": ..., ...}         terminal
     """
+    import contextvars
     import queue
     import threading
 
@@ -945,8 +946,12 @@ def relate_with_progress(
             from donedatahoarder.ai.router import get_client
             try:
                 client = get_client()
-            except RuntimeError:
+            except RuntimeError as exc:
                 client = None
+                logger.warning(
+                    "Relate: no AI client available (%s) — "
+                    "falling back to regex backstop only", exc,
+                )
             summary = relate(
                 session_id=session_id,
                 scope=scope,
@@ -969,7 +974,13 @@ def relate_with_progress(
     import contextlib
     import io
     with contextlib.redirect_stdout(io.StringIO()):
-        worker = threading.Thread(target=_runner, daemon=True, name="relate-worker")
+        # Run the worker inside a copy of the caller's context: the AI provider
+        # is bound via a contextvar (init_ai in the job thread), and contextvars
+        # do not propagate into new threads on their own.
+        ctx = contextvars.copy_context()
+        worker = threading.Thread(
+            target=ctx.run, args=(_runner,), daemon=True, name="relate-worker"
+        )
         worker.start()
 
         while True:

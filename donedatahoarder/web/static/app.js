@@ -1260,7 +1260,7 @@ document.addEventListener('alpine:init', () => {
         body.backend = settings.backend;
         body.model = settings.analyzeModel || settings.model;
         body.workers = settings.workers;
-      } else if (type === 'relate' || type === 'organize') {
+      } else if (type === 'relate' || type === 'organize' || type === 'propose') {
         body.backend = settings.backend;
         body.model = settings.proposeModel || settings.model;
       } else if (type === 'execute-dry') {

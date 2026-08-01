@@ -293,6 +293,7 @@ def generate_proposals_with_progress(
       {"done": True, "rename": ..., "tags": ..., ...}     terminal
     """
     import contextlib
+    import contextvars
     import io
     import queue
     import threading
@@ -322,7 +323,13 @@ def generate_proposals_with_progress(
             error_holder[0] = exc
             result_queue.put(sentinel_error)
 
-    worker = threading.Thread(target=_runner, daemon=True, name="propose-worker")
+    # Run the worker inside a copy of the caller's context: the AI provider
+    # (used by translate_filename) is bound via a contextvar, and contextvars
+    # do not propagate into new threads on their own.
+    ctx = contextvars.copy_context()
+    worker = threading.Thread(
+        target=ctx.run, args=(_runner,), daemon=True, name="propose-worker"
+    )
     worker.start()
 
     while True:

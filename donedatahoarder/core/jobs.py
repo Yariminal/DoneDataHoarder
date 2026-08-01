@@ -347,7 +347,12 @@ class JobManager:
         threading.Thread(target=run, daemon=True, name=f"job-{job.job_id}").start()
         return job.job_id
 
-    def start_propose(self, session_id: str) -> str:
+    def start_propose(
+        self,
+        session_id: str,
+        backend: str = "ollama",
+        model: str = "gemma3:12b",
+    ) -> str:
         """Start a propose job in a background thread. Returns job_id."""
         job = self._create_job("propose", session_id)
 
@@ -361,6 +366,9 @@ class JobManager:
                     cancel_check=lambda: job.cancel_flag,
                 ),
                 step_name="propose",
+                # Propose needs an AI client for filename translation when the
+                # session's preferred_language is not "leave_as_is".
+                init_ai_kwargs={"backend": backend, "text_model": model, "vision_model": model},
             )
 
         threading.Thread(target=run, daemon=True, name=f"job-{job.job_id}").start()

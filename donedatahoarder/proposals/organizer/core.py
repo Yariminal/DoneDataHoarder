@@ -434,6 +434,7 @@ def generate_reorg_proposals_with_progress(
       {"done": True, "move": ..., "folder_rename": ..., ...} terminal
     """
     import contextlib
+    import contextvars
     import io
     import queue
     import threading
@@ -462,7 +463,13 @@ def generate_reorg_proposals_with_progress(
             error_holder[0] = exc
             result_queue.put(sentinel_error)
 
-    worker = threading.Thread(target=_runner, daemon=True, name="organize-worker")
+    # Run the worker inside a copy of the caller's context: the AI provider
+    # (used by generate_reorg_proposals) is bound via a contextvar, and
+    # contextvars do not propagate into new threads on their own.
+    ctx = contextvars.copy_context()
+    worker = threading.Thread(
+        target=ctx.run, args=(_runner,), daemon=True, name="organize-worker"
+    )
     worker.start()
 
     while True:
