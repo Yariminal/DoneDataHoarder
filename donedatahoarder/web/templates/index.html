@@ -6,7 +6,7 @@
   <title>DoneDataHoarder</title>
   <link rel="stylesheet" href="/static/style.css">
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
-  <script src="/static/app.js?v=7_ctxfix"></script>
+  <script src="/static/app.js?v=8_modals"></script>
 </head>
 <body x-data x-init="$store.app.tab = 'home'">
 
@@ -1089,6 +1089,29 @@
     </section>
 
   </main>
+</div>
+
+<!-- In-app modal — replaces native confirm()/prompt(), which are
+     suppressed (auto-dismissed) in embedded browser contexts -->
+<div x-show="$store.modal.visible" x-cloak
+     style="position:fixed; inset:0; background:rgba(0,0,0,0.55); display:flex; align-items:center; justify-content:center; z-index:2000;"
+     @keydown.escape.window="$store.modal.visible && $store.modal.cancel()"
+     @click.self="$store.modal.cancel()">
+  <div class="card" style="max-width:460px; width:92%; box-shadow:0 12px 40px rgba(0,0,0,0.5);">
+    <div style="white-space:pre-line; line-height:1.5; margin-bottom:16px;" x-text="$store.modal.message"></div>
+    <template x-if="$store.modal.isPrompt">
+      <input type="text" class="input" style="width:100%; margin-bottom:16px;"
+             x-model="$store.modal.inputValue"
+             @keydown.enter="$store.modal.ok()"
+             x-init="$nextTick(() => $el.focus())">
+    </template>
+    <div style="display:flex; justify-content:flex-end; gap:8px;">
+      <button class="btn btn-outline btn-sm" @click="$store.modal.cancel()"
+              x-text="$store.modal.cancelText"></button>
+      <button class="btn btn-sm" :class="$store.modal.danger ? 'btn-danger' : 'btn-primary'"
+              @click="$store.modal.ok()" x-text="$store.modal.okText"></button>
+    </div>
+  </div>
 </div>
 
 <!-- Toast container -->

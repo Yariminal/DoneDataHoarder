@@ -24,6 +24,57 @@ document.addEventListener('alpine:init', () => {
   });
 
   /* ----------------------------------------------------------
+   * Modal store — in-app replacement for native confirm()/prompt().
+   * Native dialogs are suppressed (auto-return false) in embedded
+   * browser contexts, which made every confirm-gated button appear
+   * dead. These render a real DOM modal and resolve a Promise.
+   * -------------------------------------------------------- */
+  Alpine.store('modal', {
+    visible: false,
+    message: '',
+    okText: 'OK',
+    cancelText: 'Cancel',
+    danger: false,
+    isPrompt: false,
+    inputValue: '',
+    _resolve: null,
+
+    _open(opts) {
+      // If a modal is somehow already open, cancel it first
+      if (this._resolve) this.cancel();
+      this.message = opts.message || '';
+      this.okText = opts.okText || 'OK';
+      this.cancelText = opts.cancelText || 'Cancel';
+      this.danger = !!opts.danger;
+      this.isPrompt = !!opts.isPrompt;
+      this.inputValue = opts.defaultValue || '';
+      this.visible = true;
+      return new Promise((resolve) => { this._resolve = resolve; });
+    },
+    confirm(message, opts = {}) {
+      return this._open({ ...opts, message, isPrompt: false });
+    },
+    prompt(message, defaultValue = '', opts = {}) {
+      return this._open({ ...opts, message, defaultValue, isPrompt: true });
+    },
+    ok() {
+      const resolve = this._resolve;
+      this._resolve = null;
+      this.visible = false;
+      if (resolve) resolve(this.isPrompt ? this.inputValue : true);
+    },
+    cancel() {
+      const resolve = this._resolve;
+      this._resolve = null;
+      this.visible = false;
+      if (resolve) resolve(this.isPrompt ? null : false);
+    },
+  });
+
+  window.appConfirm = (message, opts) => Alpine.store('modal').confirm(message, opts);
+  window.appPrompt = (message, defaultValue, opts) => Alpine.store('modal').prompt(message, defaultValue, opts);
+
+  /* ----------------------------------------------------------
    * Session store — tracks the current active session
    * -------------------------------------------------------- */
   Alpine.store('session', {
@@ -162,7 +213,7 @@ document.addEventListener('alpine:init', () => {
 
     let name = session.name;
     if (!name) {
-      name = prompt('Enter a name for this session:', `Session ${new Date().toLocaleDateString()}`);
+      name = await appPrompt('Enter a name for this session:', `Session ${new Date().toLocaleDateString()}`, { okText: 'Save' });
       if (!name) return;
     }
 
@@ -177,10 +228,10 @@ document.addEventListener('alpine:init', () => {
     }
   };
 
-  window.goHome = function () {
+  window.goHome = async function () {
     const session = Alpine.store('session');
     if (session.active && session.is_unsaved) {
-      if (!confirm('You have unsaved changes. Leave without saving?')) return;
+      if (!(await appConfirm('You have unsaved changes. Leave without saving?', { okText: 'Leave', danger: true }))) return;
     }
     session.clear();
     Alpine.store('app').tab = 'home';
@@ -260,7 +311,7 @@ document.addEventListener('alpine:init', () => {
 
     async deleteSession(sessionId, sessionName) {
       const name = sessionName || 'Unnamed Session';
-      if (!confirm(`Permanently delete "${name}"? This cannot be undone.`)) return;
+      if (!(await appConfirm(`Permanently delete "${name}"? This cannot be undone.`, { okText: 'Delete', danger: true }))) return;
       try {
         await api.del(`/sessions/${sessionId}`);
         this.sessions = this.sessions.filter(s => s.id !== sessionId);
@@ -329,7 +380,7 @@ document.addEventListener('alpine:init', () => {
     },
 
     async saveResults(type) {
-      const name = prompt(`Save ${type} results as:`, `${type}_${new Date().toISOString().slice(0, 10)}`);
+      const name = await appPrompt(`Save ${type} results as:`, `${type}_${new Date().toISOString().slice(0, 10)}`, { okText: 'Save' });
       if (!name) return;
 
       try {
@@ -952,7 +1003,7 @@ document.addEventListener('alpine:init', () => {
     },
 
     async deleteModel(modelName) {
-      if (!confirm(`Are you sure you want to delete ${modelName}? This cannot be undone.`)) {
+      if (!(await appConfirm(`Are you sure you want to delete ${modelName}? This cannot be undone.`, { okText: 'Delete', danger: true }))) {
         return;
       }
       try {
@@ -1228,7 +1279,7 @@ document.addEventListener('alpine:init', () => {
           case 'execute-commit':
             // Commit STAYS SYNCHRONOUS so the user-visible "Apply changes? y/N"
             // confirmation flow is preserved. Only execute-dry runs in background.
-            if (!confirm('Apply all approved changes to disk? This cannot be undone.')) {
+            if (!(await appConfirm('Apply all approved changes to disk? This cannot be undone.', { okText: 'Apply changes', danger: true }))) {
               this.running = null;
               Alpine.store('app').loading = false;
               return;
@@ -1501,7 +1552,7 @@ document.addEventListener('alpine:init', () => {
     async runUnattended() {
       // If already running, treat click as cancel request
       if (this.unattendedMode) {
-        if (!confirm('Cancel the unattended run?\n\nThe current step will be cancelled (if possible).')) return;
+        if (!(await appConfirm('Cancel the unattended run?\n\nThe current step will be cancelled (if possible).', { okText: 'Cancel run', cancelText: 'Keep running', danger: true }))) return;
         this.unattendedMode = false;
         this.unattendedQueue = [];
         this.unattendedCurrentStep = null;
@@ -1547,7 +1598,7 @@ document.addEventListener('alpine:init', () => {
         'NO changes will be committed to disk. You can review proposals\n' +
         'and click "Commit" manually when you return.\n\n' +
         'Estimated time for 500 files: 30-90 minutes';
-      if (!confirm(confirmMsg)) return;
+      if (!(await appConfirm(confirmMsg, { okText: 'Start run' }))) return;
 
       // Initialize state
       this.unattendedMode = true;
