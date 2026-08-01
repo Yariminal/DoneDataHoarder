@@ -461,10 +461,12 @@ def _save_groups(
     saved = 0
     for g in groups:
         member_file_ids = []
+        seen_fids: set[int] = set()
         for m in g["members"]:
             fid = filename_to_file_id.get(m["filename"])
-            if fid is None:
+            if fid is None or fid in seen_fids:
                 continue
+            seen_fids.add(fid)
             member_file_ids.append((fid, m["role"]))
         if len(member_file_ids) < 2:
             continue
@@ -560,11 +562,17 @@ If no meaningful groups found, return [].
         if len(filenames) < 2:
             continue
 
-        # Map filenames back to file records
+        # Map filenames back to file records. Dedupe by filename — the LLM
+        # occasionally lists the same name twice in one group, which would
+        # later violate the (group_id, file_id) UNIQUE constraint.
         fn_to_id = {f.filename: f.id for f in files}
         members = []
+        seen_fn: set[str] = set()
         for fn in filenames:
+            if fn in seen_fn:
+                continue
             if fn in fn_to_id:
+                seen_fn.add(fn)
                 members.append({
                     "filename": fn,
                     "role": "sibling",

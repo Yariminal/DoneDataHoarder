@@ -132,7 +132,12 @@ class JobManager:
             job = JobInfo(job_id=job_id, job_type=job_type, session_id=session_id)
             self._jobs[job_id] = job
             self._active_job_id = job_id
-            return job
+
+        # Outside the lock: hold a system wake lock for the lifetime of the job
+        # so unattended runs survive the OS idle-sleep timer.
+        from donedatahoarder.core import wake_lock
+        wake_lock.acquire()
+        return job
 
     def _finish_job(self, job: JobInfo, state: JobState, error: str | None = None):
         job.state = state
@@ -142,6 +147,9 @@ class JobManager:
         with self._lock:
             if self._active_job_id == job.job_id:
                 self._active_job_id = None
+        # Release the system wake lock acquired in _create_job.
+        from donedatahoarder.core import wake_lock
+        wake_lock.release()
         # Push final progress to subscribers
         final = {**job.progress, "done": True, "state": state.value}
         if error:
