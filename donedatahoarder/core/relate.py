@@ -731,7 +731,11 @@ def relate(
         from donedatahoarder.ai.router import get_client
         try:
             client = get_client()
-        except RuntimeError:
+        except RuntimeError as exc:
+            logger.warning(
+                "Relate get_client failed (%s); falling back to backstop-only mode",
+                exc,
+            )
             client = None  # LLM unavailable; backstop-only mode
 
     engine = get_engine()
@@ -912,6 +916,7 @@ def relate_with_progress(
       {"cancelled": True, ...}                                       on cancel
       {"done": True, "directories": ..., "groups": ..., ...}         terminal
     """
+    import contextvars
     import queue
     import threading
 
@@ -945,7 +950,11 @@ def relate_with_progress(
             from donedatahoarder.ai.router import get_client
             try:
                 client = get_client()
-            except RuntimeError:
+            except RuntimeError as exc:
+                logger.warning(
+                    "Relate get_client failed (%s); falling back to backstop-only mode",
+                    exc,
+                )
                 client = None
             summary = relate(
                 session_id=session_id,
@@ -969,7 +978,12 @@ def relate_with_progress(
     import contextlib
     import io
     with contextlib.redirect_stdout(io.StringIO()):
-        worker = threading.Thread(target=_runner, daemon=True, name="relate-worker")
+        worker = threading.Thread(
+            target=contextvars.copy_context().run,
+            args=(_runner,),
+            daemon=True,
+            name="relate-worker",
+        )
         worker.start()
 
         while True:

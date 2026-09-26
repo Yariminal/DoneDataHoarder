@@ -6,7 +6,7 @@
   <title>DoneDataHoarder</title>
   <link rel="stylesheet" href="/static/style.css">
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
-  <script src="/static/app.js?v=6_resilient"></script>
+  <script src="/static/app.js?v=7_modals"></script>
 </head>
 <body x-data x-init="$store.app.tab = 'home'">
 
@@ -1089,6 +1089,35 @@
     </section>
 
   </main>
+</div>
+
+<!-- In-app confirm / prompt. Native dialogs are swallowed in the embedded window. -->
+<style>.app-dialog[x-cloak]{display:none !important}</style>
+<div class="modal-backdrop app-dialog" x-cloak x-show="$store.modal.open"
+     style="z-index:150;"
+     role="presentation"
+     @click.self="$store.modal.cancel()"
+     @keydown.escape.window="$store.modal.onEscape($event)"
+     @keydown.enter.window="$store.modal.onEnter($event)">
+  <div class="modal" style="max-width:460px;" role="dialog" aria-modal="true"
+       :aria-label="$store.modal.title || 'Confirm'">
+    <div class="modal-title" x-show="$store.modal.title" x-text="$store.modal.title"></div>
+    <p style="white-space:pre-wrap; margin:0 0 16px;" x-text="$store.modal.message"></p>
+    <template x-if="$store.modal.mode === 'prompt'">
+      <input type="text" class="input" x-model="$store.modal.value"
+             style="width:100%; margin-bottom:16px;"
+             @keydown.enter.prevent="$store.modal.accept()"
+             x-effect="$store.modal.open && $nextTick(() => { $el.focus(); $el.select(); })">
+    </template>
+    <div style="display:flex; justify-content:flex-end; gap:8px;">
+      <button type="button" class="btn btn-outline" @click="$store.modal.cancel()"
+              x-text="$store.modal.cancelLabel"></button>
+      <button type="button" class="btn"
+              :class="$store.modal.danger ? 'btn-danger' : 'btn-primary'"
+              @click="$store.modal.accept()"
+              x-text="$store.modal.confirmLabel"></button>
+    </div>
+  </div>
 </div>
 
 <!-- Toast container -->
