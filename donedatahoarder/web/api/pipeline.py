@@ -387,7 +387,12 @@ def trigger_propose(body: PipelineRequest = PipelineRequest()):
 
     try:
         sid = _require_session_id(body.session_id)
-        job_id = job_manager.start_propose(session_id=sid)
+        model = _resolve_model(body.model, sid, step="propose")
+        job_id = job_manager.start_propose(
+            session_id=sid,
+            backend=body.backend,
+            model=model,
+        )
         return {"job_id": job_id, "status": "started"}
     except RuntimeError as exc:
         raise HTTPException(409, str(exc))

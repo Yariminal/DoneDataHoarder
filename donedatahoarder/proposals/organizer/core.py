@@ -471,6 +471,7 @@ def generate_reorg_proposals_with_progress(
       {"done": True, "move": ..., "folder_rename": ..., ...} terminal
     """
     import contextlib
+    import contextvars
     import io
     import queue
     import threading
@@ -499,7 +500,12 @@ def generate_reorg_proposals_with_progress(
             error_holder[0] = exc
             result_queue.put(sentinel_error)
 
-    worker = threading.Thread(target=_runner, daemon=True, name="organize-worker")
+    worker = threading.Thread(
+        target=contextvars.copy_context().run,
+        args=(_runner,),
+        daemon=True,
+        name="organize-worker",
+    )
     worker.start()
 
     while True:

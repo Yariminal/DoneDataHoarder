@@ -24,6 +24,95 @@ document.addEventListener('alpine:init', () => {
   });
 
   /* ----------------------------------------------------------
+   * Modal store — in-app confirm / prompt.
+   * Native dialogs never surface inside the embedded window.
+   * -------------------------------------------------------- */
+  Alpine.store('modal', {
+    open: false,
+    mode: 'confirm',
+    title: '',
+    message: '',
+    value: '',
+    confirmLabel: 'OK',
+    cancelLabel: 'Cancel',
+    danger: false,
+    _resolve: null,
+
+    ask(opts = {}) {
+      if (this._resolve) {
+        const prev = this._resolve;
+        this._resolve = null;
+        prev(this.mode === 'prompt' ? null : false);
+      }
+      this.mode = opts.mode === 'prompt' ? 'prompt' : 'confirm';
+      this.title = opts.title || '';
+      this.message = opts.message || '';
+      this.value = opts.value != null ? String(opts.value) : '';
+      this.confirmLabel = opts.confirmLabel || 'OK';
+      this.cancelLabel = opts.cancelLabel || 'Cancel';
+      this.danger = !!opts.danger;
+      this.open = true;
+      return new Promise((resolve) => {
+        this._resolve = resolve;
+      });
+    },
+
+    accept() {
+      if (!this.open || !this._resolve) return;
+      const resolve = this._resolve;
+      const result = this.mode === 'prompt' ? this.value : true;
+      this._resolve = null;
+      this.open = false;
+      resolve(result);
+    },
+
+    cancel() {
+      if (!this.open || !this._resolve) return;
+      const resolve = this._resolve;
+      const result = this.mode === 'prompt' ? null : false;
+      this._resolve = null;
+      this.open = false;
+      resolve(result);
+    },
+
+    // Escape always cancels. Enter confirms a prompt (input or not).
+    onEscape(event) {
+      if (!this.open) return;
+      if (event) event.preventDefault();
+      this.cancel();
+    },
+
+    onEnter(event) {
+      if (!this.open || this.mode !== 'prompt') return;
+      if (event) event.preventDefault();
+      this.accept();
+    },
+  });
+
+  window.appConfirm = function (message, opts = {}) {
+    return Alpine.store('modal').ask({
+      mode: 'confirm',
+      message: message == null ? '' : String(message),
+      title: opts.title || '',
+      confirmLabel: opts.confirmLabel || 'OK',
+      cancelLabel: opts.cancelLabel || 'Cancel',
+      danger: !!opts.danger,
+    });
+  };
+
+  window.appPrompt = function (message, defaultValue = '', opts = {}) {
+    return Alpine.store('modal').ask({
+      mode: 'prompt',
+      message: message == null ? '' : String(message),
+      value: defaultValue == null ? '' : String(defaultValue),
+      title: opts.title || '',
+      confirmLabel: opts.confirmLabel || 'OK',
+      cancelLabel: opts.cancelLabel || 'Cancel',
+      danger: !!opts.danger,
+    });
+  };
+
+  /* ----------------------------------------------------------
    * Session store — tracks the current active session
    * -------------------------------------------------------- */
   Alpine.store('session', {
@@ -162,7 +251,11 @@ document.addEventListener('alpine:init', () => {
 
     let name = session.name;
     if (!name) {
-      name = prompt('Enter a name for this session:', `Session ${new Date().toLocaleDateString()}`);
+      name = await window.appPrompt(
+        'Enter a name for this session:',
+        `Session ${new Date().toLocaleDateString()}`,
+        { title: 'Save session', confirmLabel: 'Save' }
+      );
       if (!name) return;
     }
 
@@ -177,10 +270,14 @@ document.addEventListener('alpine:init', () => {
     }
   };
 
-  window.goHome = function () {
+  window.goHome = async function () {
     const session = Alpine.store('session');
     if (session.active && session.is_unsaved) {
-      if (!confirm('You have unsaved changes. Leave without saving?')) return;
+      const leave = await window.appConfirm(
+        'You have unsaved changes. Leave without saving?',
+        { title: 'Unsaved changes', confirmLabel: 'Leave', danger: true }
+      );
+      if (!leave) return;
     }
     session.clear();
     Alpine.store('app').tab = 'home';
@@ -263,7 +360,11 @@ document.addEventListener('alpine:init', () => {
 
     async deleteSession(sessionId, sessionName) {
       const name = sessionName || 'Unnamed Session';
-      if (!confirm(`Permanently delete "${name}"? This cannot be undone.`)) return;
+      const ok = await window.appConfirm(
+        `Permanently delete "${name}"? This cannot be undone.`,
+        { title: 'Delete session', confirmLabel: 'Delete', danger: true }
+      );
+      if (!ok) return;
       try {
         await api.del(`/sessions/${sessionId}`);
         this.sessions = this.sessions.filter(s => s.id !== sessionId);
@@ -332,7 +433,11 @@ document.addEventListener('alpine:init', () => {
     },
 
     async saveResults(type) {
-      const name = prompt(`Save ${type} results as:`, `${type}_${new Date().toISOString().slice(0, 10)}`);
+      const name = await window.appPrompt(
+        `Save ${type} results as:`,
+        `${type}_${new Date().toISOString().slice(0, 10)}`,
+        { title: 'Save results', confirmLabel: 'Save' }
+      );
       if (!name) return;
 
       try {
@@ -955,9 +1060,11 @@ document.addEventListener('alpine:init', () => {
     },
 
     async deleteModel(modelName) {
-      if (!confirm(`Are you sure you want to delete ${modelName}? This cannot be undone.`)) {
-        return;
-      }
+      const ok = await window.appConfirm(
+        `Are you sure you want to delete ${modelName}? This cannot be undone.`,
+        { title: 'Delete model', confirmLabel: 'Delete', danger: true }
+      );
+      if (!ok) return;
       try {
         await api.post(`/ollama/delete`, { model: modelName });
         Alpine.store('app').toast(`Deleted ${modelName}`, 'success');
@@ -1231,7 +1338,10 @@ document.addEventListener('alpine:init', () => {
           case 'execute-commit':
             // Commit STAYS SYNCHRONOUS so the user-visible "Apply changes? y/N"
             // confirmation flow is preserved. Only execute-dry runs in background.
-            if (!confirm('Apply all approved changes to disk? This cannot be undone.')) {
+            if (!await window.appConfirm(
+              'Apply all approved changes to disk? This cannot be undone.',
+              { title: 'Apply changes', confirmLabel: 'Apply changes', danger: true }
+            )) {
               this.running = null;
               Alpine.store('app').loading = false;
               return;
@@ -1263,7 +1373,7 @@ document.addEventListener('alpine:init', () => {
         body.backend = settings.backend;
         body.model = settings.analyzeModel || settings.model;
         body.workers = settings.workers;
-      } else if (type === 'relate' || type === 'organize') {
+      } else if (type === 'relate' || type === 'organize' || type === 'propose') {
         body.backend = settings.backend;
         body.model = settings.proposeModel || settings.model;
       } else if (type === 'execute-dry') {
@@ -1504,7 +1614,11 @@ document.addEventListener('alpine:init', () => {
     async runUnattended() {
       // If already running, treat click as cancel request
       if (this.unattendedMode) {
-        if (!confirm('Cancel the unattended run?\n\nThe current step will be cancelled (if possible).')) return;
+        const cancelRun = await window.appConfirm(
+          'Cancel the unattended run?\n\nThe current step will be cancelled (if possible).',
+          { title: 'Cancel run', confirmLabel: 'Cancel run', danger: true }
+        );
+        if (!cancelRun) return;
         this.unattendedMode = false;
         this.unattendedQueue = [];
         this.unattendedCurrentStep = null;
@@ -1550,7 +1664,7 @@ document.addEventListener('alpine:init', () => {
         'NO changes will be committed to disk. You can review proposals\n' +
         'and click "Commit" manually when you return.\n\n' +
         'Estimated time for 500 files: 30-90 minutes';
-      if (!confirm(confirmMsg)) return;
+      if (!await window.appConfirm(confirmMsg, { title: 'Unattended run', confirmLabel: 'Start' })) return;
 
       // Initialize state
       this.unattendedMode = true;
