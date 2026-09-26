@@ -459,8 +459,15 @@ def execute(
         con.print("[bold yellow]DRY RUN -- no files will be changed[/bold yellow]\n")
 
     with Session(engine) as session:
+        # An edited or approved proposal is an explicit yes.
+        # A still-pending one needs a real confidence score.
         query = session.query(Proposal).filter(
-            Proposal.status.in_([ProposalStatus.PENDING, ProposalStatus.APPROVED])
+            (Proposal.status.in_([ProposalStatus.APPROVED, ProposalStatus.MODIFIED]))
+            | (
+                (Proposal.status == ProposalStatus.PENDING)
+                & (Proposal.confidence.isnot(None))
+                & (Proposal.confidence >= min_confidence)
+            )
         )
         if session_id:
             query = query.join(File).filter(File.session_id == session_id)
@@ -468,10 +475,6 @@ def execute(
             query = query.filter(Proposal.id.in_(proposal_ids))
         if proposal_types:
             query = query.filter(Proposal.proposal_type.in_(proposal_types))
-        if min_confidence > 0:
-            query = query.filter(
-                (Proposal.confidence >= min_confidence) | (Proposal.confidence.is_(None))
-            )
 
         proposals = query.all()
         con.print(f"[bold]Processing {len(proposals)} proposals...[/bold]")
@@ -576,7 +579,7 @@ def execute(
                 else:
                     counts["failed"] += 1
                     if not dry_run:
-                        prop.status = ProposalStatus.REJECTED
+                        prop.user_notes = msg[:500]
                     color = "red"
 
                 con.print(f"  [{color}]{msg}[/{color}]")

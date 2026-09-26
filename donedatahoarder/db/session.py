@@ -5,7 +5,7 @@ from pathlib import Path
 from sqlalchemy import create_engine, inspect, Engine, exc as sa_exc, event
 from sqlalchemy.orm import Session, sessionmaker
 
-from donedatahoarder.db.models import Base
+from donedatahoarder.db.models import Base, DuplicateGroup, File
 
 _engine: Engine | None = None
 _SessionLocal: sessionmaker | None = None
@@ -71,6 +71,7 @@ def init_db(db_path: Path) -> Engine:
 
     @event.listens_for(_engine, "connect")
     def _set_wal(dbapi_conn, connection_record):
+        dbapi_conn.execute("PRAGMA foreign_keys=ON")
         dbapi_conn.execute("PRAGMA journal_mode=WAL")
         dbapi_conn.execute("PRAGMA synchronous=NORMAL")
 
@@ -89,6 +90,7 @@ def init_db(db_path: Path) -> Engine:
         inspector = inspect(_engine)
         _migrate_add_columns(_engine, inspector)
         _migrate_nullable_columns(_engine, inspector)
+        _migrate_session_scope(_engine)
     except sa_exc.OperationalError as exc:
         if "database is locked" in str(exc).lower():
             _handle_db_lock(exc, db_path)
@@ -153,6 +155,71 @@ def _migrate_nullable_columns(engine: Engine, inspector) -> None:
                 conn.execute(text(f"DROP TABLE {table}_old"))
 
 
+
+
+def _unique_key_sets(conn, table: str) -> list[list[str]]:
+    from sqlalchemy import text
+
+    keys: list[list[str]] = []
+    for row in conn.execute(text(f"PRAGMA index_list('{table}')")).fetchall():
+        if not row[2]:
+            continue
+        info = conn.execute(text(f"PRAGMA index_info('{row[1]}')")).fetchall()
+        cols = [item[2] for item in sorted(info, key=lambda item: item[0])]
+        if cols:
+            keys.append(cols)
+    return keys
+
+
+def _rebuild_table(engine: Engine, table_name: str, table) -> None:
+    """Recreate a table from the current model. SQLite cannot drop a UNIQUE in place."""
+    from sqlalchemy import text
+
+    legacy = f"{table_name}_legacy"
+    raw = engine.raw_connection()
+    try:
+        cursor = raw.cursor()
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        cursor.execute(f"ALTER TABLE {table_name} RENAME TO {legacy}")
+        cursor.execute(f"PRAGMA index_list('{legacy}')")
+        for row in cursor.fetchall():
+            index_name = row[1]
+            if str(index_name).startswith("sqlite_autoindex"):
+                continue
+            cursor.execute(f'DROP INDEX IF EXISTS "{index_name}"')
+        raw.commit()
+    finally:
+        raw.close()
+
+    table.create(engine)
+    old_cols = {c["name"] for c in inspect(engine).get_columns(legacy)}
+    shared = [c.name for c in table.columns if c.name in old_cols]
+    col_sql = ", ".join(shared)
+    with engine.begin() as conn:
+        conn.execute(text("PRAGMA foreign_keys=OFF"))
+        conn.execute(text(
+            f"INSERT INTO {table_name} ({col_sql}) SELECT {col_sql} FROM {legacy}"
+        ))
+        conn.execute(text(f"DROP TABLE {legacy}"))
+
+
+def _migrate_session_scope(engine: Engine) -> None:
+    """A session owns its file paths and its duplicate groups."""
+    with engine.connect() as conn:
+        names = set(inspect(engine).get_table_names())
+        rebuild_files = (
+            "files" in names
+            and ["session_id", "path"] not in _unique_key_sets(conn, "files")
+        )
+        rebuild_dupes = (
+            "duplicate_groups" in names
+            and ["session_id", "dupe_type", "group_hash"]
+            not in _unique_key_sets(conn, "duplicate_groups")
+        )
+    if rebuild_files:
+        _rebuild_table(engine, "files", File.__table__)
+    if rebuild_dupes:
+        _rebuild_table(engine, "duplicate_groups", DuplicateGroup.__table__)
 
 
 def get_engine() -> Engine:

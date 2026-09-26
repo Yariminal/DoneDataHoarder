@@ -137,7 +137,7 @@ class File(Base):
     session: Mapped["UserSession"] = relationship("UserSession", back_populates="files")
 
     # --- identity ---
-    path: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    path: Mapped[str] = mapped_column(String, nullable=False)
     filename: Mapped[str] = mapped_column(String, nullable=False)
     extension: Mapped[Optional[str]] = mapped_column(String)
     size_bytes: Mapped[Optional[int]] = mapped_column(BigInteger)
@@ -186,6 +186,10 @@ class File(Base):
             return json.loads(self.ai_tags)
         except (json.JSONDecodeError, TypeError):
             return []
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "path", name="uq_file_session_path"),
+    )
 
     def __repr__(self) -> str:
         return f"<File id={self.id} status={self.status} path={self.path!r}>"
@@ -246,7 +250,7 @@ class DuplicateGroup(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("dupe_type", "group_hash", name="uq_dupe_group"),
+        UniqueConstraint("session_id", "dupe_type", "group_hash", name="uq_dupe_group"),
     )
 
 

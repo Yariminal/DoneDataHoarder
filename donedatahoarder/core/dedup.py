@@ -82,6 +82,11 @@ def _upsert_group(
     group = (
         session.query(DuplicateGroup)
         .filter_by(dupe_type=dupe_type, group_hash=group_hash)
+        .filter(
+            DuplicateGroup.session_id == session_id
+            if session_id
+            else DuplicateGroup.session_id.is_(None)
+        )
         .first()
     )
     if group is None:

@@ -303,7 +303,8 @@ def generate_reorg_proposals(session_id: str) -> dict:
                 try:
                     rel_to_src = src_path.relative_to(src_abs)
                 except ValueError:
-                    rel_to_src = Path(src_path.name)
+                    # LIKE can match a sibling such as tax_archive. Leave it alone.
+                    continue
                 dst_path = Path(dst_abs) / rel_to_src
 
                 # Don't create proposal if source == destination

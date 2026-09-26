@@ -11,7 +11,7 @@ document.addEventListener('alpine:init', () => {
     tab: 'home',
     toasts: [],
     loading: false,
-    version: '0.3.0',
+    version: '0.6.0',
 
     toast(msg, type = 'info') {
       const id = Date.now();
@@ -195,6 +195,9 @@ document.addEventListener('alpine:init', () => {
 
     async init() {
       await this.loadSessions();
+      this.$watch(() => Alpine.store('app').tab, (tab) => {
+        if (tab === 'home') this.loadSessions();
+      });
     },
 
     async loadSessions() {

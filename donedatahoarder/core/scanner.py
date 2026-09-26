@@ -344,7 +344,11 @@ def scan(
                     continue
                 path_str = record["path"]
                 last_path = path_str
-                existing = session.query(File).filter_by(path=path_str).first()
+                existing = (
+                    session.query(File)
+                    .filter_by(path=path_str, session_id=session_id)
+                    .first()
+                )
                 if existing and not force_rescan:
                     counts["skipped"] += 1
                 elif existing:
@@ -386,7 +390,11 @@ def scan(
                         path_str = str(file_path.resolve())
 
                         if not force_rescan:
-                            exists = session.query(File.id).filter_by(path=path_str).scalar()
+                            exists = (
+                                session.query(File.id)
+                                .filter_by(path=path_str, session_id=session_id)
+                                .scalar()
+                            )
                             if exists is not None:
                                 counts["skipped"] += 1
                                 continue
@@ -417,7 +425,11 @@ def scan(
                     path_str = str(file_path.resolve())
 
                     if not force_rescan:
-                        exists = session.query(File.id).filter_by(path=path_str).scalar()
+                        exists = (
+                            session.query(File.id)
+                            .filter_by(path=path_str, session_id=session_id)
+                            .scalar()
+                        )
                         if exists is not None:
                             counts["skipped"] += 1
                             continue
