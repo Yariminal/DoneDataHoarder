@@ -42,6 +42,9 @@ class TestGetFileDates:
 
     def test_linux_no_birthtime_no_media(self):
         """Linux without birthtime, non-media file -> mtime fallback with warning."""
+        # Build the path before os.name is patched. On Windows, Python 3.11
+        # and older refuse to create a PosixPath while os.name is "posix".
+        path = Path("readme.txt")
         with patch.object(sys, "platform", "linux"):
             with patch.object(os, "name", "posix"):
                 stat = MagicMock()
@@ -50,7 +53,7 @@ class TestGetFileDates:
                 del stat.st_birthtime
                 stat.st_ctime = 1_650_000_000
 
-                mod, cre, source, warn = _get_file_dates(Path("/tmp/readme.txt"), stat)
+                mod, cre, source, warn = _get_file_dates(path, stat)
                 assert source == "mtime_fallback"
                 assert warn is not None
                 assert "mtime" in warn.lower()
@@ -61,13 +64,14 @@ class TestGetFileDates:
     def test_linux_image_exif_fallback(self, mock_exif):
         """Linux image without birthtime -> EXIF fallback."""
         mock_exif.return_value = datetime(2020, 5, 15, 10, 30, 0)
+        path = Path("photo.jpg")
         with patch.object(sys, "platform", "linux"):
             with patch.object(os, "name", "posix"):
                 stat = MagicMock()
                 stat.st_mtime = 1_700_000_000
                 del stat.st_birthtime
 
-                mod, cre, source, warn = _get_file_dates(Path("/tmp/photo.jpg"), stat)
+                mod, cre, source, warn = _get_file_dates(path, stat)
                 assert source == "exif_fallback"
                 assert cre == datetime(2020, 5, 15, 10, 30, 0)
                 assert warn is None
@@ -77,13 +81,14 @@ class TestGetFileDates:
     def test_linux_audio_mutagen_fallback(self, mock_mutagen):
         """Linux audio without birthtime -> mutagen fallback."""
         mock_mutagen.return_value = datetime(2019, 8, 1, 0, 0, 0)
+        path = Path("song.mp3")
         with patch.object(sys, "platform", "linux"):
             with patch.object(os, "name", "posix"):
                 stat = MagicMock()
                 stat.st_mtime = 1_700_000_000
                 del stat.st_birthtime
 
-                mod, cre, source, warn = _get_file_dates(Path("/tmp/song.mp3"), stat)
+                mod, cre, source, warn = _get_file_dates(path, stat)
                 assert source == "mutagen_fallback"
                 assert cre == datetime(2019, 8, 1, 0, 0, 0)
                 assert warn is None
