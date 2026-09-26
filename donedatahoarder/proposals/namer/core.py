@@ -88,6 +88,9 @@ def generate_proposals(
         reserved_names: set[Path] = set()  # Track proposed names to prevent collisions within batch
 
         while True:
+            # Build names inside a short read. translate_filename calls the LLM,
+            # so it runs only after this transaction is closed.
+            prepared: list[dict] = []
             with Session(engine) as session:
                 p_q = session.query(File).filter(File.status == FileStatus.ANALYZED)
                 if session_id:
@@ -98,36 +101,64 @@ def generate_proposals(
                 if not batch:
                     break
 
-                # Load existing proposals for this whole batch in one query
-                # instead of firing two SELECTs per file (N+1 pattern).
-                batch_ids = {f.id for f in batch}
+                for file_rec in batch:
+                    path = Path(file_rec.path)
+                    new_name = build_new_name(file_rec, root_path=session_root_path)
+                    rename_name = None
+                    if new_name and new_name != path.name:
+                        # Ensure prefix is preserved if original had one
+                        new_stem = Path(new_name).stem
+                        new_stem = _ensure_prefix(new_stem, path.stem)
+                        rename_name = f"{new_stem}{Path(new_name).suffix}"
+                    prepared.append({
+                        "id": file_rec.id,
+                        "path": path,
+                        "new_name": rename_name,
+                        "ai_description": file_rec.ai_description,
+                        "ai_confidence": file_rec.ai_confidence,
+                        "ai_tags": file_rec.ai_tags,
+                    })
+
+            for item in prepared:
+                new_name = item["new_name"]
+                if new_name and preferred_language != "leave_as_is":
+                    new_name = translate_filename(new_name, preferred_language)
+                    item["new_name"] = new_name
+                if new_name:
+                    proposed_path = _resolve_collision(
+                        item["path"].parent / new_name,
+                        item["path"],
+                        reserved_names=reserved_names,
+                    )
+                    reserved_names.add(proposed_path)
+                    item["proposed_path"] = proposed_path
+                else:
+                    item["proposed_path"] = None
+
+            with Session(engine) as session:
+                batch_ids = [item["id"] for item in prepared]
+                # One query for the batch instead of two SELECTs per file.
                 existing_proposals: set[tuple[int, ProposalType]] = {
                     (p.file_id, p.proposal_type)
                     for p in session.query(Proposal.file_id, Proposal.proposal_type)
                     .filter(Proposal.file_id.in_(batch_ids))
                 }
+                files_by_id = {
+                    f.id: f
+                    for f in session.query(File).filter(File.id.in_(batch_ids))
+                }
 
-                for file_rec in batch:
-                    path = Path(file_rec.path)
+                for item in prepared:
+                    file_rec = files_by_id.get(item["id"])
+                    path: Path = item["path"]
                     made_proposal = False
+                    if file_rec is None:
+                        progress.advance(task)
+                        continue
 
                     # --- RENAME proposal ---
-                    new_name = build_new_name(file_rec, root_path=session_root_path)
-                    if new_name and new_name != path.name:
-                        # Ensure prefix is preserved if original had one
-                        new_stem = Path(new_name).stem
-                        new_stem = _ensure_prefix(new_stem, path.stem)
-                        new_name = f"{new_stem}{Path(new_name).suffix}"
-
-                        # Apply language translation if preferred
-                        if preferred_language != "leave_as_is":
-                            new_name = translate_filename(new_name, preferred_language)
-
-                        proposed_path = _resolve_collision(
-                            path.parent / new_name, path, reserved_names=reserved_names
-                        )
-                        # Add to reserved names so other files in this batch won't collide
-                        reserved_names.add(proposed_path)
+                    proposed_path = item["proposed_path"]
+                    if proposed_path is not None:
                         if (file_rec.id, ProposalType.RENAME) not in existing_proposals:
                             session.add(Proposal(
                                 file_id=file_rec.id,
@@ -136,24 +167,24 @@ def generate_proposals(
                                 proposed_value=str(proposed_path),
                                 reasoning=(
                                     f"Renamed based on AI description: "
-                                    f"{(file_rec.ai_description or '')[:120]}"
+                                    f"{(item['ai_description'] or '')[:120]}"
                                 ),
-                                confidence=file_rec.ai_confidence or 0.5,
+                                confidence=item["ai_confidence"] or 0.5,
                                 status=ProposalStatus.PENDING,
                             ))
                             counts["rename"] += 1
                             made_proposal = True
 
                     # --- ADD_TAGS proposal ---
-                    if file_rec.ai_tags:
+                    if item["ai_tags"]:
                         if (file_rec.id, ProposalType.ADD_TAGS) not in existing_proposals:
                             session.add(Proposal(
                                 file_id=file_rec.id,
                                 proposal_type=ProposalType.ADD_TAGS,
                                 current_value=None,
-                                proposed_value=file_rec.ai_tags,
+                                proposed_value=item["ai_tags"],
                                 reasoning="Tags generated by AI analysis",
-                                confidence=file_rec.ai_confidence or 0.5,
+                                confidence=item["ai_confidence"] or 0.5,
                                 status=ProposalStatus.PENDING,
                             ))
                             counts["tags"] += 1

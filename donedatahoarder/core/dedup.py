@@ -27,10 +27,7 @@ from donedatahoarder.db.models import (
 from donedatahoarder.db.session import get_engine
 
 from donedatahoarder.config import load_phash_config
-from donedatahoarder.phash import (
-    hash_distance,
-    is_near_duplicate,
-)
+from donedatahoarder.phash import hash_distance
 
 try:
     import imagehash
@@ -160,6 +157,146 @@ def find_exact_duplicates(session_id: str | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Union-find — one component for a chain of near-duplicates
+# ---------------------------------------------------------------------------
+
+class _UnionFind:
+    """Disjoint set. A~B and B~C become one component even when A is far from C."""
+
+    def __init__(self) -> None:
+        self._parent: dict[int, int] = {}
+        self._rank: dict[int, int] = {}
+
+    def add(self, item: int) -> None:
+        if item not in self._parent:
+            self._parent[item] = item
+            self._rank[item] = 0
+
+    def find(self, item: int) -> int:
+        parent = self._parent
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        rank = self._rank
+        parent = self._parent
+        if rank[ra] < rank[rb]:
+            parent[ra] = rb
+        elif rank[ra] > rank[rb]:
+            parent[rb] = ra
+        else:
+            parent[rb] = ra
+            rank[ra] += 1
+
+    def components(self) -> dict[int, list[int]]:
+        groups: dict[int, list[int]] = defaultdict(list)
+        for item in self._parent:
+            groups[self.find(item)].append(item)
+        return groups
+
+
+def _perceptual_bitstring(hex_hash: str) -> str | None:
+    """MSB-first bits imagehash.hex_to_hash flattens, or None if unusable.
+
+    hex_to_hash zero-extends to side*side when the integer is shorter, and
+    keeps extra high bits when the format width (a minimum) does not clip.
+    side < 2 is the case imagehash cannot compare.
+    """
+    if not isinstance(hex_hash, str) or not hex_hash:
+        return None
+    try:
+        value = int(hex_hash, 16)
+    except ValueError:
+        return None
+    side = int((len(hex_hash) * 4) ** 0.5)
+    if side < 2:
+        return None
+    min_width = side * side
+    bits = format(value, "b")
+    if len(bits) < min_width:
+        bits = bits.zfill(min_width)
+    return bits
+
+
+def _perceptual_candidate_pairs(hexes: list[str], threshold: int) -> list[tuple[str, str]]:
+    """Pairs that share a hash band.
+
+    threshold + 1 bands is the pigeonhole cut: Hamming distance <= threshold
+    cannot spoil every band, so a true near-pair shares at least one.
+    """
+    n_bands = threshold + 1
+    if n_bands < 1 or len(hexes) < 2:
+        return []
+
+    bits_of: dict[str, str] = {}
+    by_len: dict[int, list[str]] = defaultdict(list)
+    for hex_hash in hexes:
+        bits = _perceptual_bitstring(hex_hash)
+        if bits is None:
+            continue
+        bits_of[hex_hash] = bits
+        by_len[len(bits)].append(hex_hash)
+
+    seen: set[tuple[str, str]] = set()
+    pairs: list[tuple[str, str]] = []
+
+    def _add_pair(left: str, right: str) -> None:
+        if left == right:
+            return
+        key = (left, right) if left <= right else (right, left)
+        if key in seen:
+            return
+        seen.add(key)
+        pairs.append(key)
+
+    for bit_len, group in by_len.items():
+        if len(group) < 2:
+            continue
+        # Fewer bits than bands: a diff can land in every band and the
+        # filter would drop pairs whose distance is still <= threshold.
+        if n_bands > bit_len:
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    _add_pair(group[i], group[j])
+            continue
+
+        buckets: dict[tuple[int, str], list[str]] = defaultdict(list)
+        base, extra = divmod(bit_len, n_bands)
+        for hex_hash in group:
+            bits = bits_of[hex_hash]
+            pos = 0
+            for band_index in range(n_bands):
+                width = base + (1 if band_index < extra else 0)
+                buckets[(band_index, bits[pos:pos + width])].append(hex_hash)
+                pos += width
+        for members in buckets.values():
+            if len(members) < 2:
+                continue
+            for i in range(len(members)):
+                for j in range(i + 1, len(members)):
+                    _add_pair(members[i], members[j])
+    return pairs
+
+
+def _parse_tags(raw: str | None) -> list[str]:
+    """JSON tag list, or [] when the column is empty or not a list of strings."""
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [tag for tag in parsed if isinstance(tag, str)]
+
+
+# ---------------------------------------------------------------------------
 # Stage 2 — Perceptual duplicates (pHash)
 # ---------------------------------------------------------------------------
 
@@ -167,9 +304,12 @@ def find_perceptual_duplicates(threshold: int | None = None, session_id: str | N
     """
     Find near-duplicate images and videos using perceptual hashing.
 
-    Uses the configured threshold (or the provided override).  Includes both
+    Uses the configured threshold (or the provided override). Includes both
     image/* and video/* MIME types now that the enricher extracts frame
     thumbnails for videos.
+
+    Candidates come from hash bands. Distance is hash_distance. Union-find
+    puts a chain in one group when each hop is within threshold.
     """
     if not _HAS_IMAGEHASH:
         return {"error": "imagehash not installed"}
@@ -192,16 +332,31 @@ def find_perceptual_duplicates(threshold: int | None = None, session_id: str | N
             q = q.filter(File.session_id == session_id)
         rows = q.all()
 
-    if not rows:
+    if len(rows) < 2:
         return counts
 
-    # Build list of (id, pHash_str) pairs — keep strings for hash_distance
-    hashes = rows  # [(fid, phash_str), ...]
+    hash_to_ids: dict[str, list[int]] = defaultdict(list)
+    for file_id, phash in rows:
+        if not phash:
+            continue
+        hash_to_ids[phash].append(file_id)
 
-    # O(n²) comparison — acceptable for up to ~50k items; can be improved with BK-tree
-    visited: set[int] = set()
-    groups: list[list[int]] = []
+    if not hash_to_ids:
+        return counts
 
+    uf = _UnionFind()
+    for phash, ids in hash_to_ids.items():
+        for file_id in ids:
+            uf.add(file_id)
+        if len(ids) < 2:
+            continue
+        dist = hash_distance(phash, phash)
+        if dist is not None and dist <= threshold:
+            anchor = ids[0]
+            for file_id in ids[1:]:
+                uf.union(anchor, file_id)
+
+    candidates = _perceptual_candidate_pairs(list(hash_to_ids), threshold)
     with Progress(
         SpinnerColumn(),
         TextColumn("[bold yellow]{task.description}"),
@@ -209,27 +364,27 @@ def find_perceptual_duplicates(threshold: int | None = None, session_id: str | N
         TaskProgressColumn(),
         TimeElapsedColumn(),
     ) as progress:
-        task = progress.add_task("Comparing perceptual hashes…", total=len(hashes))
-
-        for i, (id_a, hash_a) in enumerate(hashes):
+        task = progress.add_task(
+            "Comparing perceptual hashes…",
+            total=max(len(candidates), 1),
+        )
+        if not candidates:
             progress.advance(task)
-            if id_a in visited:
-                continue
-            group = [id_a]
-            for id_b, hash_b in hashes[i + 1:]:
-                if id_b in visited:
-                    continue
-                if is_near_duplicate(hash_a, hash_b, threshold=threshold):
-                    group.append(id_b)
-            if len(group) > 1:
-                for gid in group:
-                    visited.add(gid)
-                groups.append(group)
+        for hash_a, hash_b in candidates:
+            dist = hash_distance(hash_a, hash_b)
+            if dist is not None and dist <= threshold:
+                uf.union(hash_to_ids[hash_a][0], hash_to_ids[hash_b][0])
+            progress.advance(task)
+
+    groups = [
+        sorted(members)
+        for members in uf.components().values()
+        if len(members) > 1
+    ]
 
     with Session(engine) as session:
         for group in groups:
-            # Use string of sorted IDs as group key
-            group_hash = "-".join(str(x) for x in sorted(group))
+            group_hash = "-".join(str(x) for x in group)
             _upsert_group(
                 session,
                 DupeType.PERCEPTUAL,
@@ -267,7 +422,12 @@ def _tags_overlap(tags1: list[str], tags2: list[str]) -> float:
 
 
 def find_semantic_duplicates(session_id: str | None = None) -> dict:
-    """Find semantically similar files using AI descriptions and tags."""
+    """Find semantically similar files using AI descriptions and tags.
+
+    A pair is scored only when it shares a tag and the same mime group.
+    Union-find keeps a chain in one group. Each group is stored as
+    DupeType.SEMANTIC with the mean similarity of the links that joined it.
+    """
     engine = get_engine()
     counts = {"groups": 0, "duplicates": 0}
 
@@ -285,9 +445,27 @@ def find_semantic_duplicates(session_id: str | None = None) -> dict:
     if len(rows) < 2:
         return counts
 
-    # O(n²) comparison of AI descriptions and tags
-    visited: set[int] = set()
-    groups: list[list[int]] = []
+    # file_id, description, tags, mime group (part before '/')
+    records: list[tuple[int, str, list[str], str]] = []
+    for file_id, desc, tags_raw, mime in rows:
+        records.append((
+            file_id,
+            desc or "",
+            _parse_tags(tags_raw),
+            (mime or "").split("/")[0],
+        ))
+
+    buckets: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for index, (_file_id, _desc, tags, mime_group) in enumerate(records):
+        for tag in dict.fromkeys(tags):
+            buckets[(mime_group, tag)].append(index)
+
+    uf = _UnionFind()
+    for file_id, _desc, _tags, _mime_group in records:
+        uf.add(file_id)
+
+    seen_pairs: set[tuple[int, int]] = set()
+    links: list[tuple[int, int, float]] = []
 
     with Progress(
         SpinnerColumn(),
@@ -296,62 +474,50 @@ def find_semantic_duplicates(session_id: str | None = None) -> dict:
         TaskProgressColumn(),
         TimeElapsedColumn(),
     ) as progress:
-        task = progress.add_task("Comparing AI descriptions…", total=len(rows))
-
-        for i, (id_a, desc_a, tags_a, mime_a) in enumerate(rows):
+        task = progress.add_task(
+            "Comparing AI descriptions…",
+            total=max(len(buckets), 1),
+        )
+        if not buckets:
             progress.advance(task)
-            if id_a in visited:
+        for indexes in buckets.values():
+            progress.advance(task)
+            if len(indexes) < 2:
                 continue
+            for left in range(len(indexes)):
+                ia = indexes[left]
+                id_a, desc_a, tags_a, _mime_a = records[ia]
+                for right in range(left + 1, len(indexes)):
+                    ib = indexes[right]
+                    pair = (ia, ib) if ia < ib else (ib, ia)
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    id_b, desc_b, tags_b, _mime_b = records[ib]
+                    # 40% description, 60% tags (tags are more consistent)
+                    combined = (
+                        0.4 * _string_similarity(desc_a, desc_b)
+                        + 0.6 * _tags_overlap(tags_a, tags_b)
+                    )
+                    if combined >= AI_SIMILARITY_THRESHOLD:
+                        uf.union(id_a, id_b)
+                        links.append((id_a, id_b, combined))
 
-            group = [id_a]
-            group_sims = {}  # id_b -> combined_sim
-            mime_group_a = (mime_a or "").split("/")[0]  # e.g. "image", "application"
-            tags_a_list = []
-            try:
-                if tags_a:
-                    tags_a_list = json.loads(tags_a)
-            except (json.JSONDecodeError, TypeError):
-                pass
+    sims: dict[int, list[float]] = defaultdict(list)
+    for id_a, _id_b, combined in links:
+        sims[uf.find(id_a)].append(combined)
 
-            for id_b, desc_b, tags_b, mime_b in rows[i + 1:]:
-                if id_b in visited:
-                    continue
-
-                # Only compare files of the same broad MIME type to avoid
-                # cross-type false positives (e.g. image vs PDF)
-                mime_group_b = (mime_b or "").split("/")[0]
-                if mime_group_a and mime_group_b and mime_group_a != mime_group_b:
-                    continue
-
-                # Calculate similarity across description and tags
-                desc_sim = _string_similarity(desc_a or "", desc_b or "")
-
-                tags_b_list = []
-                try:
-                    if tags_b:
-                        tags_b_list = json.loads(tags_b)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
-                tags_sim = _tags_overlap(tags_a_list, tags_b_list)
-
-                # Weighted average: 40% description, 60% tags (tags are more consistent)
-                combined_sim = 0.4 * desc_sim + 0.6 * tags_sim
-
-                if combined_sim >= AI_SIMILARITY_THRESHOLD:
-                    group.append(id_b)
-                    group_sims[id_b] = combined_sim
-
-            if len(group) > 1:
-                for gid in group:
-                    visited.add(gid)
-                avg_sim = (sum(group_sims.values()) / len(group_sims)) if group_sims else AI_SIMILARITY_THRESHOLD
-                groups.append((group, round(avg_sim, 2)))
+    grouped: list[tuple[list[int], float]] = []
+    for root, members in uf.components().items():
+        if len(members) < 2:
+            continue
+        edge_sims = sims.get(root, [])
+        avg = (sum(edge_sims) / len(edge_sims)) if edge_sims else AI_SIMILARITY_THRESHOLD
+        grouped.append((sorted(members), round(avg, 2)))
 
     with Session(engine) as session:
-        for group, avg_sim in groups:
-            # Use string of sorted IDs as group key
-            group_hash = "-".join(str(x) for x in sorted(group))
+        for group, avg_sim in grouped:
+            group_hash = "-".join(str(x) for x in group)
             _upsert_group(
                 session,
                 DupeType.SEMANTIC,

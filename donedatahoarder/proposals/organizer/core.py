@@ -6,6 +6,7 @@ runs the deterministic backstops.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -27,6 +28,33 @@ from .text_utils import _normalize_folder_name
 from .tree import _format_tree_for_prompt, build_folder_tree
 
 logger = logging.getLogger(__name__)
+
+# LIKE escape that will not show up as a path separator.
+_LIKE_ESCAPE = "!"
+
+
+def _folder_child_like(folder: str) -> str:
+    """LIKE pattern for children of ``folder``.
+
+    A trailing separator is required so ``tax`` does not match ``tax_archive``.
+    ``%`` and ``_`` in the folder name are escaped.
+    """
+    root = str(Path(folder))
+    escaped = (
+        root.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+        .replace("%", _LIKE_ESCAPE + "%")
+        .replace("_", _LIKE_ESCAPE + "_")
+    )
+    return escaped + os.sep + "%"
+
+
+def _path_within_folder(folder: str, file_path: str) -> bool:
+    """True when ``file_path`` is ``folder`` or a path inside it."""
+    try:
+        Path(file_path).relative_to(folder)
+    except ValueError:
+        return False
+    return True
 
 
 def generate_reorg_proposals(session_id: str) -> dict:
@@ -169,12 +197,13 @@ def generate_reorg_proposals(session_id: str) -> dict:
                     counts["skipped"] += 1
                     continue
 
-                # Find a representative file in this folder to anchor the proposal
+                # Find a representative file in this folder to anchor the proposal.
+                # Children only: `tax` must not pick up `tax_archive`.
                 anchor_file = db.query(File).filter(
                     File.session_id == session_id,
-                    File.path.like(f"{src_abs}%"),
+                    File.path.like(_folder_child_like(src_abs), escape=_LIKE_ESCAPE),
                 ).first()
-                if not anchor_file:
+                if not anchor_file or not _path_within_folder(src_abs, anchor_file.path):
                     counts["skipped"] += 1
                     continue
 
@@ -216,11 +245,12 @@ def generate_reorg_proposals(session_id: str) -> dict:
                 src_abs = str(Path(root_path) / _normalize_folder_name(src_folder))
                 dst_abs = str(Path(root_path) / _normalize_folder_name(dst_folder))
 
-                # Look up each named file in the source folder
+                # Look up each named file in the source folder.
+                # Children only: `tax` must not pick up `tax_archive`.
                 for fname in filenames:
                     file_rec = db.query(File).filter(
                         File.session_id == session_id,
-                        File.path.like(f"{src_abs}%"),
+                        File.path.like(_folder_child_like(src_abs), escape=_LIKE_ESCAPE),
                         File.filename == fname,
                         File.status.in_([
                             FileStatus.ANALYZED,
@@ -232,6 +262,11 @@ def generate_reorg_proposals(session_id: str) -> dict:
                         continue
 
                     src_path = Path(file_rec.path)
+                    if not _path_within_folder(src_abs, file_rec.path):
+                        # Outside the source folder. Skip it; do not flatten
+                        # the path down to the bare filename.
+                        counts["skipped"] += 1
+                        continue
                     dst_path = Path(dst_abs) / src_path.name
                     if str(src_path) == str(dst_path):
                         counts["skipped"] += 1
@@ -270,10 +305,11 @@ def generate_reorg_proposals(session_id: str) -> dict:
             src_abs = str(Path(root_path) / _normalize_folder_name(src_folder))
             dst_abs = str(Path(root_path) / _normalize_folder_name(dst_folder))
 
-            # Find files in source folder
+            # Find files in source folder.
+            # Children only: `tax` must not pick up `tax_archive`.
             query = db.query(File).filter(
                 File.session_id == session_id,
-                File.path.like(f"{src_abs}%"),
+                File.path.like(_folder_child_like(src_abs), escape=_LIKE_ESCAPE),
                 File.status.in_([
                     FileStatus.ANALYZED,
                     FileStatus.PROPOSED,
@@ -297,13 +333,13 @@ def generate_reorg_proposals(session_id: str) -> dict:
                     if filter_words and not any(w in desc or w in tags for w in filter_words):
                         continue
 
-                # Build destination path (preserve filename)
+                # Build destination path (preserve the path under the source folder).
+                # A path that is not under the source folder is skipped, not
+                # collapsed to just the filename.
                 src_path = Path(file_rec.path)
-                # Compute the relative path within the source folder
                 try:
                     rel_to_src = src_path.relative_to(src_abs)
                 except ValueError:
-                    # LIKE can match a sibling such as tax_archive. Leave it alone.
                     continue
                 dst_path = Path(dst_abs) / rel_to_src
 

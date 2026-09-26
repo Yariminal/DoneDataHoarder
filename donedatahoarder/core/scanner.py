@@ -275,6 +275,17 @@ def _collect_file_stat(
         return {"_error": True, "path": path_str}
 
 
+def _known_paths(session: Session, session_id: str | None) -> set[str]:
+    """Every path already indexed for this session.
+
+    One query. Callers check the set instead of selecting per file.
+    The session_id filter stays so a sibling session's copy of the same
+    path is not treated as known.
+    """
+    rows = session.query(File.path).filter_by(session_id=session_id)
+    return {row[0] for row in rows}
+
+
 def scan(
     root: Path,
     force_rescan: bool = False,
@@ -306,6 +317,7 @@ def scan(
         session.add(sess_record)
         session.commit()
         scan_session_id = sess_record.id
+        known_paths = _known_paths(session, session_id)
 
     counts = {"new": 0, "skipped": 0, "errors": 0}
     logger.info(
@@ -338,20 +350,31 @@ def scan(
                 "Flushing batch",
                 extra={"batch_size": len(batch), "counts": counts.copy()},
             )
+            # The set already answered "is this path known?". Load ORM rows
+            # only when a rescan has to update them, and only for this batch.
+            existing_by_path: dict[str, File] = {}
+            if force_rescan:
+                update_paths = [
+                    record["path"]
+                    for record in batch
+                    if not record.get("_error") and record["path"] in known_paths
+                ]
+                if update_paths:
+                    rows = (
+                        session.query(File)
+                        .filter_by(session_id=session_id)
+                        .filter(File.path.in_(update_paths))
+                        .all()
+                    )
+                    existing_by_path = {row.path: row for row in rows}
             for record in batch:
                 if record.get("_error"):
                     counts["errors"] += 1
                     continue
                 path_str = record["path"]
                 last_path = path_str
-                existing = (
-                    session.query(File)
-                    .filter_by(path=path_str, session_id=session_id)
-                    .first()
-                )
-                if existing and not force_rescan:
-                    counts["skipped"] += 1
-                elif existing:
+                existing = existing_by_path.get(path_str)
+                if existing is not None:
                     # Update basic stat fields, reset status
                     for k, v in record.items():
                         if k.startswith("_"):
@@ -359,8 +382,11 @@ def scan(
                         setattr(existing, k, v)
                     existing.status = FileStatus.PENDING
                     counts["new"] += 1
+                elif path_str in known_paths and not force_rescan:
+                    counts["skipped"] += 1
                 else:
                     session.add(File(**{k: v for k, v in record.items() if not k.startswith("_")}))
+                    known_paths.add(path_str)
                     counts["new"] += 1
             session.commit()
             # Persist resume point
@@ -376,47 +402,55 @@ def scan(
         total_files = len(all_paths)
         progress.update(task, total=total_files)
 
+        def _is_known(path_str: str) -> bool:
+            return (not force_rescan) and path_str in known_paths
+
         if workers > 1:
-            # Parallel stat collection, sequential DB writes
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {
-                    pool.submit(_collect_file_stat, fp, force_rescan, session_id): fp
-                    for fp in all_paths
-                }
-                with Session(engine) as session:
-                    for future in concurrent.futures.as_completed(futures):
-                        file_path = futures[future]
-                        progress.advance(task)
-                        path_str = str(file_path.resolve())
+            # Parallel stat collection, sequential DB writes.
+            # Known paths never hit the disk or the database again.
+            to_stat: list[Path] = []
+            for file_path in all_paths:
+                path_str = str(file_path.resolve())
+                if _is_known(path_str):
+                    counts["skipped"] += 1
+                    progress.advance(task)
+                    continue
+                to_stat.append(file_path)
 
-                        if not force_rescan:
-                            exists = (
-                                session.query(File.id)
-                                .filter_by(path=path_str, session_id=session_id)
-                                .scalar()
-                            )
-                            if exists is not None:
-                                counts["skipped"] += 1
+            if to_stat:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = {
+                        pool.submit(_collect_file_stat, fp, force_rescan, session_id): fp
+                        for fp in to_stat
+                    }
+                    with Session(engine) as session:
+                        for future in concurrent.futures.as_completed(futures):
+                            file_path = futures[future]
+                            progress.advance(task)
+                            path_str = str(file_path.resolve())
+
+                            try:
+                                record = future.result()
+                            except Exception as exc:
+                                counts["errors"] += 1
+                                logger.warning(
+                                    "Scan error for file",
+                                    extra={"path": path_str, "error": str(exc)},
+                                )
                                 continue
-
-                        try:
-                            record = future.result()
+                            if record is None:
+                                counts["errors"] += 1
+                                continue
                             batch.append(record)
-                        except Exception as exc:
-                            counts["errors"] += 1
-                            logger.warning(
-                                "Scan error for file",
-                                extra={"path": path_str, "error": str(exc)},
-                            )
 
-                        if len(batch) >= BATCH_SIZE:
-                            _flush(session)
-                            progress.update(
-                                task,
-                                description=f"Scanning… {counts['new']} new, {counts['skipped']} skipped",
-                            )
+                            if len(batch) >= BATCH_SIZE:
+                                _flush(session)
+                                progress.update(
+                                    task,
+                                    description=f"Scanning… {counts['new']} new, {counts['skipped']} skipped",
+                                )
 
-                    _flush(session)
+                        _flush(session)
         else:
             # Sequential path (original behaviour)
             with Session(engine) as session:
@@ -424,15 +458,9 @@ def scan(
                     progress.advance(task)
                     path_str = str(file_path.resolve())
 
-                    if not force_rescan:
-                        exists = (
-                            session.query(File.id)
-                            .filter_by(path=path_str, session_id=session_id)
-                            .scalar()
-                        )
-                        if exists is not None:
-                            counts["skipped"] += 1
-                            continue
+                    if _is_known(path_str):
+                        counts["skipped"] += 1
+                        continue
 
                     record = _collect_file_stat(file_path, force_rescan, session_id)
                     if record is None or record.get("_error"):

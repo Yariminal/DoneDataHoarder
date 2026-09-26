@@ -138,39 +138,13 @@ def analyze(
     """
     Run AI analysis on all ENRICHED files (CLI version with Rich progress).
 
-    Args:
-        workers:          Ignored (kept for API compat). Processing is sequential.
-        limit:            Process at most this many files.
-        min_size_kb:      Skip files smaller than this.
-        skip_extensions:  Set of extensions to skip (e.g. {'.db', '.iso'}).
+    Delegates to analyze_with_progress so ``workers`` actually parallelizes.
+    The batch query there skips files smaller than ``min_size_kb``.
 
     Returns:
         Summary dict with counts.
     """
-    from donedatahoarder.ai.router import get_client
-
-    client = get_client()
-    analyzer_list: list[BaseAnalyzer] = [
-        ImageAnalyzer(client),
-        VideoAnalyzer(client),
-        DocumentAnalyzer(client),
-        ArchiveAnalyzer(client),
-        ThreeDModelAnalyzer(client),
-    ]
-
-    engine = get_engine()
     counts = {"analyzed": 0, "skipped": 0, "errors": 0}
-    skip_ext = skip_extensions or set()
-
-    with Session(engine) as session:
-        query = session.query(File).filter(File.status == FileStatus.ENRICHED)
-        if session_id:
-            query = query.filter(File.session_id == session_id)
-        if min_size_kb:
-            query = query.filter(File.size_bytes >= min_size_kb * 1024)
-        if limit:
-            query = query.limit(limit)
-        total = query.count()
 
     with Progress(
         SpinnerColumn(),
@@ -181,44 +155,30 @@ def analyze(
         TimeElapsedColumn(),
         refresh_per_second=2,
     ) as progress:
-        task = progress.add_task("Analyzing...", total=total)
-        processed = 0
-
-        while True:
-            with Session(engine) as session:
-                batch = (
-                    session.query(File.id)
-                    .filter(File.status == FileStatus.ENRICHED)
-                    .filter(File.session_id == session_id)
-                    .limit(QUERY_BATCH)
-                    .all()
-                ) if session_id else (
-                    session.query(File.id)
-                    .filter(File.status == FileStatus.ENRICHED)
-                    .limit(QUERY_BATCH)
-                    .all()
-                )
-            if not batch:
-                break
-
-            for (file_id,) in batch:
-                fid, status, error = _process_one_file(
-                    file_id, engine, analyzer_list, client, skip_ext,
-                )
-                counts[status if status in counts else "errors"] += 1
-                progress.advance(task)
+        task = progress.add_task("Analyzing...", total=0)
+        for event in analyze_with_progress(
+            workers=workers,
+            limit=limit,
+            min_size_kb=min_size_kb,
+            skip_extensions=skip_extensions,
+            session_id=session_id,
+        ):
+            counts["analyzed"] = event.get("analyzed", counts["analyzed"])
+            counts["skipped"] = event.get("skipped", counts["skipped"])
+            counts["errors"] = event.get("errors", counts["errors"])
+            if event.get("total") is not None:
+                progress.update(task, total=event["total"])
+            current = event.get("current")
+            if current:
                 progress.update(
                     task,
+                    completed=current,
                     description=(
                         f"Analyzing... done:{counts['analyzed']} "
                         f"skip:{counts['skipped']} err:{counts['errors']}"
                     ),
                 )
-                processed += 1
-                if limit and processed >= limit:
-                    break
-
-            if limit and processed >= limit:
+            if event.get("done") or event.get("cancelled"):
                 break
 
     return counts
@@ -288,6 +248,8 @@ def analyze_with_progress(
             awp_q = db.query(File.id).filter(File.status == FileStatus.ENRICHED)
             if session_id:
                 awp_q = awp_q.filter(File.session_id == session_id)
+            if min_size_kb:
+                awp_q = awp_q.filter(File.size_bytes >= min_size_kb * 1024)
             batch = awp_q.limit(QUERY_BATCH).all()
         if not batch:
             break

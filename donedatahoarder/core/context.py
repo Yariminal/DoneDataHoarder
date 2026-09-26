@@ -5,6 +5,7 @@ This context is fed to the AI so it can make informed naming/tagging decisions
 even when the filename itself is useless (e.g. "IMG_0042.jpg" or "FINAL2.docx").
 """
 import re
+import threading
 from pathlib import Path
 
 from donedatahoarder.db.models import File
@@ -16,6 +17,11 @@ _NON_WORD = re.compile(r"[^a-zA-Z0-9]+")
 # How many siblings to include in context (avoid context-window explosion)
 MAX_SIBLINGS = 15
 MAX_PARENT_DEPTH = 4  # how many folder levels to walk up
+
+# Directory listings are stable for a run and expensive on big folders.
+# Keyed by directory, shared by every worker in the process.
+_DIR_FILE_CACHE: dict[Path, tuple[str, ...]] = {}
+_DIR_FILE_CACHE_LOCK = threading.Lock()
 
 
 def _tokenise(name: str) -> list[str]:
@@ -41,15 +47,30 @@ def _folder_chain(path: Path, max_depth: int = MAX_PARENT_DEPTH) -> list[str]:
     return parts  # nearest-first
 
 
+def _cached_directory_filenames(directory: Path) -> tuple[str, ...]:
+    """File names in ``directory``. Cached for the life of the process.
+
+    Permission errors are cached as an empty listing so a forbidden folder
+    is not restated on every sibling.
+    """
+    with _DIR_FILE_CACHE_LOCK:
+        cached = _DIR_FILE_CACHE.get(directory)
+        if cached is not None:
+            return cached
+    try:
+        names = tuple(p.name for p in directory.iterdir() if p.is_file())
+    except PermissionError:
+        names = ()
+    with _DIR_FILE_CACHE_LOCK:
+        return _DIR_FILE_CACHE.setdefault(directory, names)
+
+
 def _sibling_summary(path: Path, max_siblings: int = MAX_SIBLINGS) -> str:
     """Summarise nearby files in the same directory."""
-    try:
-        siblings = [
-            p.name for p in path.parent.iterdir()
-            if p.is_file() and p != path
-        ]
-    except PermissionError:
-        return ""
+    siblings = [
+        name for name in _cached_directory_filenames(path.parent)
+        if name != path.name
+    ]
 
     # Sort: prefer files that share the same extension
     same_ext = [s for s in siblings if Path(s).suffix.lower() == path.suffix.lower()]
