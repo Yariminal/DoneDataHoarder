@@ -20,15 +20,11 @@ router = APIRouter()
 @router.get("/info")
 def get_info():
     """Get app version and info."""
-    try:
-        from importlib.metadata import version
-        app_version = version("donedatahoarder")
-    except Exception:
-        app_version = "0.3.0"
+    from donedatahoarder import __version__
 
     return {
         "name": "DoneDataHoarder",
-        "version": app_version,
+        "version": __version__,
         "description": "AI-powered file organization for data hoarders",
     }
 

@@ -24,10 +24,12 @@ def create_app(db_path: Path) -> FastAPI:
 
     init_db(db_path)
 
+    from donedatahoarder import __version__
+
     app = FastAPI(
         title="DoneDataHoarder",
         description="AI-powered file organization",
-        version="0.3.0",
+        version=__version__,
     )
 
     # CSRF guard: any webpage can fire fetch() at http://127.0.0.1:<port>,

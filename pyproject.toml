@@ -75,6 +75,10 @@ Issues = "https://github.com/Yariminal/DoneDataHoarder/issues"
 [project.scripts]
 ddh = "donedatahoarder.cli:app"
 
+[tool.pytest.ini_options]
+# Manual live-server script. It imports requests and talks to a running GUI.
+addopts = "--ignore=tests/test_pipeline.py"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["donedatahoarder*"]

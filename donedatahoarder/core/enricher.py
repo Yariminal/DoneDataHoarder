@@ -7,10 +7,11 @@ Safe to re-run; already-enriched files are skipped.
 import hashlib
 import mimetypes
 import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from donedatahoarder.timeutils import utcnow
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 from rich.progress import (
     BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
@@ -55,6 +56,11 @@ except ImportError:
 CHUNK = 65_536  # 64 KB read chunks for hashing
 BATCH_SIZE = 200
 
+# libmagic keeps one global cookie. from_file on that cookie is not safe
+# to re-enter, so mime detection takes this lock and the heavy reads
+# (md5, exif, phash) stay outside it.
+_MIME_LOCK = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Low-level helpers
@@ -75,7 +81,8 @@ def _mime_type(path: Path) -> str:
     """Best-effort MIME type detection."""
     if _HAS_MAGIC:
         try:
-            result = magic.from_file(str(path), mime=True)
+            with _MIME_LOCK:
+                result = magic.from_file(str(path), mime=True)
             # Guard: libmagic on Windows sometimes returns error messages
             # instead of raising exceptions (especially for Unicode paths).
             # Valid MIME types look like "type/subtype", never start with
@@ -133,8 +140,186 @@ def _audio_date(path: Path) -> Optional[datetime]:
 
 
 def _perceptual_hash(path: Path) -> Optional[str]:
-    """Compute perceptual hash for images and videos (delegates to phash module)."""
+    """Compute perceptual hash for images and videos (delegates to phash module).
+
+    Hash the file as stored. Resizing before the hash changes the digest.
+    """
     return _compute_phash(path)
+
+
+def _disk_metadata(path: Path) -> dict:
+    """Read mime, md5, exif, and perceptual hash. No database access."""
+    if not path.exists():
+        return {"missing": True}
+
+    mime = _mime_type(path) or ""
+    digest = _md5(path)
+    date_exif = None
+    perceptual = None
+    have_exif = False
+    have_phash = False
+
+    if mime.startswith("image/"):
+        date_exif = _exif_date(path)
+        perceptual = _perceptual_hash(path)
+        have_exif = True
+        have_phash = True
+    elif mime.startswith(("video/", "audio/")):
+        date_exif = _audio_date(path)
+        have_exif = True
+        if mime.startswith("video/"):
+            perceptual = _perceptual_hash(path)
+            have_phash = True
+
+    return {
+        "mime_type": mime,
+        "hash_md5": digest,
+        "date_exif": date_exif,
+        "have_exif": have_exif,
+        "hash_perceptual": perceptual,
+        "have_phash": have_phash,
+    }
+
+
+def _safe_disk(path_str: str) -> dict:
+    """Worker entry point. Exceptions stay off the database thread."""
+    try:
+        return _disk_metadata(Path(path_str))
+    except Exception as exc:
+        return {"error": str(exc)[:500]}
+
+
+def _apply_disk_result(file_rec: File, result: dict) -> str:
+    """Write one disk result onto a File row. Caller owns the session."""
+    if result.get("missing"):
+        file_rec.status = FileStatus.ERROR
+        file_rec.error_message = "File not found on disk"
+        return "errors"
+    if "error" in result:
+        file_rec.status = FileStatus.ERROR
+        file_rec.error_message = result["error"]
+        logger.warning(
+            "Enrichment failed",
+            extra={"path": str(file_rec.path), "error": result["error"]},
+        )
+        return "errors"
+
+    file_rec.mime_type = result["mime_type"]
+    file_rec.hash_md5 = result["hash_md5"]
+    if result["have_exif"]:
+        file_rec.date_exif = result["date_exif"]
+    if result["have_phash"]:
+        file_rec.hash_perceptual = result["hash_perceptual"]
+
+    exif = result["date_exif"] if result["have_exif"] else file_rec.date_exif
+    file_rec.date_best = _best_date(
+        exif,
+        file_rec.date_modified,
+        file_rec.date_created,
+    )
+    file_rec.status = FileStatus.ENRICHED
+    file_rec.enriched_at = utcnow()
+    return "enriched"
+
+
+def _pending_snapshot(engine, session_id: str | None, take: int) -> list[dict]:
+    """Copy id and path for a pending batch. The session closes before disk work."""
+    with Session(engine) as session:
+        query = session.query(File.id, File.path).filter(File.status == FileStatus.PENDING)
+        if session_id:
+            query = query.filter(File.session_id == session_id)
+        rows = query.limit(take).all()
+    return [{"id": row[0], "path": row[1]} for row in rows]
+
+
+def _iter_disk(
+    snapshots: list[dict],
+    workers: int,
+    pause_event: "threading.Event | None",
+    cancel_check: "Callable[[], bool] | None",
+) -> Iterator[tuple]:
+    """Yield ('item', snap, result) as disk work finishes.
+
+    At most `workers` reads run at once. Pause blocks before a new read
+    starts. Cancel stops scheduling; reads already running still yield so
+    the caller can write them.
+    """
+    worker_count = max(1, workers)
+    cancelled = False
+
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        inflight: dict = {}
+        pending = iter(snapshots)
+
+        def pull() -> bool:
+            nonlocal cancelled
+            if cancel_check and cancel_check():
+                cancelled = True
+                return False
+            if pause_event is not None:
+                pause_event.wait()
+            # Cancel during a pause must not start another file once we wake.
+            if cancel_check and cancel_check():
+                cancelled = True
+                return False
+            try:
+                snap = next(pending)
+            except StopIteration:
+                return False
+            inflight[pool.submit(_safe_disk, snap["path"])] = snap
+            return True
+
+        for _ in range(worker_count):
+            if not pull():
+                break
+
+        while inflight:
+            done, _ = wait(tuple(inflight), return_when=FIRST_COMPLETED)
+            for fut in done:
+                snap = inflight.pop(fut)
+                try:
+                    result = fut.result()
+                except Exception as exc:
+                    result = {"error": str(exc)[:500]}
+                yield ("item", snap, result)
+            if cancelled:
+                continue
+            while len(inflight) < worker_count:
+                if not pull():
+                    break
+
+    if cancelled:
+        yield ("cancelled", None, None)
+
+
+def _write_disk_results(
+    engine,
+    snapshots: list[dict],
+    workers: int,
+    counts: dict,
+    pause_event: "threading.Event | None" = None,
+    cancel_check: "Callable[[], bool] | None" = None,
+) -> Iterator[str]:
+    """Apply disk results on this thread. Yields 'file' or 'cancelled'."""
+    if not snapshots:
+        return
+    stream = _iter_disk(snapshots, workers, pause_event, cancel_check)
+    try:
+        with Session(engine) as session:
+            for kind, snap, result in stream:
+                if kind == "cancelled":
+                    session.commit()
+                    yield "cancelled"
+                    return
+                file_rec = session.get(File, snap["id"])
+                if file_rec is None:
+                    counts["errors"] += 1
+                else:
+                    counts[_apply_disk_result(file_rec, result)] += 1
+                yield "file"
+            session.commit()
+    finally:
+        stream.close()
 
 
 def _best_date(
@@ -149,12 +334,24 @@ def _best_date(
 # Main enrichment function
 # ---------------------------------------------------------------------------
 
+def _take(counts: dict, limit: Optional[int]) -> Optional[int]:
+    """How many pending rows to pull this batch. None means stop."""
+    take = BATCH_SIZE
+    if limit:
+        remaining = limit - (counts["enriched"] + counts["errors"])
+        if remaining <= 0:
+            return None
+        take = min(BATCH_SIZE, remaining)
+    return take
+
+
 def enrich(workers: int = 1, limit: Optional[int] = None, session_id: str | None = None) -> dict:
     """
     Enrich all PENDING File records with metadata and hashes.
 
     Args:
-        workers: reserved for future async implementation (currently sequential)
+        workers: parallel threads for disk work (mime, md5, exif, phash).
+                 Database writes stay on the caller thread.
         limit:   process at most this many files (useful for testing)
         session_id: if set, only enrich files belonging to this session
 
@@ -184,69 +381,18 @@ def enrich(workers: int = 1, limit: Optional[int] = None, session_id: str | None
         task = progress.add_task("Enriching…", total=total)
 
         while True:
-            with Session(engine) as session:
-                # Always query from offset 0: processed files change status
-                # and no longer match the PENDING filter.
-                enrich_q = session.query(File).filter(File.status == FileStatus.PENDING)
-                if session_id:
-                    enrich_q = enrich_q.filter(File.session_id == session_id)
-                batch = enrich_q.limit(BATCH_SIZE).all()
-                if not batch:
-                    break
+            # Always query from offset 0: processed files change status
+            # and no longer match the PENDING filter.
+            take = _take(counts, limit)
+            if take is None:
+                break
+            snapshots = _pending_snapshot(engine, session_id, take)
+            if not snapshots:
+                break
 
-                for file_rec in batch:
-                    path = Path(file_rec.path)
-
-                    if not path.exists():
-                        file_rec.status = FileStatus.ERROR
-                        file_rec.error_message = "File not found on disk"
-                        counts["errors"] += 1
-                        progress.advance(task)
-                        continue
-
-                    try:
-                        # MIME type
-                        file_rec.mime_type = _mime_type(path)
-                        mime = file_rec.mime_type or ""
-
-                        # Hashes
-                        file_rec.hash_md5 = _md5(path)
-
-                        # EXIF / audio dates + perceptual hashes
-                        if mime.startswith("image/"):
-                            file_rec.date_exif = _exif_date(path)
-                            file_rec.hash_perceptual = _perceptual_hash(path)
-                        elif mime.startswith(("video/", "audio/")):
-                            file_rec.date_exif = _audio_date(path)
-                            # Video thumbnail pHash (best-effort via ffmpeg)
-                            if mime.startswith("video/"):
-                                file_rec.hash_perceptual = _perceptual_hash(path)
-
-                        file_rec.date_best = _best_date(
-                            file_rec.date_exif,
-                            file_rec.date_modified,
-                            file_rec.date_created,
-                        )
-
-                        file_rec.status = FileStatus.ENRICHED
-                        file_rec.enriched_at = utcnow()
-                        counts["enriched"] += 1
-
-                    except Exception as exc:
-                        file_rec.status = FileStatus.ERROR
-                        file_rec.error_message = str(exc)[:500]
-                        counts["errors"] += 1
-                        logger.warning(
-                            "Enrichment failed",
-                            extra={
-                                "path": str(path),
-                                "error": str(exc),
-                            },
-                        )
-
+            for event in _write_disk_results(engine, snapshots, workers, counts):
+                if event == "file":
                     progress.advance(task)
-
-                session.commit()
 
             if limit and (counts["enriched"] + counts["errors"]) >= limit:
                 break
@@ -256,6 +402,7 @@ def enrich(workers: int = 1, limit: Optional[int] = None, session_id: str | None
         extra={
             "enriched": counts["enriched"],
             "errors": counts["errors"],
+            "workers": workers,
         },
     )
     return counts
@@ -270,6 +417,10 @@ def enrich_with_progress(
 ):
     """
     Like enrich() but yields progress dicts for SSE streaming.
+
+    `workers` threads read mime, md5, exif, and perceptual hashes.
+    Database writes stay on the caller thread. Pause and cancel are
+    checked before a file's disk work is started.
     """
     engine = get_engine()
     counts = {"enriched": 0, "errors": 0, "skipped": 0}
@@ -288,71 +439,33 @@ def enrich_with_progress(
 
     current = 0
     while True:
-        with Session(engine) as session:
-            # Always query from offset 0: processed files change status
-            # and no longer match the PENDING filter.
-            enrich_q = session.query(File).filter(File.status == FileStatus.PENDING)
-            if session_id:
-                enrich_q = enrich_q.filter(File.session_id == session_id)
-            batch = enrich_q.limit(BATCH_SIZE).all()
-            if not batch:
-                break
-
-            for file_rec in batch:
-                # Check for cancel
-                if cancel_check and cancel_check():
-                    session.commit()
-                    yield {"cancelled": True, **counts}
-                    return
-
-                # Block if paused
-                if pause_event:
-                    pause_event.wait()
-
-                path = Path(file_rec.path)
-                current += 1
-
-                if not path.exists():
-                    file_rec.status = FileStatus.ERROR
-                    file_rec.error_message = "File not found on disk"
-                    counts["errors"] += 1
-                    yield {"current": current, "total": total, **counts}
-                    continue
-
-                try:
-                    file_rec.mime_type = _mime_type(path)
-                    mime = file_rec.mime_type or ""
-                    file_rec.hash_md5 = _md5(path)
-
-                    if mime.startswith("image/"):
-                        file_rec.date_exif = _exif_date(path)
-                        file_rec.hash_perceptual = _perceptual_hash(path)
-                    elif mime.startswith(("video/", "audio/")):
-                        file_rec.date_exif = _audio_date(path)
-                        if mime.startswith("video/"):
-                            file_rec.hash_perceptual = _perceptual_hash(path)
-
-                    file_rec.date_best = _best_date(
-                        file_rec.date_exif,
-                        file_rec.date_modified,
-                        file_rec.date_created,
-                    )
-
-                    file_rec.status = FileStatus.ENRICHED
-                    file_rec.enriched_at = utcnow()
-                    counts["enriched"] += 1
-                except Exception as exc:
-                    file_rec.status = FileStatus.ERROR
-                    file_rec.error_message = str(exc)[:500]
-                    counts["errors"] += 1
-
-                yield {"current": current, "total": total, **counts}
-
-            session.commit()
-
         if cancel_check and cancel_check():
             yield {"cancelled": True, **counts}
             return
+
+        # Always query from offset 0: processed files change status
+        # and no longer match the PENDING filter.
+        take = _take(counts, limit)
+        if take is None:
+            break
+        snapshots = _pending_snapshot(engine, session_id, take)
+        if not snapshots:
+            break
+
+        for event in _write_disk_results(
+            engine,
+            snapshots,
+            workers,
+            counts,
+            pause_event=pause_event,
+            cancel_check=cancel_check,
+        ):
+            if event == "cancelled":
+                yield {"cancelled": True, **counts}
+                return
+            current += 1
+            yield {"current": current, "total": total, **counts}
+
         if limit and (counts["enriched"] + counts["errors"]) >= limit:
             break
 
