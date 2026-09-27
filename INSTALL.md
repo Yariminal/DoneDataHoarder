@@ -163,7 +163,7 @@ For contributing:
 ```bash
 git clone https://github.com/Yariminal/DoneDoneDataHoarder.git
 cd DoneDoneDataHoarder
-pip install -e ".[dev]"
+pip install -e ".[dev,web]"
 pip install -e ".[all]"  # Optional: all extras for full feature testing
 ```
 

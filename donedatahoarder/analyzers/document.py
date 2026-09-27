@@ -10,13 +10,19 @@ rendering the first page as a JPEG and sending it to the *vision* model —
 so we still get a meaningful name and tags instead of a blind filename guess.
 """
 import io
+import posixpath
+import re
+import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from xml.etree import ElementTree
 
 from donedatahoarder.analyzers.base import AnalysisResult, BaseAnalyzer, SYSTEM_PROMPT
 from donedatahoarder.db.models import File
 
 MAX_CHARS = 3000   # max text chars to send to AI
+MIN_VERIFIED_TEXT_CHARS = 40
 MAX_PAGES = 3      # max PDF pages to read
 
 # Hard size cap on document *text* extraction (pdfplumber, openpyxl, etc.).
@@ -43,6 +49,8 @@ MAX_PDF_RENDER_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 # to cover cover + table-of-contents + first content page for most
 # brochures / reports, at ~120 KB per JPEG → ~360 KB total upload.
 MAX_VISION_PAGES = 3
+MAX_PPTX_XML_ENTRY_BYTES = 8 * 1024 * 1024
+MAX_PPTX_XML_TOTAL_BYTES = 16 * 1024 * 1024
 
 DOC_EXTENSIONS = {
     ".pdf", ".docx", ".doc", ".odt",
@@ -66,6 +74,71 @@ DOC_MIMES = {
     "application/json", "application/xml", "text/xml",
     "application/rtf", "text/rtf",
 }
+
+
+@dataclass(frozen=True)
+class ExtractionResult:
+    text: str = ""
+    reason: str | None = None
+    extractor: str = "none"
+
+
+_OFFICE_OPENXML = {".docx", ".xlsx", ".pptx"}
+_LEGACY_UNSUPPORTED = {".doc", ".xls", ".ppt", ".odt", ".ods", ".odp"}
+
+
+class ExtractionTooLarge(ValueError):
+    pass
+
+
+def _extract_pptx(path: Path) -> str:
+    """Read visible slide text from the OpenXML package, in slide order."""
+    with zipfile.ZipFile(path) as archive:
+        entries = {info.filename: info for info in archive.infolist()}
+        slides = [n for n in entries if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)]
+        slides.sort(key=lambda name: int(re.search(r"slide(\d+)", name).group(1)))
+        presentation = entries.get("ppt/presentation.xml")
+        relationships = entries.get("ppt/_rels/presentation.xml.rels")
+        if presentation and relationships:
+            if (presentation.file_size > MAX_PPTX_XML_ENTRY_BYTES
+                    or relationships.file_size > MAX_PPTX_XML_ENTRY_BYTES):
+                raise ExtractionTooLarge("PPTX presentation XML exceeds extraction cap")
+            pres_xml = ElementTree.fromstring(archive.read(presentation))
+            rels_xml = ElementTree.fromstring(archive.read(relationships))
+            rel_targets = {
+                rel.get("Id"): rel.get("Target", "")
+                for rel in rels_xml.iter() if rel.tag.endswith("}Relationship")
+                and rel.get("TargetMode") != "External"
+            }
+            rel_ns = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+            ordered = []
+            for node in pres_xml.iter():
+                if not node.tag.endswith("}sldId"):
+                    continue
+                target = rel_targets.get(node.get(rel_ns), "")
+                candidate = (target.lstrip("/") if target.startswith("/") else
+                             posixpath.normpath(posixpath.join("ppt", target)))
+                if candidate in entries and candidate in slides:
+                    ordered.append(candidate)
+            if ordered:
+                slides = list(dict.fromkeys(ordered))
+        if not slides:
+            return ""
+        chunks: list[str] = []
+        expanded = 0
+        for name in slides[:20]:
+            size = entries[name].file_size
+            expanded += size
+            if size > MAX_PPTX_XML_ENTRY_BYTES or expanded > MAX_PPTX_XML_TOTAL_BYTES:
+                raise ExtractionTooLarge("PPTX slide XML exceeds extraction cap")
+            root = ElementTree.fromstring(archive.read(name))
+            words = [node.text.strip() for node in root.iter()
+                     if node.tag.endswith("}t") and node.text and node.text.strip()]
+            if words:
+                chunks.append(" ".join(words))
+            if sum(map(len, chunks)) >= MAX_CHARS:
+                break
+        return "\n".join(chunks)[:MAX_CHARS]
 
 
 # ---------------------------------------------------------------------------
@@ -240,40 +313,74 @@ def _extract_xlsx(path: Path) -> str:
 
 
 def _extract_text(path: Path) -> str:
-    """Read plain-text files with encoding fallbacks."""
+    """Read a bounded plain-text excerpt after rejecting binary/control data."""
     if _file_too_big(path):
         # 1 GB log files / massive CSV exports — skip rather than load into RAM.
         # We only need MAX_CHARS worth anyway; future improvement would be a
         # streaming read of the first MAX_CHARS bytes, but for now skip.
         return ""
-    for enc in ("utf-8", "cp1252", "latin-1"):
+    try:
+        with path.open("rb") as stream:
+            sample = stream.read(MAX_CHARS * 4)
+    except OSError:
+        return ""
+    if not sample or b"\x00" in sample or sample.startswith((b"PK\x03\x04", b"%PDF")):
+        return ""
+    controls = sum(byte < 32 and byte not in (9, 10, 13) for byte in sample)
+    if controls / len(sample) > 0.01:
+        return ""
+    for enc in ("utf-8", "cp1252"):
         try:
-            return path.read_text(encoding=enc)
-        except (UnicodeDecodeError, LookupError):
+            decoded = sample.decode(enc)
+            if sum(ch.isprintable() or ch.isspace() for ch in decoded) / len(decoded) < 0.9:
+                return ""
+            return decoded[:MAX_CHARS]
+        except UnicodeDecodeError:
             continue
-        except OSError:
-            return ""
     return ""
 
 
-def extract_text(path: Path, mime_type: Optional[str] = None) -> str:
-    """Extract readable text from a document, up to MAX_CHARS."""
+def extract_document(path: Path, mime_type: Optional[str] = None) -> ExtractionResult:
+    """Extract a bounded excerpt with an explicit no-content reason."""
     ext = path.suffix.lower()
     mime = mime_type or ""
-
+    if ext in _LEGACY_UNSUPPORTED:
+        return ExtractionResult(reason="unsupported_type")
     if ext == ".pdf" or "pdf" in mime:
-        text = _extract_pdf(path)
-    elif ext in (".docx", ".doc") or "word" in mime:
-        text = _extract_docx(path)
-    elif ext in (".xlsx", ".xls") or "spreadsheet" in mime or "excel" in mime:
-        text = _extract_xlsx(path)
-    elif ext in (".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml",
-                  ".html", ".htm", ".rtf"):
-        text = _extract_text(path)
+        try:
+            import pdfplumber  # noqa: F401
+        except ImportError:
+            return ExtractionResult(reason="missing_dependency", extractor="pdfplumber")
+        text, extractor = _extract_pdf(path), "pdfplumber"
+    elif ext == ".pptx":
+        try:
+            text = _extract_pptx(path)
+        except ExtractionTooLarge:
+            return ExtractionResult(reason="oversized_content", extractor="pptx_openxml")
+        except (OSError, zipfile.BadZipFile, ElementTree.ParseError, ValueError):
+            return ExtractionResult(reason="unreadable_content", extractor="pptx_openxml")
+        extractor = "pptx_openxml"
+    elif ext == ".docx":
+        try:
+            import docx  # noqa: F401
+        except ImportError:
+            return ExtractionResult(reason="missing_dependency", extractor="python-docx")
+        text, extractor = _extract_docx(path), "python-docx"
+    elif ext == ".xlsx":
+        try:
+            import openpyxl  # noqa: F401
+        except ImportError:
+            return ExtractionResult(reason="missing_dependency", extractor="openpyxl")
+        text, extractor = _extract_xlsx(path), "openpyxl"
     else:
-        text = _extract_text(path)  # try anyway
+        text, extractor = _extract_text(path), "bounded_plaintext"
+    text = text[:MAX_CHARS].strip()
+    return ExtractionResult(text=text, reason=None if text else "unreadable_content", extractor=extractor)
 
-    return text[:MAX_CHARS].strip()
+
+def extract_text(path: Path, mime_type: Optional[str] = None) -> str:
+    """Compatibility wrapper for callers needing only the text excerpt."""
+    return extract_document(path, mime_type).text
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +465,8 @@ class DocumentAnalyzer(BaseAnalyzer):
 
     def analyze(self, file_rec: File, context: str) -> AnalysisResult:
         path = Path(file_rec.path)
-        text = extract_text(path, file_rec.mime_type)
+        extraction = extract_document(path, file_rec.mime_type)
+        text = extraction.text
         ext = path.suffix.lower()
 
         # Vision fallback: PDFs that yield near-zero extractable text are
@@ -378,10 +486,21 @@ class DocumentAnalyzer(BaseAnalyzer):
                     file_rec, context, pdf_pages
                 )
                 if vision_result is not None:
+                    vision_result.evidence_source = "vision"
+                    vision_result.extractor = "pdfium_render"
+                    vision_result.content_chars = 0
                     return vision_result
-            # Fall through to the text-only path if rendering or vision
-            # inference failed — the filename-only guess is still better
-            # than no result at all.
+        if not text:
+            return AnalysisResult(
+                description="No readable document content was available",
+                confidence=0.0,
+                content_available=False,
+                evidence_source="none",
+                outcome="skipped",
+                reason=extraction.reason or "unreadable_content",
+                content_chars=0,
+                extractor=extraction.extractor,
+            )
 
         prompt = DOC_PROMPT.format(
             context=context,
@@ -398,6 +517,13 @@ class DocumentAnalyzer(BaseAnalyzer):
             )
 
         result = AnalysisResult.from_ai_response(data)
+        result.evidence_source = "text"
+        result.content_chars = len(text)
+        result.extractor = extraction.extractor
+        if len(text) < MIN_VERIFIED_TEXT_CHARS:
+            result.outcome = "context_only"
+            result.reason = "limited_content"
+            result.confidence = min(result.confidence, 0.4)
         doc_type = data.get("document_type", "")
         if doc_type and doc_type not in result.tags:
             result.tags.insert(0, doc_type)
@@ -408,10 +534,6 @@ class DocumentAnalyzer(BaseAnalyzer):
         # If text extraction yielded nothing meaningful, the LLM was guessing
         # from filename + folder context only. Mark accordingly so the
         # description is prefixed [UNVERIFIED ...] and confidence is capped.
-        if is_text_empty:
-            result.content_available = False
-            result.confidence = min(result.confidence, 0.4)
-
         return result
 
     def _analyze_rendered_pdf(
@@ -449,10 +571,14 @@ class DocumentAnalyzer(BaseAnalyzer):
 
         try:
             data = self._client.generate_json(prompt, **kwargs)
-        except Exception:
-            # If the model doesn't support vision (or fails), let the
-            # caller try the text-only path rather than returning an error.
-            return None
+        except Exception as exc:
+            return AnalysisResult(
+                description=f"AI inference failed: {exc}",
+                confidence=0.0,
+                content_available=False,
+                outcome="failed",
+                reason="provider_failure",
+            )
 
         result = AnalysisResult.from_ai_response(data)
         doc_type = data.get("document_type", "")

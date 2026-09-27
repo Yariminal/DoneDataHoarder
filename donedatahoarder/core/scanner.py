@@ -11,7 +11,7 @@ import sys
 from datetime import datetime
 from donedatahoarder.timeutils import utcnow
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 from rich.progress import (
     BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
@@ -19,7 +19,9 @@ from rich.progress import (
 )
 from sqlalchemy.orm import Session
 
-from donedatahoarder.db.models import File, FileStatus, ScanSession
+from donedatahoarder.db.models import (
+    File, FileStatus, Proposal, ProposalStatus, ScanSession,
+)
 from donedatahoarder.db.session import get_engine
 from donedatahoarder.logging import get_logger
 from donedatahoarder.core.ignore import load_ddhignore
@@ -275,23 +277,13 @@ def _collect_file_stat(
         return {"_error": True, "path": path_str}
 
 
-def _known_paths(session: Session, session_id: str | None) -> set[str]:
-    """Every path already indexed for this session.
-
-    One query. Callers check the set instead of selecting per file.
-    The session_id filter stays so a sibling session's copy of the same
-    path is not treated as known.
-    """
-    rows = session.query(File.path).filter_by(session_id=session_id)
-    return {row[0] for row in rows}
-
-
-def scan(
+def _scan_unlocked(
     root: Path,
     force_rescan: bool = False,
     extra_skip_dirs: set[str] | None = None,
     session_id: str | None = None,
     workers: int = 1,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict:
     """
     Walk *root* and upsert File records into the database.
@@ -317,9 +309,9 @@ def scan(
         session.add(sess_record)
         session.commit()
         scan_session_id = sess_record.id
-        known_paths = _known_paths(session, session_id)
 
     counts = {"new": 0, "skipped": 0, "errors": 0}
+    cancelled = False
     logger.info(
         "Scan started",
         extra={
@@ -350,23 +342,15 @@ def scan(
                 "Flushing batch",
                 extra={"batch_size": len(batch), "counts": counts.copy()},
             )
-            # The set already answered "is this path known?". Load ORM rows
-            # only when a rescan has to update them, and only for this batch.
-            existing_by_path: dict[str, File] = {}
-            if force_rescan:
-                update_paths = [
-                    record["path"]
-                    for record in batch
-                    if not record.get("_error") and record["path"] in known_paths
-                ]
-                if update_paths:
-                    rows = (
-                        session.query(File)
-                        .filter_by(session_id=session_id)
-                        .filter(File.path.in_(update_paths))
-                        .all()
-                    )
-                    existing_by_path = {row.path: row for row in rows}
+            paths = [record["path"] for record in batch if not record.get("_error")]
+            rows = (
+                session.query(File)
+                .filter_by(session_id=session_id)
+                .filter(File.path.in_(paths))
+                .all()
+            ) if paths else []
+            existing_by_path = {row.path: row for row in rows}
+            reset_ids: list[int] = []
             for record in batch:
                 if record.get("_error"):
                     counts["errors"] += 1
@@ -374,20 +358,48 @@ def scan(
                 path_str = record["path"]
                 last_path = path_str
                 existing = existing_by_path.get(path_str)
-                if existing is not None:
+                if existing is not None and force_rescan:
                     # Update basic stat fields, reset status
+                    reset_ids.append(existing.id)
                     for k, v in record.items():
                         if k.startswith("_"):
                             continue
                         setattr(existing, k, v)
                     existing.status = FileStatus.PENDING
+                    existing.hash_md5 = None
+                    existing.hash_sha256 = None
+                    existing.hash_perceptual = None
+                    existing.date_exif = None
+                    existing.date_best = None
+                    existing.ai_description = None
+                    existing.ai_suggested_name = None
+                    existing.ai_tags = None
+                    existing.ai_transcript = None
+                    existing.ai_confidence = None
+                    existing.ai_model = None
+                    existing.analysis_outcome = None
+                    existing.analysis_reason = None
+                    existing.analysis_evidence_source = None
+                    existing.analysis_model_tag = None
+                    existing.analysis_model_digest = None
+                    existing.analysis_prompt_version = None
+                    existing.analysis_extractor_version = None
+                    existing.analysis_content_chars = None
+                    existing.analyzed_at = None
+                    existing.enriched_at = None
+                    existing.error_message = record.get("error_message")
                     counts["new"] += 1
-                elif path_str in known_paths and not force_rescan:
+                elif existing is not None:
                     counts["skipped"] += 1
                 else:
                     session.add(File(**{k: v for k, v in record.items() if not k.startswith("_")}))
-                    known_paths.add(path_str)
                     counts["new"] += 1
+            if reset_ids:
+                session.query(Proposal).filter(
+                    Proposal.file_id.in_(reset_ids),
+                    Proposal.status.in_((ProposalStatus.PENDING, ProposalStatus.APPROVED,
+                                         ProposalStatus.MODIFIED)),
+                ).update({"status": ProposalStatus.REJECTED}, synchronize_session=False)
             session.commit()
             # Persist resume point
             if last_path and scan_session_id:
@@ -397,71 +409,62 @@ def scan(
                     session.commit()
             batch.clear()
 
-        # Pre-walk to collect paths
-        all_paths = list(walk_files(root, extra_skip_dirs))
-        total_files = len(all_paths)
-        progress.update(task, total=total_files)
-
-        def _is_known(path_str: str) -> bool:
-            return (not force_rescan) and path_str in known_paths
-
         if workers > 1:
-            # Parallel stat collection, sequential DB writes.
-            # Known paths never hit the disk or the database again.
-            to_stat: list[Path] = []
-            for file_path in all_paths:
-                path_str = str(file_path.resolve())
-                if _is_known(path_str):
-                    counts["skipped"] += 1
-                    progress.advance(task)
-                    continue
-                to_stat.append(file_path)
-
-            if to_stat:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = {
-                        pool.submit(_collect_file_stat, fp, force_rescan, session_id): fp
-                        for fp in to_stat
-                    }
-                    with Session(engine) as session:
-                        for future in concurrent.futures.as_completed(futures):
-                            file_path = futures[future]
+            # Only a small number of stat futures may be outstanding. Paths
+            # are yielded by os.walk and never collected into a full list.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                pending: dict[concurrent.futures.Future, Path] = {}
+                paths = iter(walk_files(root, extra_skip_dirs))
+                exhausted = False
+                with Session(engine) as session:
+                    while pending or not exhausted:
+                        if cancel_check and cancel_check():
+                            exhausted = True
+                            cancelled = True
+                        while not exhausted and len(pending) < max(2, workers * 2):
+                            try:
+                                file_path = next(paths)
+                            except StopIteration:
+                                exhausted = True
+                                break
+                            future = pool.submit(
+                                _collect_file_stat, file_path, force_rescan, session_id
+                            )
+                            pending[future] = file_path
+                        if not pending:
+                            continue
+                        done, _ = concurrent.futures.wait(
+                            pending, return_when=concurrent.futures.FIRST_COMPLETED
+                        )
+                        for future in done:
+                            file_path = pending.pop(future)
                             progress.advance(task)
-                            path_str = str(file_path.resolve())
-
                             try:
                                 record = future.result()
                             except Exception as exc:
                                 counts["errors"] += 1
-                                logger.warning(
-                                    "Scan error for file",
-                                    extra={"path": path_str, "error": str(exc)},
-                                )
+                                logger.warning("Scan error for file", extra={
+                                    "path": str(file_path), "error": str(exc),
+                                })
                                 continue
                             if record is None:
                                 counts["errors"] += 1
                                 continue
                             batch.append(record)
-
                             if len(batch) >= BATCH_SIZE:
                                 _flush(session)
-                                progress.update(
-                                    task,
-                                    description=f"Scanning… {counts['new']} new, {counts['skipped']} skipped",
-                                )
-
-                        _flush(session)
+                                progress.update(task, description=(
+                                    f"Scanning… {counts['new']} new, {counts['skipped']} skipped"
+                                ))
+                    _flush(session)
         else:
             # Sequential path (original behaviour)
             with Session(engine) as session:
-                for file_path in all_paths:
+                for file_path in walk_files(root, extra_skip_dirs):
+                    if cancel_check and cancel_check():
+                        cancelled = True
+                        break
                     progress.advance(task)
-                    path_str = str(file_path.resolve())
-
-                    if _is_known(path_str):
-                        counts["skipped"] += 1
-                        continue
-
                     record = _collect_file_stat(file_path, force_rescan, session_id)
                     if record is None or record.get("_error"):
                         counts["errors"] += 1
@@ -486,7 +489,7 @@ def scan(
             sess_record.files_skipped = counts["skipped"]
             sess_record.files_error = counts["errors"]
             sess_record.files_found = counts["new"] + counts["skipped"]
-            sess_record.completed = True
+            sess_record.completed = not cancelled
             sess_record.last_scanned_path = None
             session.commit()
 
@@ -498,4 +501,21 @@ def scan(
             "errors": counts["errors"],
         },
     )
+    if cancelled:
+        counts["cancelled"] = True
     return counts
+
+
+def scan(
+    root: Path,
+    force_rescan: bool = False,
+    extra_skip_dirs: set[str] | None = None,
+    session_id: str | None = None,
+    workers: int = 1,
+    cancel_check: Callable[[], bool] | None = None,
+) -> dict:
+    from donedatahoarder.core.process_lock import operation_lock
+
+    with operation_lock("scan"):
+        return _scan_unlocked(root, force_rescan, extra_skip_dirs, session_id,
+                              workers, cancel_check)

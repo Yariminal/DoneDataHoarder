@@ -1,4 +1,4 @@
-"""Near-duplicate chains stay in one group, without a full pairwise scan."""
+"""Near-duplicate candidates retain direct keeper-relative evidence."""
 import json
 from pathlib import Path
 
@@ -71,9 +71,14 @@ def _groups(engine, dupe_type: DupeType):
             found.append({
                 "session_id": group.session_id,
                 "type": group.dupe_type,
+                "keeper_id": group.keep_file_id,
                 "ids": tuple(sorted(member.file_id for member in group.members)),
                 "scores": {
                     member.file_id: member.similarity_score
+                    for member in group.members
+                },
+                "distances": {
+                    member.file_id: member.distance_to_keeper
                     for member in group.members
                 },
             })
@@ -87,8 +92,8 @@ def _pair_sim(desc_a, tags_a, desc_b, tags_b) -> float:
     )
 
 
-def test_perceptual_chain_is_one_group(tmp_path):
-    """A~B~C~D is one group even when the ends are past the threshold."""
+def test_perceptual_chain_splits_at_keeper_threshold(tmp_path):
+    """A~B~C~D cannot claim its far end matches A's keeper evidence."""
     engine = _boot(tmp_path)
     sid = _new_session(engine, "main")
     other = _new_session(engine, "other")
@@ -129,13 +134,14 @@ def test_perceptual_chain_is_one_group(tmp_path):
         db.commit()
 
     counts = find_perceptual_duplicates(threshold=threshold, session_id=sid)
-    assert counts == {"groups": 2, "duplicates": 4}
+    assert counts == {"groups": 3, "duplicates": 3}
 
     found = _groups(engine, DupeType.PERCEPTUAL)
     assert {group["session_id"] for group in found} == {sid}
     sets = {group["ids"] for group in found}
     assert sets == {
-        tuple(sorted((id_a, id_b, id_c, id_d))),
+        tuple(sorted((id_a, id_b))),
+        tuple(sorted((id_c, id_d))),
         tuple(sorted((id_p, id_q))),
     }
     assert id_far not in {fid for group in found for fid in group["ids"]}
@@ -143,7 +149,10 @@ def test_perceptual_chain_is_one_group(tmp_path):
     assert id_foreign not in {fid for group in found for fid in group["ids"]}
     for group in found:
         assert group["type"] == DupeType.PERCEPTUAL
-        assert all(score == pytest.approx(0.95) for score in group["scores"].values())
+        for member_id in group["ids"]:
+            distance = group["distances"][member_id]
+            assert distance <= threshold
+            assert group["scores"][member_id] == pytest.approx(1 - distance / 64)
 
 
 def test_spread_bits_within_threshold_still_group(tmp_path):
@@ -237,7 +246,7 @@ def test_identical_hashes_consult_hash_distance(monkeypatch, tmp_path):
 
     counts = find_perceptual_duplicates(threshold=0, session_id=sid)
     assert counts == {"groups": 1, "duplicates": 1}
-    assert calls["n"] == 1
+    assert calls["n"] >= 3  # candidate verification and keeper-relative evidence
     assert _groups(engine, DupeType.PERCEPTUAL)[0]["ids"] == tuple(sorted((id_a, id_b)))
 
 
@@ -393,10 +402,15 @@ def test_semantic_chain_keeps_one_group_and_a_score(monkeypatch, tmp_path):
         tuple(sorted((id_h1, id_h2))),
         tuple(sorted((id_o1, id_o2))),
     }
-    expected = round((s_ab + s_bc + s_cd) / 3, 2)
-    assert all(
-        score == pytest.approx(expected)
-        for score in by_ids[chain_ids]["scores"].values()
+    # Scores are measured directly against A, never copied from transitive
+    # A-B, B-C, C-D edge averages.
+    assert by_ids[chain_ids]["scores"][id_a] == pytest.approx(1.0)
+    assert by_ids[chain_ids]["scores"][id_b] == pytest.approx(s_ab)
+    assert by_ids[chain_ids]["scores"][id_c] == pytest.approx(
+        _pair_sim(chain, ["t1"], chain, ["t2", "t3"])
+    )
+    assert by_ids[chain_ids]["scores"][id_d] == pytest.approx(
+        _pair_sim(chain, ["t1"], chain, ["t3"])
     )
     solo_ids = tuple(sorted((id_h1, id_h2)))
     assert all(

@@ -105,6 +105,9 @@ class ImageAnalyzer(BaseAnalyzer):
             return AnalysisResult(
                 description="PIL not installed — cannot analyze image",
                 confidence=0.0,
+                content_available=False,
+                outcome="skipped",
+                reason="missing_dependency",
             )
 
         path = Path(file_rec.path)
@@ -132,6 +135,8 @@ class ImageAnalyzer(BaseAnalyzer):
             # Mark this as a content-unavailable inference so save_result()
             # prefixes the description with [UNVERIFIED ...] downstream.
             result.content_available = False
+            result.evidence_source = "filename_only"
+            result.reason = "unreadable_content"
             category = data.get("category", "")
             if category and category not in result.tags:
                 result.tags.insert(0, category)
@@ -153,6 +158,8 @@ class ImageAnalyzer(BaseAnalyzer):
             )
 
         result = AnalysisResult.from_ai_response(data)
+        result.evidence_source = "vision"
+        result.extractor = "pillow_resize"
         # Add category as a tag
         category = data.get("category", "")
         if category and category not in result.tags:

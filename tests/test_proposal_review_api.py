@@ -1,0 +1,846 @@
+"""Review decisions and commit previews stay inside the selected session."""
+
+from pathlib import Path
+import hashlib
+import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from threading import Event, Thread
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
+
+from donedatahoarder.db.models import (
+    BackgroundJob, DuplicateGroup, DuplicateMember, DupeType, File, FileStatus, Proposal,
+    ProposalStatus, ProposalType, RunPlan, UserSession,
+)
+from donedatahoarder.db.session import get_engine
+from donedatahoarder.web.app import create_app
+
+
+@pytest.fixture
+def review_db(tmp_path: Path, monkeypatch):
+    journal = tmp_path / "journal"
+    monkeypatch.setenv("DDH_DATA_DIR", str(journal))
+    app = create_app(tmp_path / "review.db")
+    roots = (tmp_path / "one", tmp_path / "two")
+    for root in roots:
+        root.mkdir()
+    with Session(get_engine()) as db:
+        sessions = [UserSession(name=f"session-{i}", root_path=str(root)) for i, root in enumerate(roots)]
+        db.add_all(sessions)
+        db.commit()
+        ids = [row.id for row in sessions]
+    with TestClient(app) as client:
+        yield client, ids, roots
+
+
+def _proposal(sid: str, root: Path, name: str, status=ProposalStatus.PENDING,
+              proposal_type=ProposalType.RENAME, destination: str | None = None) -> int:
+    source = root / name
+    source.write_text(name, encoding="utf-8")
+    with Session(get_engine()) as db:
+        file = File(session_id=sid, path=str(source), filename=name)
+        db.add(file)
+        db.flush()
+        proposal = Proposal(
+            file_id=file.id, proposal_type=proposal_type,
+            current_value=str(source),
+            proposed_value=destination or str(root / f"new-{name}"),
+            confidence=0.9, status=status,
+        )
+        db.add(proposal)
+        db.commit()
+        return proposal.id
+
+
+def _status(proposal_id: int) -> ProposalStatus:
+    with Session(get_engine()) as db:
+        return db.get(Proposal, proposal_id).status
+
+
+def test_bulk_review_only_changes_selected_session(review_db):
+    client, (one, two), (root_one, root_two) = review_db
+    first = _proposal(one, root_one, "first.txt")
+    second = _proposal(two, root_two, "second.txt")
+    with Session(get_engine()) as db:
+        file = db.get(File, db.get(Proposal, first).file_id)
+        file.analysis_outcome = "content_verified"
+        file.analysis_evidence_source = "text"
+        db.commit()
+
+    response = client.post("/api/proposals/bulk-approve", json={"session_id": one, "min_confidence": 0.8})
+    assert response.status_code == 200
+    assert response.json()["approved"] == 1
+    assert _status(first) == ProposalStatus.APPROVED
+    assert _status(second) == ProposalStatus.PENDING
+
+    response = client.post("/api/proposals/bulk-reject", json={"session_id": two})
+    assert response.status_code == 200
+    assert response.json()["rejected"] == 1
+    assert _status(second) == ProposalStatus.REJECTED
+    assert client.post("/api/proposals/bulk-approve", json={"session_id": "missing"}).status_code == 404
+    assert client.post("/api/proposals/bulk-reject", json={}).status_code == 422
+
+
+def test_bulk_rename_requires_verified_content_but_allows_individual_review(review_db):
+    client, (sid, _), (root, _) = review_db
+    proposal_id = _proposal(sid, root, "legacy.txt")
+    bulk = client.post("/api/proposals/bulk-approve", json={"session_id": sid})
+    assert bulk.status_code == 200
+    assert bulk.json()["approved"] == 0
+    assert bulk.json()["skipped_unverified_rename"] == 1
+    listed = client.get(f"/api/proposals?session_id={sid}").json()["items"]
+    assert listed[0]["analysis_outcome"] is None
+    assert _status(proposal_id) == ProposalStatus.PENDING
+    assert client.post(f"/api/proposals/{proposal_id}/approve", json={"session_id": sid}).status_code == 200
+    assert _status(proposal_id) == ProposalStatus.APPROVED
+
+
+def test_review_mutations_and_preview_reject_concurrent_writer(review_db):
+    client, (sid, _), (root, _) = review_db
+    proposal_id = _proposal(sid, root, "busy.txt")
+    from donedatahoarder.core.process_lock import operation_lock
+
+    locked = Event()
+    release = Event()
+
+    def hold_writer():
+        with operation_lock("test writer"):
+            locked.set()
+            assert release.wait(5)
+
+    worker = Thread(target=hold_writer)
+    worker.start()
+    try:
+        assert locked.wait(5)
+        edit = client.post(f"/api/proposals/{proposal_id}/edit", json={
+            "session_id": sid, "proposed_value": "new-busy.txt",
+        })
+        assert edit.status_code == 409
+        preview = client.get("/api/execute/preview", params={"session_id": sid})
+        assert preview.status_code == 409
+        settings = client.patch(f"/api/sessions/{sid}", json={"model": "example:1b"})
+        assert settings.status_code == 409
+        assert _status(proposal_id) == ProposalStatus.PENDING
+    finally:
+        release.set()
+        worker.join(timeout=5)
+
+
+def test_run_plan_is_persisted_and_scoped_to_session(review_db, monkeypatch):
+    client, (one, two), (root, _) = review_db
+    from donedatahoarder.core.jobs import job_manager
+
+    # Keep dispatch out of this API-contract test. Durable worker/checkpoint
+    # behavior has its own integration tests.
+    monkeypatch.setattr(job_manager, "advance_run_plan", lambda _plan_id: None)
+    with Session(get_engine()) as db:
+        owner = db.get(UserSession, one)
+        owner.analyze_model = "gemma4:26b"
+        owner.propose_model = "gemma4:26b"
+        db.commit()
+    response = client.post("/api/pipeline/runs", json={
+        "session_id": one, "root_path": str(root), "steps": ["scan", "analyze"],
+    })
+    assert response.status_code == 200, response.text
+    plan = response.json()["plan"]
+    assert plan["state"] == "ready"
+    assert plan["steps"] == ["scan", "analyze"]
+    assert plan["options"]["analyze_model"] == "gemma4:26b"
+    assert plan["options"]["propose_model"] == "gemma4:26b"
+    with Session(get_engine()) as db:
+        assert db.get(RunPlan, plan["plan_id"]) is not None
+    latest = client.get("/api/pipeline/runs/latest", params={"session_id": one})
+    assert latest.json()["plan"]["plan_id"] == plan["plan_id"]
+    assert client.get(f"/api/pipeline/runs/{plan['plan_id']}", params={"session_id": two}).status_code == 404
+    assert client.post(f"/api/pipeline/runs/{plan['plan_id']}/cancel", json={"session_id": two}).status_code == 404
+    cancelled = client.post(f"/api/pipeline/runs/{plan['plan_id']}/cancel", json={"session_id": one})
+    assert cancelled.status_code == 200
+    assert cancelled.json()["plan"]["state"] == "cancelled"
+
+
+def test_provider_errors_are_actionable_and_web_retry_is_explicit(review_db, monkeypatch):
+    client, (sid, _), (root, _) = review_db
+    from donedatahoarder.core.jobs import job_manager
+    with Session(get_engine()) as db:
+        owner = db.get(UserSession, sid)
+        owner.analyze_model = "gemma4:26b"
+        db.add_all([
+            File(session_id=sid, path=str(root / "timeout.txt"), filename="timeout.txt",
+                 status=FileStatus.ERROR, analysis_reason="provider_timeout"),
+            File(session_id=sid, path=str(root / "unknown.bin"), filename="unknown.bin",
+                 status=FileStatus.ERROR, analysis_reason="unsupported_type"),
+        ])
+        db.commit()
+    counts = client.get("/api/pipeline/analyze/errors", params={"session_id": sid})
+    assert counts.status_code == 200
+    assert counts.json() == {"total": 2, "retryable": 1,
+                             "reasons": {"provider_timeout": 1, "unsupported_type": 1}}
+    called = {}
+
+    def fake_start_analyze(**kwargs):
+        called.update(kwargs)
+        return "synthetic-job"
+
+    monkeypatch.setattr(job_manager, "start_analyze", fake_start_analyze)
+    started = client.post("/api/pipeline/analyze", json={
+        "session_id": sid, "retry_errors": True,
+    })
+    assert started.status_code == 200, started.text
+    assert started.json()["job_id"] == "synthetic-job"
+    assert called["retry_errors"] is True
+    assert called["model"] == "gemma4:26b"
+
+
+def test_cancel_endpoint_reports_cancelling_until_worker_exit(review_db, monkeypatch):
+    from types import SimpleNamespace
+    from donedatahoarder.core.jobs import JobState, job_manager
+
+    client, _, _ = review_db
+    monkeypatch.setattr(job_manager, "force_cancel", lambda _job_id: None)
+    monkeypatch.setattr(job_manager, "get_job", lambda _job_id: SimpleNamespace(state=JobState.CANCELLING))
+    response = client.post("/api/pipeline/jobs/synthetic-job/cancel")
+    assert response.status_code == 200
+    assert response.json() == {"status": "cancelling", "job_id": "synthetic-job"}
+
+
+@pytest.mark.parametrize("state", ["paused", "running"])
+def test_session_delete_waits_for_foreign_live_worker_but_allows_other_session(review_db, state):
+    from donedatahoarder.core.job_store import process_started_at
+
+    client, (one, two), _ = review_db
+    job_id = f"foreign-{state}"
+    with Session(get_engine()) as db:
+        db.add(BackgroundJob(id=job_id, session_id=one, job_type="analyze",
+                             state=state, owner_pid=os.getpid(),
+                             owner_token="foreign-owner",
+                             owner_started_at=process_started_at(os.getpid())))
+        db.commit()
+    response = client.delete(f"/api/sessions/{one}")
+    assert response.status_code == 409
+    assert "worker to exit" in response.json()["detail"]
+    with Session(get_engine()) as db:
+        assert db.get(UserSession, one) is not None
+        assert db.get(BackgroundJob, job_id).cancel_requested is True
+    unrelated = client.delete(f"/api/sessions/{two}")
+    assert unrelated.status_code == 200, unrelated.text
+
+
+def test_protected_resource_cannot_be_approved_and_bulk_skips_it(review_db):
+    client, (sid, _), (root, _) = review_db
+    proposal_id = _proposal(sid, root, "CADFONT.SHX")
+    response = client.post(f"/api/proposals/{proposal_id}/approve", json={"session_id": sid})
+    assert response.status_code == 409
+    assert "Protected resource" in response.json()["detail"]
+    edited = client.post(f"/api/proposals/{proposal_id}/edit", json={
+        "session_id": sid, "proposed_value": "renamed.SHX",
+    })
+    assert edited.status_code == 409
+    assert "Protected resource" in edited.json()["detail"]
+    response = client.post("/api/proposals/bulk-approve", json={"session_id": sid})
+    assert response.status_code == 200
+    assert response.json()["approved"] == 0
+    assert response.json()["skipped_protected"] == 1
+    assert _status(proposal_id) == ProposalStatus.PENDING
+    listed = client.get(f"/api/proposals?session_id={sid}").json()["items"]
+    assert listed[0]["protected"] is True
+    assert listed[0]["protection_reason"]
+
+
+def test_near_duplicate_requires_individual_review_not_bulk(review_db):
+    client, (sid, _), (root, _) = review_db
+    victim_id = _proposal(sid, root, "victim.png", proposal_type=ProposalType.MARK_DUPLICATE,
+                          destination=str(root / "keeper.png"))
+    keeper_path = root / "keeper.png"
+    keeper_path.write_bytes(b"different image")
+    with Session(get_engine()) as db:
+        keeper = File(session_id=sid, path=str(keeper_path), filename="keeper.png")
+        db.add(keeper)
+        db.flush()
+        group = DuplicateGroup(session_id=sid, dupe_type=DupeType.PERCEPTUAL,
+                               group_hash="near-pair", keep_file_id=keeper.id)
+        db.add(group)
+        db.flush()
+        proposal = db.get(Proposal, victim_id)
+        proposal.duplicate_group_id = group.id
+        db.add_all([DuplicateMember(group_id=group.id, file_id=keeper.id, similarity_score=1.0),
+                    DuplicateMember(group_id=group.id, file_id=proposal.file_id, similarity_score=0.8,
+                                    distance_to_keeper=13)])
+        db.commit()
+    response = client.post("/api/proposals/bulk-approve", json={"session_id": sid})
+    assert response.json()["approved"] == 0
+    assert response.json()["skipped_near_duplicate"] == 1
+    assert client.post(f"/api/proposals/{victim_id}/approve", json={"session_id": sid}).status_code == 200
+    with Session(get_engine()) as db:
+        assert db.get(Proposal, victim_id).review_kind == "individual"
+    listed = client.get(f"/api/proposals?session_id={sid}&status=approved").json()["items"]
+    assert listed[0]["duplicate_evidence"]["distance_to_keeper"] == 13
+    group = client.get(f"/api/duplicates?session_id={sid}").json()["items"][0]
+    candidate = next(file for file in group["files"] if file["filename"] == "victim.png")
+    assert candidate["distance_to_keeper"] == 13
+    assert candidate["exact_bytes_to_keeper"] is None
+    assert group["evidence_label"].startswith("Visual similarity")
+
+
+def test_exact_md5_group_reports_unknown_stored_sha_until_available(review_db):
+    from donedatahoarder.core.dedup import find_exact_duplicates
+
+    client, (sid, _), (root, _) = review_db
+    payload = b"same indexed content"
+    digest = hashlib.md5(payload).hexdigest()
+    with Session(get_engine()) as db:
+        files = []
+        for name in ("copy-one.txt", "copy-two.txt"):
+            path = root / name
+            path.write_bytes(payload)
+            file = File(session_id=sid, path=str(path), filename=name,
+                        status=FileStatus.ENRICHED, hash_md5=digest)
+            db.add(file)
+            files.append(file)
+        db.commit()
+        file_ids = [file.id for file in files]
+
+    assert find_exact_duplicates(session_id=sid) == {"groups": 1, "duplicates": 1}
+    with Session(get_engine()) as db:
+        group = db.query(DuplicateGroup).filter_by(session_id=sid, dupe_type=DupeType.EXACT).one()
+        victim_id = next(file_id for file_id in file_ids if file_id != group.keep_file_id)
+        keeper = db.get(File, group.keep_file_id)
+        victim = db.get(File, victim_id)
+        db.add(Proposal(file_id=victim_id, proposal_type=ProposalType.MARK_DUPLICATE,
+                        current_value=victim.path, proposed_value=keeper.path,
+                        duplicate_group_id=group.id, status=ProposalStatus.PENDING))
+        db.commit()
+
+    group_json = client.get(f"/api/duplicates?session_id={sid}").json()["items"][0]
+    candidate = next(file for file in group_json["files"] if not file["is_keeper"])
+    evidence = client.get(f"/api/proposals?session_id={sid}").json()["items"][0]["duplicate_evidence"]
+    assert candidate["matching_indexed_md5"] is True
+    assert candidate["exact_bytes_to_keeper"] is None
+    assert evidence["matching_indexed_md5"] is True
+    assert evidence["exact_bytes"] is None
+    assert "MD5" in group_json["evidence_label"]
+    assert "SHA-256" in group_json["evidence_label"]
+
+    with Session(get_engine()) as db:
+        db.get(File, victim_id).hash_sha256 = hashlib.sha256(payload).hexdigest()
+        db.get(File, group_json["keep_file_id"]).hash_sha256 = hashlib.sha256(payload).hexdigest()
+        db.commit()
+    assert client.get(f"/api/proposals?session_id={sid}").json()["items"][0]["duplicate_evidence"]["exact_bytes"] is True
+    with Session(get_engine()) as db:
+        db.get(File, victim_id).hash_sha256 = hashlib.sha256(b"different indexed content").hexdigest()
+        db.commit()
+    assert client.get(f"/api/proposals?session_id={sid}").json()["items"][0]["duplicate_evidence"]["exact_bytes"] is False
+
+
+def test_individual_review_is_session_bound_and_edit_cannot_escape_root(review_db):
+    client, (one, two), (root_one, _) = review_db
+    rename = _proposal(one, root_one, "rename.txt")
+    move = _proposal(one, root_one, "move.txt", proposal_type=ProposalType.MOVE)
+    folder = _proposal(one, root_one, "folder.txt", proposal_type=ProposalType.RENAME_FOLDER)
+
+    for endpoint in ("approve", "reject", "edit"):
+        payload = {"session_id": two, "proposed_value": "safe.txt"}
+        assert client.post(f"/api/proposals/{rename}/{endpoint}", json=payload).status_code == 404
+    for name in ("../escape.txt", r"..\escape.txt", "C:escape.txt", "nested/file.txt"):
+        response = client.post(f"/api/proposals/{rename}/edit", json={"session_id": one, "proposed_value": name})
+        assert response.status_code == 400, name
+    for proposal_id in (move, folder):
+        response = client.post(f"/api/proposals/{proposal_id}/edit", json={"session_id": one, "proposed_value": str(root_one.parent / "outside.txt")})
+        assert response.status_code == 400
+        response = client.post(f"/api/proposals/{proposal_id}/edit", json={"session_id": one, "proposed_value": str(root_one / "sub" / "inside.txt")})
+        assert response.status_code == 200
+
+    response = client.post(f"/api/proposals/{rename}/edit", json={"session_id": one, "proposed_value": "safe.txt"})
+    assert response.status_code == 200
+    assert response.json()["proposed_value"] == str(root_one / "safe.txt")
+
+
+def test_preview_matches_reviewed_selection_and_stale_token_blocks_commit(review_db):
+    client, (one, two), (root_one, root_two) = review_db
+    approved = _proposal(one, root_one, "approved.txt", ProposalStatus.APPROVED)
+    pending = _proposal(one, root_one, "pending.txt")
+    foreign = _proposal(two, root_two, "foreign.txt", ProposalStatus.APPROVED)
+
+    preview = client.get("/api/execute/preview", params={"session_id": one})
+    assert preview.status_code == 200
+    snapshot = preview.json()
+    assert snapshot["total"] == 1
+    assert [item["id"] for item in snapshot["items"]] == [approved]
+    assert snapshot["items"][0]["source"] == str(root_one / "approved.txt")
+
+    assert client.post("/api/execute", json={"session_id": one, "dry_run": False}).status_code == 400
+    assert client.post(f"/api/proposals/{pending}/approve", json={"session_id": one}).status_code == 200
+    stale = client.post("/api/execute", json={"session_id": one, "dry_run": False, "preview_token": snapshot["token"]})
+    assert stale.status_code == 409
+    assert (root_one / "approved.txt").exists()
+
+    fresh = client.get("/api/execute/preview", params={"session_id": one}).json()
+    assert set(item["id"] for item in fresh["items"]) == {approved, pending}
+    committed = client.post("/api/execute", json={"session_id": one, "dry_run": False, "preview_token": fresh["token"]})
+    assert committed.status_code == 200, committed.text
+    assert committed.json()["applied"] == 2
+    assert (root_one / "new-approved.txt").exists()
+    assert (root_one / "new-pending.txt").exists()
+    assert (root_two / "foreign.txt").exists()
+    assert _status(foreign) == ProposalStatus.APPROVED
+    assert (root_one.parent / "journal" / f"undo_{one}.log").exists()
+
+
+def test_empty_preview_cannot_commit(review_db):
+    client, (one, _), _ = review_db
+    preview = client.get("/api/execute/preview", params={"session_id": one}).json()
+    assert preview["total"] == 0
+    response = client.post("/api/execute", json={"session_id": one, "dry_run": False, "preview_token": preview["token"]})
+    assert response.status_code == 400
+
+
+def test_preview_uses_ordered_rename_then_move_destination(review_db):
+    client, (sid, _), (root, _) = review_db
+    rename_id = _proposal(sid, root, "a.txt", ProposalStatus.APPROVED,
+                          ProposalType.RENAME, str(root / "b.txt"))
+    with Session(get_engine()) as db:
+        file_id = db.get(Proposal, rename_id).file_id
+        move = Proposal(file_id=file_id, proposal_type=ProposalType.MOVE,
+                        current_value=str(root / "a.txt"),
+                        proposed_value=str(root / "sorted" / "a.txt"),
+                        status=ProposalStatus.APPROVED, confidence=0.9)
+        db.add(move)
+        db.commit()
+        move_id = move.id
+    preview = client.get("/api/execute/preview", params={"session_id": sid}).json()
+    assert preview["errors"] == 0
+    by_id = {item["id"]: item for item in preview["items"]}
+    assert by_id[rename_id]["destination"] == str(root / "b.txt")
+    assert by_id[move_id]["source"] == str(root / "b.txt")
+    assert by_id[move_id]["destination"] == str(root / "sorted" / "b.txt")
+    committed = client.post("/api/execute", json={
+        "session_id": sid, "dry_run": False, "preview_token": preview["token"],
+    })
+    assert committed.status_code == 200
+    assert (root / "sorted" / "b.txt").is_file()
+
+
+def test_preview_projects_folder_rename_into_child_move(review_db):
+    client, (sid, _), (root, _) = review_db
+    old = root / "old"
+    old.mkdir()
+    source = old / "one.txt"
+    source.write_text("content", encoding="utf-8")
+    with Session(get_engine()) as db:
+        file = File(session_id=sid, path=str(source), filename=source.name)
+        db.add(file)
+        db.flush()
+        folder = Proposal(file_id=file.id, proposal_type=ProposalType.RENAME_FOLDER,
+                          current_value=str(old), proposed_value=str(root / "new"),
+                          status=ProposalStatus.APPROVED, confidence=0.9)
+        move = Proposal(file_id=file.id, proposal_type=ProposalType.MOVE,
+                        current_value=str(source), proposed_value=str(old / "final" / source.name),
+                        status=ProposalStatus.APPROVED, confidence=0.9)
+        db.add_all([folder, move])
+        db.commit()
+        move_id = move.id
+    preview = client.get("/api/execute/preview", params={"session_id": sid}).json()
+    by_id = {item["id"]: item for item in preview["items"]}
+    assert preview["errors"] == 0
+    assert by_id[move_id]["source"] == str(root / "new" / "one.txt")
+    assert by_id[move_id]["destination"] == str(root / "new" / "final" / "one.txt")
+
+
+def test_preview_flags_destination_swap_before_commit(review_db):
+    client, (sid, _), (root, _) = review_db
+    _proposal(sid, root, "a.txt", ProposalStatus.APPROVED,
+              ProposalType.RENAME, str(root / "b.txt"))
+    _proposal(sid, root, "b.txt", ProposalStatus.APPROVED,
+              ProposalType.RENAME, str(root / "a.txt"))
+    preview = client.get("/api/execute/preview", params={"session_id": sid}).json()
+    assert preview["errors"] == 2
+    assert all(item["error"] for item in preview["items"])
+    committed = client.post("/api/execute", json={
+        "session_id": sid, "dry_run": False, "preview_token": preview["token"],
+    })
+    assert committed.status_code == 409
+    assert (root / "a.txt").is_file() and (root / "b.txt").is_file()
+
+
+def test_edit_during_commit_revalidation_invalidates_old_preview(review_db, monkeypatch):
+    from donedatahoarder.web.api import proposals as proposal_api
+    from donedatahoarder import executor
+
+    client, (one, _), (root_one, _) = review_db
+    proposal_id = _proposal(one, root_one, "race.txt", ProposalStatus.APPROVED)
+    token = client.get("/api/execute/preview", params={"session_id": one}).json()["token"]
+    editing = Event()
+    release_edit = Event()
+    original_validate = proposal_api._validated_edit
+    execute_called = []
+
+    def hold_edit(*args):
+        editing.set()
+        assert release_edit.wait(5)
+        return original_validate(*args)
+
+    monkeypatch.setattr(proposal_api, "_validated_edit", hold_edit)
+    monkeypatch.setattr(executor, "execute", lambda **kwargs: execute_called.append(kwargs))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        edited = pool.submit(client.post, f"/api/proposals/{proposal_id}/edit",
+                             json={"session_id": one, "proposed_value": "changed.txt"})
+        assert editing.wait(5)
+        committed = pool.submit(client.post, "/api/execute",
+                                json={"session_id": one, "dry_run": False, "preview_token": token})
+        release_edit.set()
+        assert edited.result(timeout=5).status_code == 200
+        response = committed.result(timeout=5)
+
+    assert response.status_code == 409
+    assert execute_called == []
+    assert (root_one / "race.txt").exists()
+
+
+def test_parallel_commits_cannot_apply_same_preview_twice(review_db, monkeypatch):
+    from donedatahoarder import executor
+
+    client, (one, _), (root_one, _) = review_db
+    proposal_id = _proposal(one, root_one, "once.txt", ProposalStatus.APPROVED)
+    token = client.get("/api/execute/preview", params={"session_id": one}).json()["token"]
+    executing = Event()
+    release_execute = Event()
+    calls = []
+
+    def held_execute(**kwargs):
+        calls.append(kwargs)
+        executing.set()
+        assert release_execute.wait(5)
+        with Session(get_engine()) as db:
+            db.get(Proposal, proposal_id).status = ProposalStatus.APPLIED
+            db.commit()
+        return {"applied": 1, "failed": 0, "skipped": 0}
+
+    monkeypatch.setattr(executor, "execute", held_execute)
+    payload = {"session_id": one, "dry_run": False, "preview_token": token}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(client.post, "/api/execute", json=payload)
+        assert executing.wait(5)
+        second = pool.submit(client.post, "/api/execute", json=payload)
+        release_execute.set()
+        responses = (first.result(timeout=5), second.result(timeout=5))
+
+    assert [response.status_code for response in responses] == [200, 409]
+    assert len(calls) == 1
+
+
+def test_cancelled_but_live_worker_blocks_commit(review_db, monkeypatch):
+    from donedatahoarder.core import wake_lock
+    from donedatahoarder.core.jobs import JobState, job_manager
+
+    client, (one, _), (root_one, _) = review_db
+    _proposal(one, root_one, "worker.txt", ProposalStatus.APPROVED)
+    token = client.get("/api/execute/preview", params={"session_id": one}).json()["token"]
+    monkeypatch.setattr(wake_lock, "acquire", lambda: None)
+    monkeypatch.setattr(wake_lock, "release", lambda: None)
+    running = Event()
+    exit_worker = Event()
+    job = job_manager._create_job("test", one)
+
+    def worker():
+        try:
+            running.set()
+            assert exit_worker.wait(5)
+        finally:
+            job_manager._finish_job(job, JobState.CANCELLED)
+
+    try:
+        job_manager._start_worker(job, worker)
+        assert running.wait(5)
+        job_manager.force_cancel(job.job_id)
+        # Durable cancellation retains the active slot until the worker exits.
+        assert job_manager.get_active().state.value == "cancelling"
+        assert job_manager.has_live_workers()
+        response = client.post("/api/execute", json={
+            "session_id": one, "dry_run": False, "preview_token": token,
+        })
+        assert response.status_code == 409
+        assert (root_one / "worker.txt").exists()
+    finally:
+        exit_worker.set()
+        worker_thread = job_manager._worker_threads.get(job.job_id)
+        if worker_thread is not None:
+            worker_thread.join(timeout=5)
+        assert not job_manager.has_live_workers()
+        assert job_manager.get_active() is None
+
+
+def test_keeper_change_invalidates_duplicate_commit_preview(review_db):
+    client, (one, _), (root_one, _) = review_db
+    victim_id = _proposal(
+        one, root_one, "victim.txt", ProposalStatus.APPROVED,
+        ProposalType.MARK_DUPLICATE, str(root_one / "keeper.txt"),
+    )
+    keeper_id = _proposal(one, root_one, "keeper.txt")
+    alternate_id = _proposal(one, root_one, "alternate.txt")
+    with Session(get_engine()) as db:
+        victim_file = db.get(Proposal, victim_id).file_id
+        keeper_file = db.get(Proposal, keeper_id).file_id
+        alternate_file = db.get(Proposal, alternate_id).file_id
+        group = DuplicateGroup(session_id=one, dupe_type=DupeType.EXACT,
+                               group_hash="review-keeper", keep_file_id=keeper_file)
+        db.add(group)
+        db.flush()
+        db.add_all([
+            DuplicateMember(group_id=group.id, file_id=file_id)
+            for file_id in (victim_file, keeper_file, alternate_file)
+        ])
+        db.commit()
+        group_id = group.id
+    token = client.get("/api/execute/preview", params={"session_id": one}).json()["token"]
+    assert client.post(f"/api/duplicates/{group_id}/keeper",
+                       json={"session_id": one, "keep_file_id": alternate_file}).status_code == 200
+    changed = client.get("/api/execute/preview", params={"session_id": one}).json()
+    assert changed["token"] != token
+    assert client.post("/api/execute", json={
+        "session_id": one, "dry_run": False, "preview_token": token,
+    }).status_code == 409
+
+
+def test_keeper_change_resets_linked_approval_for_re_review(review_db):
+    client, (sid, _), (root, _) = review_db
+    victim_id = _proposal(sid, root, "victim.txt", ProposalStatus.APPROVED,
+                          ProposalType.MARK_DUPLICATE, str(root / "keeper.txt"))
+    keeper_id = _proposal(sid, root, "keeper.txt")
+    alternate_id = _proposal(sid, root, "alternate.txt")
+    with Session(get_engine()) as db:
+        victim = db.get(Proposal, victim_id)
+        keeper = db.get(Proposal, keeper_id)
+        alternate = db.get(Proposal, alternate_id)
+        group = DuplicateGroup(session_id=sid, dupe_type=DupeType.EXACT,
+                               group_hash="keeper-reset", keep_file_id=keeper.file_id)
+        db.add(group)
+        db.flush()
+        victim.duplicate_group_id = group.id
+        victim.review_kind = "individual"
+        db.add_all([DuplicateMember(group_id=group.id, file_id=file_id)
+                    for file_id in (victim.file_id, keeper.file_id, alternate.file_id)])
+        db.commit()
+        group_id, alternate_file_id = group.id, alternate.file_id
+    response = client.post(f"/api/duplicates/{group_id}/keeper", json={
+        "session_id": sid, "keep_file_id": alternate_file_id,
+    })
+    assert response.status_code == 200
+    assert response.json()["review_reset"] >= 1
+    with Session(get_engine()) as db:
+        victim = db.get(Proposal, victim_id)
+        assert victim.status == ProposalStatus.PENDING
+        assert victim.review_kind is None
+        assert victim.proposed_value == str(root / "alternate.txt")
+
+
+def test_duplicate_keeper_edit_cannot_bypass_group_membership(review_db):
+    client, (one, two), (root_one, _) = review_db
+    victim_id = _proposal(
+        one, root_one, "victim.txt", proposal_type=ProposalType.MARK_DUPLICATE,
+        destination=str(root_one / "keeper.txt"),
+    )
+    keeper_id = _proposal(one, root_one, "keeper.txt")
+    unrelated_id = _proposal(one, root_one, "unrelated.txt")
+    victim_path = root_one / "victim.txt"
+    keeper_path = root_one / "keeper.txt"
+    unrelated_path = root_one / "unrelated.txt"
+    victim_path.write_bytes(b"same content")
+    keeper_path.write_bytes(b"same content")
+    unrelated_path.write_bytes(b"different content")
+
+    with Session(get_engine()) as db:
+        victim = db.get(File, db.get(Proposal, victim_id).file_id)
+        keeper = db.get(File, db.get(Proposal, keeper_id).file_id)
+        unrelated = db.get(File, db.get(Proposal, unrelated_id).file_id)
+        victim.hash_md5 = hashlib.md5(victim_path.read_bytes()).hexdigest()
+        group = DuplicateGroup(session_id=one, dupe_type=DupeType.EXACT,
+                               group_hash=victim.hash_md5, keep_file_id=keeper.id)
+        db.add(group)
+        db.flush()
+        db.add_all([
+            DuplicateMember(group_id=group.id, file_id=file_id)
+            for file_id in (victim.id, keeper.id)
+        ])
+        db.commit()
+        group_id, unrelated_file_id, keeper_file_id = group.id, unrelated.id, keeper.id
+
+    # The generic editor is available in the review UI, but a duplicate's
+    # destination is a keeper identity rather than a freely editable path.
+    edited = client.post(f"/api/proposals/{victim_id}/edit", json={
+        "session_id": one, "proposed_value": str(unrelated_path),
+    })
+    assert edited.status_code == 400
+    with Session(get_engine()) as db:
+        proposal = db.get(Proposal, victim_id)
+        assert proposal.proposed_value == str(keeper_path)
+        assert proposal.status == ProposalStatus.PENDING
+
+    assert client.post(f"/api/duplicates/{group_id}/keeper", json={
+        "session_id": one, "keep_file_id": unrelated_file_id,
+    }).status_code == 400
+    assert client.post(f"/api/duplicates/{group_id}/keeper", json={
+        "session_id": two, "keep_file_id": keeper_file_id,
+    }).status_code == 404
+    assert client.post(f"/api/duplicates/{group_id}/keeper", json={
+        "keep_file_id": keeper_file_id,
+    }).status_code == 422
+    assert victim_path.exists()
+
+
+def test_cancelled_nested_producer_still_blocks_commit_and_new_job(review_db, monkeypatch):
+    from donedatahoarder.core.jobs import job_manager
+    from donedatahoarder.proposals.namer import core as namer_core
+
+    client, (one, _), (root_one, _) = review_db
+    _proposal(one, root_one, "nested.txt", ProposalStatus.APPROVED)
+    token = client.get("/api/execute/preview", params={"session_id": one}).json()["token"]
+    running = Event()
+    exit_worker = Event()
+    cancelled = Event()
+
+    def slow_propose(**kwargs):
+        running.set()
+        assert exit_worker.wait(10)
+        return {"rename": 0}
+
+    monkeypatch.setattr(namer_core, "generate_proposals", slow_propose)
+    progress = namer_core.generate_proposals_with_progress(
+        session_id=one, cancel_check=cancelled.is_set,
+    )
+    assert next(progress)["phase"] == "starting"
+    try:
+        assert next(progress)["heartbeat"] is True
+        assert running.wait(5)
+        cancelled.set()
+        assert next(progress)["cancelled"] is True
+        progress.close()
+        assert job_manager.get_active() is None
+        assert job_manager.has_live_workers()
+        response = client.post("/api/execute", json={
+            "session_id": one, "dry_run": False, "preview_token": token,
+        })
+        assert response.status_code == 409
+        with pytest.raises(RuntimeError, match="previous pipeline worker"):
+            job_manager._create_job("test", one)
+    finally:
+        exit_worker.set()
+        for worker in list(job_manager._worker_threads.values()):
+            worker.join(timeout=5)
+        assert not job_manager.has_live_workers()
+
+
+def test_worker_registration_is_atomic_with_thread_start():
+    from donedatahoarder.core.jobs import job_manager
+
+    starting = Event()
+    allow_start = Event()
+    allow_exit = Event()
+
+    class DelayedStart(Thread):
+        def start(self):
+            starting.set()
+            assert allow_start.wait(5)
+            super().start()
+
+    worker = DelayedStart(target=lambda: allow_exit.wait(5), daemon=True)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            start = pool.submit(job_manager.start_tracked_worker, worker)
+            assert starting.wait(5)
+            check = pool.submit(job_manager.has_live_workers)
+            with pytest.raises(FutureTimeout):
+                check.result(timeout=0.05)
+            allow_start.set()
+            start.result(timeout=5)
+            assert check.result(timeout=5) is True
+    finally:
+        allow_start.set()
+        allow_exit.set()
+        if worker.ident is not None:
+            worker.join(timeout=5)
+    assert not job_manager.has_live_workers()
+
+
+def test_completed_job_allows_immediate_next_job_after_writes(monkeypatch):
+    from donedatahoarder.core import wake_lock
+    from donedatahoarder.core.jobs import JobState, job_manager
+
+    monkeypatch.setattr(wake_lock, "acquire", lambda: None)
+    monkeypatch.setattr(wake_lock, "release", lambda: None)
+    published = Event()
+    release_publish = Event()
+    finished = Event()
+    job = job_manager._create_job("test", "first")
+    original_push = job.push_progress
+
+    def slow_terminal_push(progress):
+        original_push(progress)
+        if progress.get("done"):
+            published.set()
+            assert release_publish.wait(5)
+
+    job.push_progress = slow_terminal_push
+    def finish_job():
+        try:
+            job_manager._finish_job(job, JobState.COMPLETED)
+        finally:
+            finished.set()
+
+    job_manager._start_worker(job, finish_job)
+    try:
+        assert published.wait(5)
+        assert job_manager.get_active() is None
+        # The old worker is still finishing its terminal notification, but
+        # has no remaining database writes or nested producer.
+        assert not job_manager.has_live_workers()
+        next_job = job_manager._create_job("test", "second")
+        job_manager._finish_job(next_job, JobState.CANCELLED)
+    finally:
+        release_publish.set()
+        assert finished.wait(5)
+
+
+def test_pipeline_uses_saved_models_when_request_omits_model(review_db, monkeypatch):
+    from donedatahoarder.core.jobs import job_manager
+
+    client, (one, _), _ = review_db
+    with Session(get_engine()) as db:
+        user_session = db.get(UserSession, one)
+        user_session.model = "gemma3:12b"  # legacy fallback must not win
+        user_session.analyze_model = "gemma4:26b"
+        user_session.propose_model = "gemma4:26b"
+        db.commit()
+
+    started = []
+    monkeypatch.setattr(job_manager, "start_analyze",
+                        lambda **kwargs: started.append(("analyze", kwargs)) or "analysis-job")
+    monkeypatch.setattr(job_manager, "start_propose",
+                        lambda **kwargs: started.append(("propose", kwargs)) or "proposal-job")
+
+    for step in ("analyze", "propose"):
+        response = client.post(f"/api/pipeline/{step}", json={"session_id": one})
+        assert response.status_code == 200, response.text
+    assert [(step, kwargs["model"]) for step, kwargs in started] == [
+        ("analyze", "gemma4:26b"), ("propose", "gemma4:26b"),
+    ]
+
+    for step in ("analyze", "propose"):
+        response = client.post(f"/api/pipeline/{step}", json={
+            "session_id": one, "model": "gemma4:e4b",
+        })
+        assert response.status_code == 200, response.text
+    assert [(step, kwargs["model"]) for step, kwargs in started[2:]] == [
+        ("analyze", "gemma4:e4b"), ("propose", "gemma4:e4b"),
+    ]
+
+    with Session(get_engine()) as db:
+        user_session = db.get(UserSession, one)
+        user_session.analyze_model = None
+        user_session.propose_model = None
+        user_session.model = ""
+        db.commit()
+    response = client.post("/api/pipeline/analyze", json={"session_id": one})
+    assert response.status_code == 200, response.text
+    assert started[-1][1]["model"] == "gemma3:12b"

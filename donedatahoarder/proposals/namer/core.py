@@ -3,16 +3,20 @@ Core proposal loop — creates RENAME / ADD_TAGS proposals for analyzed files,
 then runs the post-passes (sibling propagation, disambiguation, fallbacks,
 spelling normalisation, near-duplicate flagging).
 """
+import re
 from pathlib import Path
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from donedatahoarder.db.models import File, FileStatus, Proposal, ProposalStatus, ProposalType, UserSession
+from donedatahoarder.db.models import (
+    File, FileStatus, Proposal, ProposalStatus, ProposalType,
+    RelationGroup, RelationMember, UserSession,
+)
 from donedatahoarder.db.session import get_engine
 
 from .llm import translate_filename
-from .naming import _ensure_prefix, _resolve_collision, build_new_name
+from .naming import _ensure_prefix, _is_useless_stem, _resolve_collision, build_new_name
 from .postpass import (
     _disambiguate_generic_stems_in_dir,
     _flag_near_duplicate_proposals,
@@ -28,7 +32,126 @@ from .postpass import (
 # Proposal generation
 # ---------------------------------------------------------------------------
 
-def generate_proposals(
+_IDENTITY_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+_GENERIC_SOURCE_TOKENS = {"img", "dsc", "image", "photo", "file", "untitled", "scan"}
+
+
+def _preserves_descriptive_identity(original_stem: str, proposed_stem: str) -> bool:
+    """Do not trade an informative project filename for a generic AI label."""
+    compact_id = any(
+        (len(token) >= 2 and token.isupper())
+        or (any(char.isalpha() for char in token) and any(char.isdigit() for char in token))
+        for token in _IDENTITY_TOKEN_RE.findall(original_stem)
+    )
+    if _is_useless_stem(original_stem) and not compact_id:
+        return True
+    raw_tokens = _IDENTITY_TOKEN_RE.findall(original_stem)
+    original_tokens = [token.casefold() for token in raw_tokens]
+    meaningful = [
+        token.casefold() for token in raw_tokens
+        if (len(token) >= 3 or token.isdigit() or re.fullmatch(r"v\d+", token.casefold())
+            or (len(token) >= 2 and token.isupper())
+            or (any(char.isalpha() for char in token) and any(char.isdigit() for char in token)))
+        and token.casefold() not in _GENERIC_SOURCE_TOKENS
+    ]
+    if not meaningful:
+        return True
+    proposed_tokens = {token.casefold() for token in _IDENTITY_TOKEN_RE.findall(proposed_stem)}
+    return all(token in proposed_tokens for token in meaningful)
+
+
+def _restore_descriptive_identity(original_stem: str, proposed_stem: str) -> str:
+    if _preserves_descriptive_identity(original_stem, proposed_stem):
+        return proposed_stem
+    existing = {token.casefold() for token in _IDENTITY_TOKEN_RE.findall(proposed_stem)}
+    original = [token for token in _IDENTITY_TOKEN_RE.findall(original_stem)
+                if token.casefold() not in _GENERIC_SOURCE_TOKENS]
+    missing = [token for token in original if token.casefold() not in existing]
+    return "_".join([*missing, proposed_stem]) if missing else proposed_stem
+
+
+def _borrowed_name_supported(file_rec: File, proposed_stem: str) -> bool:
+    """Own verified content must support every new semantic term borrowed."""
+    if not _content_verified_for_naming(file_rec):
+        return False
+    proposed = {token.casefold() for token in _IDENTITY_TOKEN_RE.findall(proposed_stem)}
+    original = {token.casefold() for token in _IDENTITY_TOKEN_RE.findall(Path(file_rec.path).stem)}
+    generic = {"file", "document", "image", "photo", "source", "sibling", "export", "backup"}
+    new_semantics = proposed - original - generic
+    evidence = {token.casefold() for token in _IDENTITY_TOKEN_RE.findall(
+        (file_rec.ai_description or "") + " " + (file_rec.ai_tags or "")
+    )}
+    description_tokens = [token.casefold() for token in _IDENTITY_TOKEN_RE.findall(
+        file_rec.ai_description or ""
+    )]
+    for index, token in enumerate(description_tokens):
+        if token in new_semantics and {"not", "no", "without"} & set(
+            description_tokens[max(0, index - 3):index]
+        ):
+            return False
+    return bool(new_semantics) and new_semantics <= evidence
+
+
+def _content_verified_for_naming(file_rec: File) -> bool:
+    return (
+        getattr(file_rec, "analysis_outcome", None) == "content_verified"
+        and getattr(file_rec, "analysis_evidence_source", None) in {"text", "vision"}
+        and file_rec.ai_confidence is not None
+        and file_rec.ai_confidence > 0
+    )
+
+
+def _suppress_unsafe_rename_postpasses(session_id: str | None,
+                                       sequence_ids: set[int]) -> dict[str, int]:
+    """Final gate applies to every naming post-pass, not only the AI pass."""
+    if not session_id:
+        return {}
+    removed: dict[str, int] = {}
+    with Session(get_engine()) as db:
+        from donedatahoarder.core.dependency_protection import ProtectionIndex
+        owner = db.get(UserSession, session_id)
+        protection = ProtectionIndex(Path(owner.root_path)) if owner and owner.root_path else None
+        proposals = (
+            db.query(Proposal, File).join(File, Proposal.file_id == File.id)
+            .filter(File.session_id == session_id,
+                    Proposal.proposal_type == ProposalType.RENAME,
+                    Proposal.status == ProposalStatus.PENDING)
+            .all()
+        )
+        reserved = {Path(p.proposed_value) for p, _ in proposals if p.proposed_value}
+        for proposal, file_rec in proposals:
+            original = Path(file_rec.path)
+            proposed = Path(proposal.proposed_value or "")
+            borrowed = (proposal.reasoning or "").startswith((
+                "RelationGroup propagation", "Sibling rename",
+            ))
+            if file_rec.id in sequence_ids:
+                reason = "numbered_sequence"
+            elif protection and protection.assess(original).protected:
+                reason = "protected_resource"
+            elif borrowed and not _borrowed_name_supported(file_rec, proposed.stem):
+                # Related paths or a shared stem do not establish the same
+                # content. A target's own verified description must support
+                # the transferred semantic name.
+                reason = "unsupported_relation_name_transfer"
+            else:
+                restored = _restore_descriptive_identity(original.stem, proposed.stem)
+                if restored != proposed.stem:
+                    destination = proposed.with_name(restored + proposed.suffix)
+                    if destination in reserved or destination.exists():
+                        destination = _resolve_collision(destination, original,
+                                                         reserved_names=reserved)
+                    reserved.add(destination)
+                    proposal.proposed_value = str(destination)
+                    proposal.reasoning = ((proposal.reasoning or "")
+                                          + " Original project/file identity retained.")
+                continue
+            removed[reason] = removed.get(reason, 0) + 1
+            db.delete(proposal)
+        db.commit()
+    return removed
+
+def _generate_proposals_impl(
     limit: Optional[int] = None,
     offset: Optional[int] = None,
     session_id: str | None = None,
@@ -65,6 +188,14 @@ def generate_proposals(
                 session_root_path = user_sess.root_path
 
     with Session(engine) as session:
+        sequence_ids = {
+            file_id for (file_id,) in (
+                session.query(RelationMember.file_id)
+                .join(RelationGroup, RelationMember.group_id == RelationGroup.id)
+                .filter(RelationGroup.session_id == session_id,
+                        RelationGroup.label.like("frame_sequence_%"))
+            )
+        } if session_id else set()
         query = session.query(File).filter(File.status == FileStatus.ANALYZED)
         if session_id:
             query = query.filter(File.session_id == session_id)
@@ -103,12 +234,17 @@ def generate_proposals(
 
                 for file_rec in batch:
                     path = Path(file_rec.path)
-                    new_name = build_new_name(file_rec, root_path=session_root_path)
+                    verified = _content_verified_for_naming(file_rec)
+                    new_name = (
+                        build_new_name(file_rec, root_path=session_root_path)
+                        if verified and file_rec.id not in sequence_ids else None
+                    )
                     rename_name = None
                     if new_name and new_name != path.name:
                         # Ensure prefix is preserved if original had one
                         new_stem = Path(new_name).stem
                         new_stem = _ensure_prefix(new_stem, path.stem)
+                        new_stem = _restore_descriptive_identity(path.stem, new_stem)
                         rename_name = f"{new_stem}{Path(new_name).suffix}"
                     prepared.append({
                         "id": file_rec.id,
@@ -116,7 +252,7 @@ def generate_proposals(
                         "new_name": rename_name,
                         "ai_description": file_rec.ai_description,
                         "ai_confidence": file_rec.ai_confidence,
-                        "ai_tags": file_rec.ai_tags,
+                        "ai_tags": file_rec.ai_tags if verified else None,
                     })
 
             for item in prepared:
@@ -169,7 +305,7 @@ def generate_proposals(
                                     f"Renamed based on AI description: "
                                     f"{(item['ai_description'] or '')[:120]}"
                                 ),
-                                confidence=item["ai_confidence"] or 0.5,
+                                confidence=(item["ai_confidence"] if item["ai_confidence"] is not None else 0.5),
                                 status=ProposalStatus.PENDING,
                             ))
                             counts["rename"] += 1
@@ -184,7 +320,7 @@ def generate_proposals(
                                 current_value=None,
                                 proposed_value=item["ai_tags"],
                                 reasoning="Tags generated by AI analysis",
-                                confidence=item["ai_confidence"] or 0.5,
+                                confidence=(item["ai_confidence"] if item["ai_confidence"] is not None else 0.5),
                                 status=ProposalStatus.PENDING,
                             ))
                             counts["tags"] += 1
@@ -291,12 +427,57 @@ def generate_proposals(
         # Best-effort — never break the pipeline if it errors.
         pass
 
+    if session_id:
+        suppressed = _suppress_unsafe_rename_postpasses(session_id, sequence_ids)
+    else:
+        # Older `ddh pipeline` and direct library callers may omit a session ID.
+        # Apply the same final gate to every affected session, including its
+        # own numbered-frame membership and dependency root.
+        suppressed = {}
+        with Session(engine) as db:
+            affected = [sid for (sid,) in (
+                db.query(File.session_id).join(Proposal, Proposal.file_id == File.id)
+                .filter(Proposal.proposal_type == ProposalType.RENAME,
+                        Proposal.status == ProposalStatus.PENDING)
+                .distinct()
+            ) if sid]
+            sequences_by_session = {
+                sid: {fid for (fid,) in (
+                    db.query(RelationMember.file_id)
+                    .join(RelationGroup, RelationMember.group_id == RelationGroup.id)
+                    .filter(RelationGroup.session_id == sid,
+                            RelationGroup.label.like("frame_sequence_%"))
+                )}
+                for sid in affected
+            }
+        for sid in affected:
+            for reason, number in _suppress_unsafe_rename_postpasses(
+                sid, sequences_by_session[sid]
+            ).items():
+                suppressed[reason] = suppressed.get(reason, 0) + number
+    if suppressed:
+        counts["suppressed_unsafe_renames"] = sum(suppressed.values())
+        counts["rename_suppression_reasons"] = suppressed
+        if suppressed.get("numbered_sequence"):
+            counts["sequence_renames_suppressed"] = suppressed["numbered_sequence"]
+
     return counts
 
 
 # ---------------------------------------------------------------------------
 # Background-job-friendly wrapper
 # ---------------------------------------------------------------------------
+
+def generate_proposals(
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+    session_id: str | None = None,
+) -> dict:
+    """Write naming proposals under the database's cross-process lock."""
+    from donedatahoarder.core.process_lock import operation_lock
+
+    with operation_lock("generate proposals"):
+        return _generate_proposals_impl(limit, offset, session_id)
 
 def generate_proposals_with_progress(
     session_id: str | None = None,
@@ -360,7 +541,8 @@ def generate_proposals_with_progress(
         daemon=True,
         name="propose-worker",
     )
-    worker.start()
+    from donedatahoarder.core.jobs import job_manager
+    job_manager.start_tracked_worker(worker)
 
     while True:
         try:

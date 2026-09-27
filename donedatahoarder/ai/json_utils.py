@@ -105,7 +105,11 @@ def _extract_json_object_or_array(text: str) -> Optional[str]:
     return None
 
 
-def extract_json(raw: str, fix_escapes: bool = True) -> Any:
+def extract_json(
+    raw: str,
+    fix_escapes: bool = True,
+    allow_control_chars: bool = False,
+) -> Any:
     """
     Extract a Python dict/list from a raw LLM response string.
 
@@ -115,6 +119,10 @@ def extract_json(raw: str, fix_escapes: bool = True) -> Any:
       3. Try with escape fixing.
       4. Try extracting the first JSON object/array substring.
       5. Try extraction + escape fixing.
+
+    allow_control_chars tolerates literal control characters inside JSON
+    strings when requested by a caller that validates extracted values against
+    an exact allowlist. It does not alter those characters.
 
     Returns:
       Parsed JSON (dict/list) or raises ValueError if unrecoverable.
@@ -127,7 +135,7 @@ def extract_json(raw: str, fix_escapes: bool = True) -> Any:
 
     for text in attempts:
         try:
-            return json.loads(text)
+            return json.loads(text, strict=not allow_control_chars)
         except json.JSONDecodeError:
             pass
 
@@ -136,7 +144,7 @@ def extract_json(raw: str, fix_escapes: bool = True) -> Any:
         snippet = _extract_json_object_or_array(text)
         if snippet:
             try:
-                return json.loads(snippet)
+                return json.loads(snippet, strict=not allow_control_chars)
             except json.JSONDecodeError:
                 pass
 

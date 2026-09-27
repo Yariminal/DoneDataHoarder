@@ -20,6 +20,7 @@ from donedatahoarder.db.models import (
 from donedatahoarder.db.session import get_engine
 from donedatahoarder.timeutils import utcnow
 
+from .deps import review_operation
 from .schemas import CreateSessionRequest, SaveSessionRequest
 
 router = APIRouter()
@@ -181,6 +182,11 @@ class UpdateSessionSettingsRequest(BaseModel):
 @router.patch("/sessions/{session_id}")
 def update_session_settings(session_id: str, body: UpdateSessionSettingsRequest):
     """Update session settings (models, backend, etc.)."""
+    with review_operation("update session settings"):
+        return _update_session_settings_locked(session_id, body)
+
+
+def _update_session_settings_locked(session_id: str, body: UpdateSessionSettingsRequest):
     engine = get_engine()
     with Session(engine) as session:
         user_session = session.get(UserSession, session_id)
@@ -264,9 +270,28 @@ def mark_session_dirty(session_id: str):
 @router.delete("/sessions/{session_id}")
 def delete_session(session_id: str):
     """Delete a session and all its associated data."""
-    # Force-cancel any running jobs for this session first
+    with review_operation("delete session"):
+        return _delete_session_locked(session_id)
+
+
+def _delete_session_locked(session_id: str):
+    # A second web process may own a paused or just-dispatched worker that
+    # is absent from this process's in-memory registry. Its persisted lease
+    # remains live until that worker really exits.
     from donedatahoarder.core.jobs import job_manager
+    from donedatahoarder.core.job_store import LIVE_STATES
+    from donedatahoarder.db.models import BackgroundJob
+
     job_manager.cancel_session_jobs(session_id)
+    job_manager.reconcile_startup()
+    with Session(get_engine()) as db:
+        live = (db.query(BackgroundJob).filter(
+            BackgroundJob.session_id == session_id,
+            BackgroundJob.state.in_(LIVE_STATES),
+        ).first())
+    if live is not None:
+        job_manager.force_cancel(live.id)
+        raise HTTPException(409, "Wait for the session's pipeline worker to exit before deleting it")
 
     engine = get_engine()
     with Session(engine) as session:

@@ -345,7 +345,7 @@ def _take(counts: dict, limit: Optional[int]) -> Optional[int]:
     return take
 
 
-def enrich(workers: int = 1, limit: Optional[int] = None, session_id: str | None = None) -> dict:
+def _enrich_unlocked(workers: int = 1, limit: Optional[int] = None, session_id: str | None = None) -> dict:
     """
     Enrich all PENDING File records with metadata and hashes.
 
@@ -408,7 +408,7 @@ def enrich(workers: int = 1, limit: Optional[int] = None, session_id: str | None
     return counts
 
 
-def enrich_with_progress(
+def _enrich_with_progress_unlocked(
     workers: int = 1,
     limit: int | None = None,
     session_id: str | None = None,
@@ -470,3 +470,26 @@ def enrich_with_progress(
             break
 
     yield {"current": current, "total": total, **counts, "done": True}
+
+
+def enrich(workers: int = 1, limit: Optional[int] = None, session_id: str | None = None) -> dict:
+    from donedatahoarder.core.process_lock import operation_lock
+
+    with operation_lock("enrich"):
+        return _enrich_unlocked(workers=workers, limit=limit, session_id=session_id)
+
+
+def enrich_with_progress(
+    workers: int = 1,
+    limit: int | None = None,
+    session_id: str | None = None,
+    pause_event: "threading.Event | None" = None,
+    cancel_check: "Callable[[], bool] | None" = None,
+):
+    from donedatahoarder.core.process_lock import operation_lock
+
+    with operation_lock("enrich"):
+        yield from _enrich_with_progress_unlocked(
+            workers=workers, limit=limit, session_id=session_id,
+            pause_event=pause_event, cancel_check=cancel_check,
+        )

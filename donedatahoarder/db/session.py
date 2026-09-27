@@ -40,6 +40,17 @@ def _migrate_add_columns(engine: Engine, inspector) -> None:
         ("sessions", "relate_scope", "VARCHAR", "'per_directory'"),
         ("files", "date_created_source", "VARCHAR", "NULL"),
         ("scan_sessions", "last_scanned_path", "VARCHAR", "NULL"),
+        ("files", "analysis_outcome", "VARCHAR", "NULL"),
+        ("files", "analysis_reason", "VARCHAR", "NULL"),
+        ("files", "analysis_evidence_source", "VARCHAR", "NULL"),
+        ("files", "analysis_model_tag", "VARCHAR", "NULL"),
+        ("files", "analysis_model_digest", "VARCHAR", "NULL"),
+        ("files", "analysis_prompt_version", "VARCHAR", "NULL"),
+        ("files", "analysis_extractor_version", "VARCHAR", "NULL"),
+        ("files", "analysis_content_chars", "INTEGER", "NULL"),
+        ("duplicate_members", "distance_to_keeper", "FLOAT", "NULL"),
+        ("proposals", "duplicate_group_id", "INTEGER", "NULL"),
+        ("proposals", "review_kind", "VARCHAR", "NULL"),
     ]
 
     for table, column, sql_type, default in migrations:
@@ -76,13 +87,15 @@ def init_db(db_path: Path) -> Engine:
         dbapi_conn.execute("PRAGMA synchronous=NORMAL")
 
     try:
-        # Check if the 'sessions' table exists; if not, drop everything and
-        # recreate so we get a clean slate with the new session-based schema.
+        # A pre-session database needs an explicit conversion. Never erase an
+        # existing user's file index as a side effect of opening the app.
         inspector = inspect(_engine)
         existing_tables = inspector.get_table_names()
         if "files" in existing_tables and "sessions" not in existing_tables:
-            # Old schema without sessions — drop all and recreate
-            Base.metadata.drop_all(_engine)
+            raise RuntimeError(
+                "Legacy database has files but no sessions table. Back it up and "
+                "migrate it explicitly; automatic opening will not erase it."
+            )
 
         Base.metadata.create_all(_engine)
 
@@ -101,58 +114,18 @@ def init_db(db_path: Path) -> Engine:
 
 
 def _migrate_nullable_columns(engine: Engine, inspector) -> None:
-    """Alter columns to nullable where the schema has evolved (SQLite limited support)."""
-    from sqlalchemy import text
-
-    # SQLite only supports limited ALTER TABLE; we recreate the table
-    # if we need to drop a NOT NULL constraint. For scan_sessions,
-    # dropping and recreating is acceptable (it's just scan metadata).
+    """Rebuild legacy NOT NULL tables while preserving dependent rows."""
     nullable_migrations = [
         ("scan_sessions", "session_id"),
         ("duplicate_groups", "session_id"),
     ]
-
     for table, column in nullable_migrations:
         if table not in inspector.get_table_names():
             continue
         cols = inspector.get_columns(table)
         col_info = next((c for c in cols if c["name"] == column), None)
         if col_info and not col_info.get("nullable", True):
-            # Column is NOT NULL but should be nullable — we need to recreate the table
-            with engine.begin() as conn:
-                conn.execute(text(f"ALTER TABLE {table} RENAME TO {table}_old"))
-                # Create new table with correct schema (sqlite-specific)
-                if table == "scan_sessions":
-                    conn.execute(text(
-                        f"CREATE TABLE {table} ("
-                        f"id INTEGER NOT NULL PRIMARY KEY, "
-                        f"session_id VARCHAR(36), "
-                        f"root_path VARCHAR NOT NULL, "
-                        f"started_at DATETIME, "
-                        f"finished_at DATETIME, "
-                        f"files_found INTEGER DEFAULT 0, "
-                        f"files_new INTEGER DEFAULT 0, "
-                        f"files_skipped INTEGER DEFAULT 0, "
-                        f"files_error INTEGER DEFAULT 0, "
-                        f"completed BOOLEAN DEFAULT 0, "
-                        f"last_scanned_path VARCHAR, "
-                        f"FOREIGN KEY(session_id) REFERENCES sessions (id) ON DELETE CASCADE"
-                        f")"
-                    ))
-                elif table == "duplicate_groups":
-                    conn.execute(text(
-                        f"CREATE TABLE {table} ("
-                        f"id INTEGER NOT NULL PRIMARY KEY, "
-                        f"session_id VARCHAR(36), "
-                        f"dupe_type VARCHAR NOT NULL, "
-                        f"group_hash VARCHAR NOT NULL, "
-                        f"keep_file_id INTEGER, "
-                        f"FOREIGN KEY(session_id) REFERENCES sessions (id) ON DELETE CASCADE, "
-                        f"FOREIGN KEY(keep_file_id) REFERENCES files (id)"
-                        f")"
-                    ))
-                conn.execute(text(f"INSERT INTO {table} SELECT * FROM {table}_old"))
-                conn.execute(text(f"DROP TABLE {table}_old"))
+            _rebuild_table(engine, table, Base.metadata.tables[table])
 
 
 
@@ -172,35 +145,52 @@ def _unique_key_sets(conn, table: str) -> list[list[str]]:
 
 
 def _rebuild_table(engine: Engine, table_name: str, table) -> None:
-    """Recreate a table from the current model. SQLite cannot drop a UNIQUE in place."""
-    from sqlalchemy import text
+    """Transactionally recreate a table without retargeting child FKs."""
+    from sqlalchemy.schema import CreateIndex, CreateTable
 
     legacy = f"{table_name}_legacy"
     raw = engine.raw_connection()
     try:
         cursor = raw.cursor()
-        cursor.execute("PRAGMA foreign_keys=OFF")
-        cursor.execute(f"ALTER TABLE {table_name} RENAME TO {legacy}")
-        cursor.execute(f"PRAGMA index_list('{legacy}')")
-        for row in cursor.fetchall():
-            index_name = row[1]
-            if str(index_name).startswith("sqlite_autoindex"):
-                continue
-            cursor.execute(f'DROP INDEX IF EXISTS "{index_name}"')
         raw.commit()
+        old_fk = cursor.execute("PRAGMA foreign_keys").fetchone()[0]
+        old_legacy = cursor.execute("PRAGMA legacy_alter_table").fetchone()[0]
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        cursor.execute("PRAGMA legacy_alter_table=ON")
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(f"ALTER TABLE {table_name} RENAME TO {legacy}")
+            for row in cursor.execute(f"PRAGMA index_list('{legacy}')").fetchall():
+                index_name = row[1]
+                if not str(index_name).startswith("sqlite_autoindex"):
+                    cursor.execute(f'DROP INDEX IF EXISTS "{index_name}"')
+            cursor.execute(str(CreateTable(table).compile(dialect=engine.dialect)))
+            for index in table.indexes:
+                cursor.execute(str(CreateIndex(index).compile(dialect=engine.dialect)))
+            old_columns = {row[1] for row in cursor.execute(f"PRAGMA table_info('{legacy}')")}
+            shared = [column.name for column in table.columns if column.name in old_columns]
+            column_sql = ", ".join(f'"{name}"' for name in shared)
+            cursor.execute(
+                f"INSERT INTO {table_name} ({column_sql}) "
+                f"SELECT {column_sql} FROM {legacy}"
+            )
+            cursor.execute(f"DROP TABLE {legacy}")
+            violations = cursor.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError(
+                    f"Migration of {table_name} would break foreign keys: {violations[:3]}"
+                )
+            raw.commit()
+        except BaseException:
+            raw.rollback()
+            raise
+        finally:
+            cursor.execute(f"PRAGMA legacy_alter_table={old_legacy}")
+            cursor.execute(f"PRAGMA foreign_keys={old_fk}")
+            if cursor.execute("PRAGMA foreign_keys").fetchone()[0] != old_fk:
+                raise RuntimeError("Could not restore SQLite foreign-key enforcement")
     finally:
         raw.close()
-
-    table.create(engine)
-    old_cols = {c["name"] for c in inspect(engine).get_columns(legacy)}
-    shared = [c.name for c in table.columns if c.name in old_cols]
-    col_sql = ", ".join(shared)
-    with engine.begin() as conn:
-        conn.execute(text("PRAGMA foreign_keys=OFF"))
-        conn.execute(text(
-            f"INSERT INTO {table_name} ({col_sql}) SELECT {col_sql} FROM {legacy}"
-        ))
-        conn.execute(text(f"DROP TABLE {legacy}"))
 
 
 def _migrate_session_scope(engine: Engine) -> None:

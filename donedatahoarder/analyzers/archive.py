@@ -94,6 +94,9 @@ class ArchiveAnalyzer(BaseAnalyzer):
             )
 
         result = AnalysisResult.from_ai_response(data)
+        result.evidence_source = "metadata" if total_entries > 0 else "filename_only"
+        result.extractor = "zip_manifest"
+        result.content_chars = len(manifest)
         archive_type = data.get("archive_type", "")
         if archive_type and archive_type not in result.tags:
             result.tags.insert(0, archive_type)
@@ -106,5 +109,6 @@ class ArchiveAnalyzer(BaseAnalyzer):
         ):
             result.content_available = False
             result.confidence = min(result.confidence, 0.4)
+            result.reason = "unreadable_content"
 
         return result
