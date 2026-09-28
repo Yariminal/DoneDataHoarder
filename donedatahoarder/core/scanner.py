@@ -102,6 +102,35 @@ def _active_database_files() -> set[Path]:
             Path(f"{path}-journal")}
 
 
+def directory_exclusion(name: str, path: Path, skip: set[str], ddhignore) -> str | None:
+    """Return the scanner's first exclusion reason for a directory."""
+    if name in skip:
+        return "scanner_skip_directory"
+    if name.startswith("."):
+        return "scanner_dot_directory"
+    if _is_link_or_reparse(path):
+        return "link_or_reparse"
+    if ddhignore.should_ignore(path, is_dir=True):
+        return "ddhignore_directory"
+    return None
+
+
+def file_exclusion(name: str, path: Path, active_database_files: set[Path],
+                   ddhignore) -> str | None:
+    """Return the scanner's first exclusion reason for a file."""
+    if name in SKIP_FILENAMES or name.startswith(SKIP_FILENAME_PREFIXES):
+        return "system_metadata_name"
+    if Path(name).suffix.lower() in SKIP_EXTENSIONS:
+        return "transient_extension"
+    if _is_link_or_reparse(path):
+        return "link_or_reparse"
+    if path.resolve() in active_database_files:
+        return "active_database"
+    if ddhignore.should_ignore(path, is_dir=False):
+        return "ddhignore_file"
+    return None
+
+
 def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[Path]:
     """
     Yield Path objects for every regular file under *root*.
@@ -130,32 +159,16 @@ def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[
         # Prune unwanted dirs in-place so os.walk won't descend into them
         dirnames_filtered = []
         for d in dirnames:
-            if d in skip or d.startswith("."):
-                continue
-            # Check .ddhignore patterns
             dir_path = dirpath_obj / d
-            if _is_link_or_reparse(dir_path):
-                continue
-            if ddhignore.should_ignore(dir_path, is_dir=True):
+            if directory_exclusion(d, dir_path, skip, ddhignore):
                 continue
             dirnames_filtered.append(d)
 
         dirnames[:] = dirnames_filtered
 
         for name in filenames:
-            # Skip by filename pattern (system metadata, macOS AppleDouble, etc.)
-            if name in SKIP_FILENAMES or name.startswith(SKIP_FILENAME_PREFIXES):
-                continue
-            # Skip by extension
-            if Path(name).suffix.lower() in SKIP_EXTENSIONS:
-                continue
-            # Check .ddhignore patterns
             file_path = dirpath_obj / name
-            if _is_link_or_reparse(file_path):
-                continue
-            if file_path.resolve() in active_database_files:
-                continue
-            if ddhignore.should_ignore(file_path, is_dir=False):
+            if file_exclusion(name, file_path, active_database_files, ddhignore):
                 continue
             yield file_path
 

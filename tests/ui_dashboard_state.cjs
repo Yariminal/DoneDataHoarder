@@ -53,7 +53,8 @@ listeners.get('alpine:init')();
   session.current_session_id = 'A';
   const statsA = { total_files: 1321, total_size_bytes: 4000,
     by_status: { analyzed: 1, proposed: 781, skipped: 539 },
-    proposal_counts: { pending: 869 }, duplicate_groups: 0, by_extension: [] };
+    proposal_counts: { pending: 869 }, pending_by_type: { rename: 700, move: 169 },
+    duplicate_groups: 0, by_extension: [] };
 
   let load = dashboard.load();
   answer('/stats?session_id=A', statsA);
@@ -63,8 +64,21 @@ listeners.get('alpine:init')();
   assert.equal(dashboard.executionState(), 'Idle');
   assert.equal(dashboard.executionSummary(), 'No active app processing');
   assert.equal(dashboard.reviewWaiting(), '869 suggestions awaiting review');
+  assert.equal(dashboard.pendingReviewTypes().length, 2);
+  dashboard.openReviewQueue('move');
+  assert.equal(stores.get('app').tab, 'proposals');
+  assert.equal(stores.get('app').reviewQueue.session_id, 'A');
+  assert.equal(stores.get('app').reviewQueue.type, 'move');
   assert.deepEqual(Array.from(dashboard.fileStatusDistribution(), x => x.count), [1, 781, 539]);
   assert.equal(dashboard.fileStatusDistribution()[1].share, '59.1%');
+  load = dashboard.load();
+  context.window._dataVersion += 1;
+  answer('/stats?session_id=A', statsA);
+  answer('/pipeline/jobs/active', { job_id: null });
+  answer('/pipeline/runs/latest?session_id=A', { plan: null });
+  await load;
+  assert.ok(dashboard._loadedVersion < context.window._dataVersion,
+    'in-flight old stats must not claim the review mutation version');
 
   let status = dashboard.loadExecutionStatus();
   answer('/pipeline/jobs/active', { job_id: 'other', session_id: 'B', state: 'running' });

@@ -364,11 +364,18 @@ tr:hover td { background: rgba(255,255,255,.02); }
 .coverage-grid strong { color: var(--primary); font-size: 1.2rem; }
 .coverage-grid span { color: var(--text-dim); font-size: .78rem; }
 .review-note { display: block; padding: 5px 8px; margin-top: 6px; border-left: 3px solid var(--warning); background: var(--surface-2); color: var(--text); font-size: .78rem; line-height: 1.4; }
+.pending-review-links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.duplicate-comparison-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 14px 0; }
+.duplicate-comparison-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+.duplicate-comparison-grid pre { overflow-wrap: anywhere; }
 button:focus-visible, a:focus-visible, summary:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }
 @media (max-width: 600px) {
   .preflight-controls { display: grid; align-items: stretch; }
   .preflight-controls > label:first-child { min-width: 0; }
   .dupe-file { grid-template-columns: 1fr !important; }
+  .duplicate-comparison-grid { grid-template-columns: minmax(0, 1fr); }
+  .duplicate-comparison-actions { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .duplicate-comparison-actions .btn { width: 100%; white-space: normal; }
 }
 .keeper-star { color: var(--success); font-weight: 700; }
 

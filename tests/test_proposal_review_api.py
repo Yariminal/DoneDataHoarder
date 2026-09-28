@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import hashlib
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from threading import Event, Thread
@@ -57,6 +58,82 @@ def _proposal(sid: str, root: Path, name: str, status=ProposalStatus.PENDING,
 def _status(proposal_id: int) -> ProposalStatus:
     with Session(get_engine()) as db:
         return db.get(Proposal, proposal_id).status
+
+
+def test_dashboard_pending_review_counts_are_scoped_and_bounded(review_db):
+    client, (one, two), (root_one, root_two) = review_db
+    _proposal(one, root_one, "rename.txt", proposal_type=ProposalType.RENAME)
+    _proposal(one, root_one, "move.txt", proposal_type=ProposalType.MOVE)
+    _proposal(one, root_one, "done.txt", status=ProposalStatus.APPROVED,
+              proposal_type=ProposalType.RENAME)
+    _proposal(two, root_two, "other.txt", proposal_type=ProposalType.MARK_DUPLICATE)
+
+    first = client.get(f"/api/stats?session_id={one}")
+    assert first.status_code == 200
+    assert first.json()["proposal_counts"] == {"pending": 2, "approved": 1}
+    assert first.json()["pending_by_type"] == {"rename": 1, "move": 1}
+    second = client.get(f"/api/stats?session_id={two}")
+    assert second.json()["pending_by_type"] == {"mark_duplicate": 1}
+    assert client.get("/api/stats").json()["pending_by_type"] == {
+        "rename": 1, "move": 1, "mark_duplicate": 1,
+    }
+
+
+def test_saved_results_require_explicit_session_owner(review_db, tmp_path, monkeypatch):
+    from donedatahoarder.web import results_manager
+
+    monkeypatch.setattr(results_manager, "RESULTS_DIR", tmp_path / "saved-results")
+    client, (one, two), (root_one, root_two) = review_db
+    first = _proposal(one, root_one, "first.txt")
+    _proposal(two, root_two, "second.txt")
+    with Session(get_engine()) as db:
+        file_id = db.get(Proposal, first).file_id
+        group = DuplicateGroup(session_id=one, dupe_type=DupeType.EXACT,
+                               group_hash="snapshot-group", keep_file_id=file_id)
+        db.add(group)
+        db.flush()
+        db.add(DuplicateMember(group_id=group.id, file_id=file_id))
+        db.commit()
+
+    assert client.post("/api/results/save/files").status_code == 422
+    for kind in ("files", "proposals", "duplicates"):
+        saved = client.post(f"/api/results/save/{kind}", params={"session_id": one, "name": "review"})
+        assert saved.status_code == 200, saved.text
+        filename = saved.json()["filename"]
+        own = client.get(f"/api/results/load/{filename}",
+                         params={"session_id": one, "result_type": kind})
+        assert own.status_code == 200
+        assert own.json()["session_id"] == one
+        assert len(own.json()["data"]["items"]) == 1
+        assert client.get(f"/api/results/load/{filename}",
+                          params={"session_id": two, "result_type": kind}).status_code == 404
+        assert client.get(f"/api/results/load/{filename}",
+                          params={"session_id": one, "result_type": "files" if kind != "files" else "proposals"}).status_code == 404
+        listed = client.get("/api/results/list", params={"session_id": one, "result_type": kind})
+        assert [item["filename"] for item in listed.json()] == [filename]
+        assert client.get("/api/results/list", params={"session_id": two, "result_type": kind}).json() == []
+
+    legacy = results_manager.RESULTS_DIR / "legacy.json"
+    legacy.write_text(json.dumps({"type": "files", "saved_at": "old", "data": {"items": []}}),
+                      encoding="utf-8")
+    assert client.get("/api/results/load/legacy.json",
+                      params={"session_id": one, "result_type": "files"}).status_code == 409
+    assert "legacy.json" not in [row["filename"] for row in client.get(
+        "/api/results/list", params={"session_id": one, "result_type": "files"}).json()]
+
+    def bounded_groups(page, per_page, session_id):
+        assert (page, per_page, session_id) == (1, 100, one)
+        return {"items": [{"id": number} for number in range(100)], "total": 125}
+
+    monkeypatch.setattr("donedatahoarder.web.api.results.list_duplicates", bounded_groups)
+    capped = client.post("/api/results/save/duplicates",
+                         params={"session_id": one, "name": "capped"})
+    assert capped.status_code == 200
+    assert "100 of 125" in capped.json()["message"]
+    retained = client.get(f"/api/results/load/{capped.json()['filename']}",
+                          params={"session_id": one, "result_type": "duplicates"}).json()
+    assert len(retained["data"]["items"]) == 100
+    assert retained["data"]["total"] == 125
 
 
 def test_bulk_review_only_changes_selected_session(review_db):

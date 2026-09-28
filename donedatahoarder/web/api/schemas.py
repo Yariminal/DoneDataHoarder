@@ -15,6 +15,7 @@ class StatsResponse(BaseModel):
     by_extension: list[dict] = []
     by_mime_category: list[dict] = []
     proposal_counts: dict[str, int] = {}
+    pending_by_type: dict[str, int] = {}
     duplicate_groups: int = 0
     duplicate_wasted_bytes: int = 0
 

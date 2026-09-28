@@ -9,7 +9,7 @@ from fastapi import APIRouter
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from donedatahoarder.db.models import DupeType, DuplicateGroup, DuplicateMember, File, Proposal
+from donedatahoarder.db.models import DupeType, DuplicateGroup, DuplicateMember, File, Proposal, ProposalStatus
 from donedatahoarder.db.session import get_engine
 
 from .schemas import StatsResponse
@@ -71,6 +71,12 @@ def get_stats(session_id: Optional[str] = None):
             prop_q = prop_q.join(File).filter(File.session_id == sid)
         prop_rows = prop_q.group_by(Proposal.status).all()
         proposal_counts = {s.value: c for s, c in prop_rows}
+        pending_q = session.query(Proposal.proposal_type, func.count(Proposal.id)).filter(
+            Proposal.status == ProposalStatus.PENDING
+        )
+        if sid:
+            pending_q = pending_q.join(File).filter(File.session_id == sid)
+        pending_by_type = {kind.value: count for kind, count in pending_q.group_by(Proposal.proposal_type).all()}
 
         # Duplicates
         dupe_q = session.query(func.count(DuplicateGroup.id))
@@ -99,6 +105,7 @@ def get_stats(session_id: Optional[str] = None):
         by_extension=by_extension,
         by_mime_category=by_mime,
         proposal_counts=proposal_counts,
+        pending_by_type=pending_by_type,
         duplicate_groups=dupe_count,
         duplicate_wasted_bytes=dupe_wasted,
     )

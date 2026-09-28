@@ -25,6 +25,7 @@ document.addEventListener('alpine:init', () => {
     loading: false,
     foregroundOperation: null,
     foregroundOperationSeq: 0,
+    reviewQueue: null,
     version: '0.6.0',
 
     toast(msg, type = 'info') {
@@ -503,29 +504,74 @@ document.addEventListener('alpine:init', () => {
   const resultsMixin = {
     currentResult: '',
     savedResults: [],
+    snapshotMode: false,
+    snapshotItems: [],
+    snapshotSavedTotal: 0,
+    snapshotAsOf: '',
+    _resultsListRequest: 0,
+    _resultLoadRequest: 0,
+
+    resultType() {
+      if (this.files !== undefined) return 'files';
+      if (this.proposals !== undefined) return 'proposals';
+      return 'duplicates';
+    },
+
+    resetResults() {
+      this._resultsListRequest += 1;
+      this._resultLoadRequest += 1;
+      this.currentResult = '';
+      this.savedResults = [];
+      this.clearSnapshot();
+      this.loadResultsList();
+    },
+
+    clearSnapshot() {
+      this.snapshotMode = false;
+      this.snapshotItems = [];
+      this.snapshotSavedTotal = 0;
+      this.snapshotAsOf = '';
+      this.currentResult = '';
+    },
+
+    showSnapshotPage() {
+      if (!this.snapshotMode) return;
+      const rows = this.snapshotItems.slice((this.page - 1) * this.perPage, this.page * this.perPage);
+      const key = this.resultType() === 'files' ? 'files' : this.resultType() === 'proposals' ? 'proposals' : 'groups';
+      this[key] = rows;
+      this.total = this.snapshotItems.length;
+    },
 
     async initResults() {
       await this.loadResultsList();
     },
 
     async loadResultsList() {
+      const sid = Alpine.store('session').current_session_id;
+      const requestId = ++this._resultsListRequest;
+      if (!sid) { this.savedResults = []; return; }
       try {
-        this.savedResults = await api.get('/results/list');
+        const rows = await api.get(`/results/list?session_id=${encodeURIComponent(sid)}&result_type=${this.resultType()}`);
+        if (requestId === this._resultsListRequest && sid === Alpine.store('session').current_session_id)
+          this.savedResults = rows;
       } catch (e) {
         console.error('Failed to load results list:', e);
       }
     },
 
     async saveResults(type) {
+      const sid = Alpine.store('session').current_session_id;
+      if (!sid || type !== this.resultType()) return;
       const name = await window.appPrompt(
-        `Save ${type} results as:`,
+        `Save this session's ${type === 'proposals' ? 'pending proposals' : type} snapshot as:`,
         `${type}_${new Date().toISOString().slice(0, 10)}`,
         { title: 'Save results', confirmLabel: 'Save' }
       );
-      if (!name) return;
+      if (!name || sid !== Alpine.store('session').current_session_id) return;
 
       try {
-        const result = await api.post(`/results/save/${type}?name=${encodeURIComponent(name)}`);
+        const result = await api.post(`/results/save/${type}?session_id=${encodeURIComponent(sid)}&name=${encodeURIComponent(name)}`);
+        if (sid !== Alpine.store('session').current_session_id) return;
         Alpine.store('app').toast(`Saved ${result.filename} (${result.message})`, 'success');
         await this.loadResultsList();
         this.currentResult = '';
@@ -536,23 +582,34 @@ document.addEventListener('alpine:init', () => {
 
     async loadResult() {
       if (!this.currentResult) return;
+      const sid = Alpine.store('session').current_session_id;
+      const filename = this.currentResult;
+      const type = this.resultType();
+      const requestId = ++this._resultLoadRequest;
+      if (!sid) return;
 
       try {
-        const result = await api.get(`/results/load/${encodeURIComponent(this.currentResult)}`);
+        const result = await api.get(`/results/load/${encodeURIComponent(filename)}?session_id=${encodeURIComponent(sid)}&result_type=${type}`);
+        if (requestId !== this._resultLoadRequest || sid !== Alpine.store('session').current_session_id ||
+            filename !== this.currentResult) return;
+        if (result.session_id !== sid || result.type !== type || !Array.isArray(result.data?.items))
+          throw new Error('Saved result does not belong to this session and view');
         const data = result.data;
-
-        if (data.items) {
-          // Only set properties that exist on this component
-          if (this.files !== undefined) this.files = data.items;
-          if (this.proposals !== undefined) this.proposals = data.items;
-          if (this.groups !== undefined) this.groups = data.items;
-          this.total = data.total;
-          this.page = 1;
-        }
-
-        Alpine.store('app').toast(`Loaded ${this.currentResult}`, 'success');
+        this._listRequest += 1;
+        this._loadedFilters = null;
+        this._loadedVersion = -1;
+        if (this.cancelDuplicateReview) this.cancelDuplicateReview();
+        if (this.selectedFile !== undefined) { this.selectedFile = null; this.showModal = false; }
+        this.snapshotMode = true;
+        this.snapshotItems = data.items;
+        this.snapshotSavedTotal = data.total;
+        this.snapshotAsOf = result.saved_at || '';
+        this.page = 1;
+        this.showSnapshotPage();
+        Alpine.store('app').toast(`Loaded historical ${type} snapshot (read-only)`, 'info');
       } catch (e) {
-        Alpine.store('app').toast(`Failed to load results: ${e.message}`, 'error');
+        if (requestId === this._resultLoadRequest && sid === Alpine.store('session').current_session_id)
+          Alpine.store('app').toast(`Failed to load results: ${e.message}`, 'error');
       }
     },
   };
@@ -594,6 +651,7 @@ document.addEventListener('alpine:init', () => {
     async load() {
       const sid = Alpine.store('session').current_session_id;
       const requestId = ++this._statsRequest;
+      const dataVersion = window._dataVersion;
       this.stats = null;
       this._loadedVersion = -1;
       const statusRequest = this.loadExecutionStatus();
@@ -602,7 +660,7 @@ document.addEventListener('alpine:init', () => {
         const stats = await api.get(url);
         if (requestId !== this._statsRequest || sid !== Alpine.store('session').current_session_id) return;
         this.stats = stats;
-        this._loadedVersion = window._dataVersion;
+        this._loadedVersion = dataVersion;
       } catch (e) {
         if (requestId === this._statsRequest && sid === Alpine.store('session').current_session_id)
           Alpine.store('app').toast('Failed to load stats', 'error');
@@ -699,6 +757,21 @@ document.addEventListener('alpine:init', () => {
       return this.executionState() === 'Idle' && pending > 0
         ? `${pending.toLocaleString()} suggestions awaiting review` : '';
     },
+    pendingReviewTypes() {
+      const counts = this.stats?.pending_by_type || {};
+      return [
+        ['rename', 'Renames'], ['rename_folder', 'Folder renames'],
+        ['move', 'Moves'], ['add_tags', 'Tags'], ['update_metadata', 'Metadata'],
+        ['mark_duplicate', 'Duplicates'],
+      ].map(([type, label]) => ({ type, label, count: counts[type] || 0 }))
+        .filter(item => item.count > 0);
+    },
+    openReviewQueue(type = '') {
+      const sid = Alpine.store('session').current_session_id;
+      if (!sid || !this.stats?.proposal_counts?.pending) return;
+      Alpine.store('app').reviewQueue = { session_id: sid, type };
+      Alpine.store('app').tab = 'proposals';
+    },
     formatBytes(b) {
       if (!b) return '0 B';
       const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -736,6 +809,10 @@ document.addEventListener('alpine:init', () => {
     selectedFile: null,
     showModal: false,
     _loadedVersion: -1,
+    _listRequest: 0,
+    _detailRequest: 0,
+    _sessionId: null,
+    _loadedFilters: null,
     ...resultsMixin,
 
     async init() {
@@ -746,38 +823,79 @@ document.addEventListener('alpine:init', () => {
       this.$watch(() => Alpine.store('app').tab, (tab) => {
         if (tab === 'files' && this._loadedVersion < window._dataVersion) this.load();
       });
+      this.$watch(() => Alpine.store('session').current_session_id, () => this.onSessionChange());
+      if (this._sessionId !== Alpine.store('session').current_session_id) this.onSessionChange();
+    },
+
+    onSessionChange() {
+      this.resetResults();
+      this._listRequest += 1;
+      this._detailRequest += 1;
+      this._sessionId = null;
+      this._loadedFilters = null;
+      this._loadedVersion = -1;
+      this.files = []; this.total = 0; this.page = 1;
+      this.search = ''; this.statusFilter = ''; this.mimeFilter = '';
+      this.showModal = false; this.selectedFile = null;
+      if (Alpine.store('app').tab === 'files') this.load();
     },
 
     async load() {
+      this._resultLoadRequest += 1;
+      this.clearSnapshot();
+      const sid = Alpine.store('session').current_session_id;
+      const requestId = ++this._listRequest;
+      const filters = JSON.stringify([this.page, this.perPage, this.statusFilter, this.mimeFilter, this.search]);
+      this._sessionId = sid || null;
+      this._loadedFilters = null;
+      this.files = []; this.total = 0;
+      if (!sid) return;
       try {
         let url = `/files?page=${this.page}&per_page=${this.perPage}`;
         if (this.statusFilter) url += `&status=${this.statusFilter}`;
         if (this.mimeFilter) url += `&mime_prefix=${this.mimeFilter}`;
         if (this.search) url += `&search=${encodeURIComponent(this.search)}`;
-        const sid = Alpine.store('session').current_session_id;
-        if (sid) url += `&session_id=${sid}`;
+        url += `&session_id=${encodeURIComponent(sid)}`;
         const data = await api.get(url);
+        if (requestId !== this._listRequest || sid !== Alpine.store('session').current_session_id ||
+            filters !== JSON.stringify([this.page, this.perPage, this.statusFilter, this.mimeFilter, this.search])) return;
         this.files = data.items;
         this.total = data.total;
+        this._loadedFilters = filters;
         this._loadedVersion = window._dataVersion;
       } catch (e) {
-        Alpine.store('app').toast('Failed to load files', 'error');
+        if (requestId === this._listRequest && sid === Alpine.store('session').current_session_id)
+          Alpine.store('app').toast('Failed to load files', 'error');
       }
     },
 
     totalPages() { return Math.ceil(this.total / this.perPage) || 1; },
 
     async viewFile(id) {
+      const sid = Alpine.store('session').current_session_id;
+      const row = this.files.find(file => file.id === id);
+      if (!sid || this._sessionId !== sid || !row) return;
+      if (this._loadedFilters !== JSON.stringify([this.page, this.perPage, this.statusFilter, this.mimeFilter, this.search])) return;
+      const requestId = ++this._detailRequest;
+      const listRequest = this._listRequest;
+      const filters = this._loadedFilters;
       try {
         this._fileDialogReturnFocus = document.activeElement;
-        this.selectedFile = await api.get(`/files/${id}`);
+        const detail = await api.get(`/files/${id}`);
+        if (requestId !== this._detailRequest || sid !== Alpine.store('session').current_session_id ||
+            listRequest !== this._listRequest || filters !== this._loadedFilters ||
+            this._sessionId !== sid || !this.files.some(file => file.id === id && file.path === row.path) ||
+            detail.id !== id || detail.path !== row.path) return;
+        this.selectedFile = detail;
         this.showModal = true;
       } catch (e) {
-        Alpine.store('app').toast('Failed to load file details', 'error');
+        if (requestId === this._detailRequest && sid === Alpine.store('session').current_session_id)
+          Alpine.store('app').toast('Failed to load file details', 'error');
       }
     },
 
     closeModal() {
+      this._detailRequest += 1;
       this.showModal = false; this.selectedFile = null;
       this.$nextTick(() => this._fileDialogReturnFocus?.isConnected && this._fileDialogReturnFocus.focus());
     },
@@ -798,8 +916,8 @@ document.addEventListener('alpine:init', () => {
       this.searchDebounced = setTimeout(() => { this.page = 1; this.load(); }, 350);
     },
 
-    async prevPage() { if (this.page > 1) { this.page--; await this.load(); } },
-    async nextPage() { if (this.page < this.totalPages()) { this.page++; await this.load(); } },
+    async prevPage() { if (this.page > 1) { this.page--; if (this.snapshotMode) this.showSnapshotPage(); else await this.load(); } },
+    async nextPage() { if (this.page < this.totalPages()) { this.page++; if (this.snapshotMode) this.showSnapshotPage(); else await this.load(); } },
   }));
 
   /* ----------------------------------------------------------
@@ -821,6 +939,9 @@ document.addEventListener('alpine:init', () => {
     duplicateReviewReturnFocus: null,
     duplicateReviewRequestId: 0,
     _loadedVersion: -1,
+    _listRequest: 0,
+    _sessionId: null,
+    _loadedFilters: null,
     ...resultsMixin,
 
     async init() {
@@ -829,30 +950,78 @@ document.addEventListener('alpine:init', () => {
       await this.load();
       document.addEventListener('datahoarder:refresh', () => this.load());
       this.$watch(() => Alpine.store('app').tab, (tab) => {
-        if (tab === 'proposals' && this._loadedVersion < window._dataVersion) this.load();
+        if (tab === 'proposals') {
+          if (!this.applyReviewQueue() && this._loadedVersion < window._dataVersion) this.load();
+        }
       });
+      this.$watch(() => Alpine.store('session').current_session_id, () => this.onSessionChange());
+      if (this._sessionId !== Alpine.store('session').current_session_id) this.onSessionChange();
+      else if (Alpine.store('app').tab === 'proposals') this.applyReviewQueue();
+    },
+
+    onSessionChange() {
+      this.resetResults();
+      this._listRequest += 1;
+      this.cancelDuplicateReview();
+      this._sessionId = null; this._loadedVersion = -1;
+      this._loadedFilters = null;
+      this.proposals = []; this.total = 0; this.page = 1;
+      this.statusFilter = 'pending'; this.typeFilter = ''; this.search = ''; this.minConfidence = 0;
+      this.editingId = null; this.editValue = '';
+      if (Alpine.store('app').reviewQueue?.session_id !== Alpine.store('session').current_session_id)
+        Alpine.store('app').reviewQueue = null;
+      if (Alpine.store('app').tab === 'proposals') {
+        if (!this.applyReviewQueue()) this.load();
+      }
+    },
+
+    applyReviewQueue() {
+      const queue = Alpine.store('app').reviewQueue;
+      if (!queue) return false;
+      Alpine.store('app').reviewQueue = null;
+      if (queue.session_id !== Alpine.store('session').current_session_id) return false;
+      this.page = 1; this.statusFilter = 'pending'; this.typeFilter = queue.type;
+      this.search = ''; this.minConfidence = 0;
+      this.load();
+      return true;
     },
 
     async load() {
+      this._resultLoadRequest += 1;
+      this.clearSnapshot();
+      const sid = Alpine.store('session').current_session_id;
+      const requestId = ++this._listRequest;
+      const filters = JSON.stringify([this.page, this.perPage, this.statusFilter, this.typeFilter,
+        this.search, this.minConfidence]);
+      this._sessionId = sid || null;
+      this._loadedFilters = null;
+      this.proposals = []; this.total = 0;
+      this.cancelDuplicateReview();
+      this.editingId = null;
+      if (!sid) return;
       try {
-        this.cancelDuplicateReview();
         let url = `/proposals?page=${this.page}&per_page=${this.perPage}`;
         if (this.statusFilter) url += `&status=${this.statusFilter}`;
         if (this.typeFilter)   url += `&proposal_type=${this.typeFilter}`;
         if (this.minConfidence > 0) url += `&min_confidence=${this.minConfidence / 100}`;
         if (this.search) url += `&search=${encodeURIComponent(this.search)}`;
-        const sid = Alpine.store('session').current_session_id;
-        if (sid) url += `&session_id=${sid}`;
+        url += `&session_id=${encodeURIComponent(sid)}`;
         const data = await api.get(url);
+        if (requestId !== this._listRequest || sid !== Alpine.store('session').current_session_id ||
+            filters !== JSON.stringify([this.page, this.perPage, this.statusFilter, this.typeFilter,
+              this.search, this.minConfidence])) return;
         this.proposals = data.items;
         this.total = data.total;
+        this._loadedFilters = filters;
         this._loadedVersion = window._dataVersion;
       } catch (e) {
-        Alpine.store('app').toast('Failed to load proposals', 'error');
+        if (requestId === this._listRequest && sid === Alpine.store('session').current_session_id)
+          Alpine.store('app').toast('Failed to load proposals', 'error');
       }
     },
 
     async requestApproval(p) {
+      if (!this.canActOn(p.id)) return;
       if (p.proposal_type !== 'mark_duplicate' || p.duplicate_evidence?.type === 'exact') {
         return this.approve(p.id);
       }
@@ -868,7 +1037,7 @@ document.addEventListener('alpine:init', () => {
           api.get(`/files/${p.file_id}`),
           api.get(`/files/${p.duplicate_evidence.keeper_id}`),
         ]);
-        if (!sid || requestId !== this.duplicateReviewRequestId ||
+        if (!sid || this._sessionId !== sid || requestId !== this.duplicateReviewRequestId ||
             sid !== Alpine.store('session').current_session_id ||
             candidate.id !== p.file_id || candidate.path !== p.file_path ||
             keeper.id !== p.duplicate_evidence.keeper_id ||
@@ -887,7 +1056,8 @@ document.addEventListener('alpine:init', () => {
           document.querySelector('.duplicate-review-dialog button.btn-outline')?.focus();
         });
       } catch (_) {
-        Alpine.store('app').toast('Could not load the current candidate and keeper; review again', 'error');
+        if (sid === Alpine.store('session').current_session_id && requestId === this.duplicateReviewRequestId)
+          Alpine.store('app').toast('Could not load the current candidate and keeper; review again', 'error');
       }
     },
 
@@ -908,6 +1078,7 @@ document.addEventListener('alpine:init', () => {
       const files = this.duplicateReviewFiles;
       const sid = Alpine.store('session').current_session_id;
       if (!candidate || !files || !sid || sid !== this.duplicateReviewSessionId ||
+          !this.canActOn(candidate.id) ||
           !this.proposals.some(p => p.id === candidate.id &&
             (p.status === 'pending' || p.status === 'modified'))) {
         this.cancelDuplicateReview();
@@ -925,26 +1096,46 @@ document.addEventListener('alpine:init', () => {
       await this.approve(candidate.id, comparison);
     },
 
+    canActOn(id) {
+      const sid = Alpine.store('session').current_session_id;
+      return !!sid && !this.snapshotMode && this._sessionId === sid &&
+        this._loadedFilters === JSON.stringify([this.page, this.perPage, this.statusFilter,
+          this.typeFilter, this.search, this.minConfidence]) && this.proposals.some(p => p.id === id &&
+        (p.status === 'pending' || p.status === 'modified'));
+    },
+
+    markReviewChanged() {
+      window._dataVersion += 1;
+    },
+
     async approve(id, comparison = null) {
+      if (!this.canActOn(id)) return;
+      const sid = Alpine.store('session').current_session_id;
       try {
         await api.post(`/proposals/${id}/approve`, {
-          session_id: Alpine.store('session').current_session_id,
+          session_id: sid,
           ...(comparison || {}),
         });
+        if (sid !== Alpine.store('session').current_session_id || this._sessionId !== sid) return;
         this.proposals = this.proposals.map(p => p.id === id ? { ...p, status: 'approved' } : p);
+        this.markReviewChanged();
         Alpine.store('app').toast('Approved', 'success');
       } catch (e) {
-        Alpine.store('app').toast('Approve failed', 'error');
+        if (sid === Alpine.store('session').current_session_id) Alpine.store('app').toast('Approve failed', 'error');
       }
     },
 
     async reject(id) {
+      if (!this.canActOn(id)) return;
+      const sid = Alpine.store('session').current_session_id;
       try {
-        await api.post(`/proposals/${id}/reject`, { session_id: Alpine.store('session').current_session_id });
+        await api.post(`/proposals/${id}/reject`, { session_id: sid });
+        if (sid !== Alpine.store('session').current_session_id || this._sessionId !== sid) return;
         this.proposals = this.proposals.map(p => p.id === id ? { ...p, status: 'rejected' } : p);
+        this.markReviewChanged();
         Alpine.store('app').toast('Rejected', 'success');
       } catch (e) {
-        Alpine.store('app').toast('Reject failed', 'error');
+        if (sid === Alpine.store('session').current_session_id) Alpine.store('app').toast('Reject failed', 'error');
       }
     },
 
@@ -952,6 +1143,7 @@ document.addEventListener('alpine:init', () => {
     editValue: '',
 
     startEdit(p) {
+      if (!this.canActOn(p.id)) return;
       if (p.proposal_type === 'mark_duplicate') {
         Alpine.store('app').toast('Choose the keeper in Duplicate Review', 'info');
         return;
@@ -961,50 +1153,71 @@ document.addEventListener('alpine:init', () => {
     },
 
     async saveEdit(id) {
+      if (!this.canActOn(id) || this.editingId !== id) return;
+      const sid = Alpine.store('session').current_session_id;
+      const value = this.editValue;
       try {
-        const updated = await api.post(`/proposals/${id}/edit`, { session_id: Alpine.store('session').current_session_id, proposed_value: this.editValue });
+        const updated = await api.post(`/proposals/${id}/edit`, { session_id: sid, proposed_value: value });
+        if (sid !== Alpine.store('session').current_session_id || this._sessionId !== sid) return;
         this.proposals = this.proposals.map(p =>
-          p.id === id ? { ...p, proposed_value: this.editValue, proposed_path: updated.proposed_value, status: 'modified' } : p
+          p.id === id ? { ...p, proposed_value: value, proposed_path: updated.proposed_value, status: 'modified' } : p
         );
         this.editingId = null;
+        this.markReviewChanged();
         Alpine.store('app').toast('Updated', 'success');
       } catch (e) {
-        Alpine.store('app').toast('Edit failed', 'error');
+        if (sid === Alpine.store('session').current_session_id) Alpine.store('app').toast('Edit failed', 'error');
       }
     },
 
     cancelEdit() { this.editingId = null; },
 
     async bulkApprove() {
+      const sessionId = Alpine.store('session').current_session_id;
       try {
-        const sessionId = Alpine.store('session').current_session_id;
-        if (!sessionId) throw new Error('Select a session first');
+        if (!sessionId || this._sessionId !== sessionId || this.snapshotMode) throw new Error('Load this session first');
         const threshold = this.bulkConfidence / 100;
         const type = this.typeFilter || '';
+        const filters = JSON.stringify([this.page, this.perPage, this.statusFilter, this.typeFilter,
+          this.search, this.minConfidence]);
+        const stillCurrent = () => sessionId === Alpine.store('session').current_session_id &&
+          this._sessionId === sessionId && this._loadedFilters === filters &&
+          filters === JSON.stringify([this.page, this.perPage, this.statusFilter, this.typeFilter,
+            this.search, this.minConfidence]) && threshold === this.bulkConfidence / 100;
+        if (!stillCurrent() || this.statusFilter !== 'pending' || this.search) {
+          Alpine.store('app').toast('Load pending review and clear search before approving across the session', 'info');
+          return;
+        }
         const match = await api.get(`/proposals?session_id=${encodeURIComponent(sessionId)}&status=pending&min_confidence=${threshold}&proposal_type=${encodeURIComponent(type)}&per_page=1`);
+        if (!stillCurrent()) return;
         if (!match.total) {
           Alpine.store('app').toast('No pending proposals match this threshold', 'info');
           return;
         }
-        if (!await window.appConfirm(`Review bulk approval for up to ${match.total} pending proposal(s) with a model-reported score of at least ${this.bulkConfidence}%. Protected resources, similarity-only duplicates, and renames without verified content will be skipped.`, { title: 'Approve matching proposals', confirmLabel: 'Approve' })) return;
+        const scope = type ? `${type.replaceAll('_', ' ')} proposal(s)` : 'proposals across all types';
+        if (!await window.appConfirm(`Review bulk approval for up to ${match.total} pending ${scope} in this session with a model-reported score of at least ${threshold * 100}%. Protected resources, similarity-only duplicates, and renames without verified content will be skipped.`, { title: 'Approve matching proposals', confirmLabel: 'Approve' })) return;
+        if (!stillCurrent()) return;
         const data = await api.post('/proposals/bulk-approve', {
           session_id: sessionId,
           min_confidence: threshold,
           proposal_type: type || null,
         });
+        if (sessionId !== Alpine.store('session').current_session_id || this._sessionId !== sessionId) return;
+        this.markReviewChanged();
         Alpine.store('app').toast(
           `Approved ${data.approved}; skipped ${data.skipped_protected || 0} protected, ${data.skipped_near_duplicate || 0} near-duplicates, ${data.skipped_unverified_rename || 0} unverified renames`,
           data.approved ? 'success' : 'info'
         );
         await this.load();
       } catch (e) {
-        Alpine.store('app').toast('Bulk approve failed', 'error');
+        if (sessionId === Alpine.store('session').current_session_id)
+          Alpine.store('app').toast('Bulk approve failed', 'error');
       }
     },
 
     totalPages() { return Math.ceil(this.total / this.perPage) || 1; },
-    async prevPage() { if (this.page > 1) { this.page--; await this.load(); } },
-    async nextPage() { if (this.page < this.totalPages()) { this.page++; await this.load(); } },
+    async prevPage() { if (this.page > 1) { this.page--; if (this.snapshotMode) this.showSnapshotPage(); else await this.load(); } },
+    async nextPage() { if (this.page < this.totalPages()) { this.page++; if (this.snapshotMode) this.showSnapshotPage(); else await this.load(); } },
 
     confColor(c) {
       if (!c) return 'var(--text-dim)';
@@ -1014,6 +1227,24 @@ document.addEventListener('alpine:init', () => {
     },
     hasImage(fileId, mime) {
       return !!fileId && !!mime && mime.startsWith('image/');
+    },
+    comparisonProvenance(file) {
+      if (!file) return 'Analysis provenance unavailable';
+      const outcome = file.analysis_outcome;
+      const source = file.analysis_evidence_source;
+      if (outcome === 'content_verified') {
+        const medium = source === 'vision' ? 'image' : source === 'text' ? 'text' : 'file content';
+        return `AI read ${medium}; its interpretation has not been independently verified.`;
+      }
+      if (outcome === 'context_only') {
+        if (source === 'text' && file.analysis_content_chars > 0)
+          return `AI received ${file.analysis_content_chars} extracted text characters; evidence was too limited to verify the content subject.`;
+        if (source === 'filename_only') return 'Filename and folder context only; file content was not read by AI.';
+        return 'Limited context evidence; content subject remains unverified.';
+      }
+      if (outcome === 'metadata_only') return 'Metadata or file structure only; content subject was not established.';
+      if (outcome === 'skipped' || outcome === 'failed') return 'No content analysis available.';
+      return 'Analysis provenance unknown; inspect the original file.';
     },
     duplicateEvidenceText(evidence) {
       if (!evidence) return 'Keeper evidence is unavailable; review this candidate individually.';
@@ -1042,6 +1273,8 @@ document.addEventListener('alpine:init', () => {
     total: 0,
     page: 1,
     _loadedVersion: -1,
+    _listRequest: 0,
+    _sessionId: null,
     ...resultsMixin,
 
     async init() {
@@ -1051,23 +1284,45 @@ document.addEventListener('alpine:init', () => {
       this.$watch(() => Alpine.store('app').tab, (tab) => {
         if (tab === 'duplicates' && this._loadedVersion < window._dataVersion) this.load();
       });
+      this.$watch(() => Alpine.store('session').current_session_id, () => this.onSessionChange());
+      if (this._sessionId !== Alpine.store('session').current_session_id) this.onSessionChange();
+    },
+
+    onSessionChange() {
+      this.resetResults();
+      this._listRequest += 1;
+      this._sessionId = null; this._loadedVersion = -1;
+      this.groups = []; this.total = 0; this.page = 1;
+      if (Alpine.store('app').tab === 'duplicates') this.load();
     },
 
     async load() {
+      this._resultLoadRequest += 1;
+      this.clearSnapshot();
+      const sid = Alpine.store('session').current_session_id;
+      const requestId = ++this._listRequest;
+      this._sessionId = sid || null;
+      this.groups = []; this.total = 0;
+      if (!sid) return;
       try {
-        const sid = Alpine.store('session').current_session_id;
-        const data = await api.get(`/duplicates?page=${this.page}&per_page=20&session_id=${sid}`);
+        const data = await api.get(`/duplicates?page=${this.page}&per_page=20&session_id=${encodeURIComponent(sid)}`);
+        if (requestId !== this._listRequest || sid !== Alpine.store('session').current_session_id) return;
         this.groups = data.items;
         this.total = data.total;
         this._loadedVersion = window._dataVersion;
       } catch (e) {
-        Alpine.store('app').toast('Failed to load duplicates', 'error');
+        if (requestId === this._listRequest && sid === Alpine.store('session').current_session_id)
+          Alpine.store('app').toast('Failed to load duplicates', 'error');
       }
     },
 
     async setKeeper(groupId, fileId) {
+      const sid = Alpine.store('session').current_session_id;
+      if (!sid || this.snapshotMode || this._sessionId !== sid ||
+          !this.groups.some(group => group.id === groupId && group.files.some(file => file.id === fileId))) return;
       try {
-        const result = await api.post(`/duplicates/${groupId}/keeper`, { session_id: Alpine.store('session').current_session_id, keep_file_id: fileId });
+        const result = await api.post(`/duplicates/${groupId}/keeper`, { session_id: sid, keep_file_id: fileId });
+        if (sid !== Alpine.store('session').current_session_id) return;
         await this.load();
         window._dataVersion++;
         Alpine.store('app').toast(
@@ -1088,8 +1343,8 @@ document.addEventListener('alpine:init', () => {
 
     perPage: 20,
     totalPages() { return Math.ceil(this.total / this.perPage) || 1; },
-    async prevPage() { if (this.page > 1) { this.page--; await this.load(); } },
-    async nextPage() { if (this.page < this.totalPages()) { this.page++; await this.load(); } },
+    async prevPage() { if (this.page > 1) { this.page--; if (this.snapshotMode) this.showSnapshotPage(); else await this.load(); } },
+    async nextPage() { if (this.page < this.totalPages()) { this.page++; if (this.snapshotMode) this.showSnapshotPage(); else await this.load(); } },
 
     isImage(f) { return f.mime_type && f.mime_type.startsWith('image/'); },
     keeper(g) { return g.files.find(f => f.id === g.keep_file_id) || null; },
@@ -2084,7 +2339,7 @@ document.addEventListener('alpine:init', () => {
         switch (type) {
           case 'analyze':
             Alpine.store('app').toast(
-              `Analyze complete: ${data.analyzed || 0} fresh, ${data.cached || 0} cached, ${data.sampled || 0} sampled out, ${data.skipped || 0} unsupported, ${data.errors || 0} errors`,
+              `Analyze complete: ${data.analyzed || 0} fresh, ${data.cached || 0} cached, ${data.sampled || 0} sampled out, ${data.skipped || 0} skipped, ${data.errors || 0} errors`,
               'success',
             );
             break;

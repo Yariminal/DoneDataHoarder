@@ -47,3 +47,4 @@ jobs:
           node tests/ui_analysis_coverage_state.cjs
           node tests/ui_nonexact_review.cjs
           node tests/ui_dashboard_state.cjs
+          node tests/ui_review_request_state.cjs

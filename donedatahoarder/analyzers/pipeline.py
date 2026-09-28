@@ -29,6 +29,7 @@ from donedatahoarder.analyzers.archive import ArchiveAnalyzer
 from donedatahoarder.analyzers.base import BaseAnalyzer, AnalysisResult
 from donedatahoarder.analyzers.document import DocumentAnalyzer
 from donedatahoarder.analyzers.dxf import DxfAnalyzer
+from donedatahoarder.analyzers.format_policy import OPAQUE_RESOURCE_EXTENSIONS
 from donedatahoarder.analyzers.image import ImageAnalyzer
 from donedatahoarder.analyzers.threedmodel import ThreeDModelAnalyzer
 from donedatahoarder.analyzers.video import VideoAnalyzer
@@ -122,6 +123,10 @@ def _get_analyzer(
 ) -> Optional[BaseAnalyzer]:
     ext = (extension or "").lower()
     mime = (mime_type or "").lower()
+    # These are preserved resource files, even if a MIME detector happens to
+    # misclassify one as an image or text document. No content is invented.
+    if ext in OPAQUE_RESOURCE_EXTENSIONS:
+        return None
     # A CAD file must not reach ImageAnalyzer merely because a MIME detector
     # calls it image/vnd.dwg. Backups are generic: block only recognized CAD
     # MIME or DWG header, leaving unrelated readable .bak files routable.

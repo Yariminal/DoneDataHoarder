@@ -64,6 +64,20 @@ listeners.get('alpine:init')();
       keeper_path: 'C:/collection/keeper.pdf', distance_to_keeper: 5 },
   };
   review.proposals = [near];
+  review._sessionId = 'review-session';
+  review._loadedFilters = JSON.stringify([review.page, review.perPage, review.statusFilter,
+    review.typeFilter, review.search, review.minConfidence]);
+  details.get(10).analysis_outcome = 'content_verified';
+  details.get(10).analysis_evidence_source = 'vision';
+  details.get(20).analysis_outcome = 'metadata_only';
+  details.get(20).analysis_evidence_source = 'metadata';
+  assert.match(review.comparisonProvenance(details.get(10)), /AI read image/);
+  assert.match(review.comparisonProvenance(details.get(20)), /Metadata or file structure only/);
+  assert.match(review.comparisonProvenance({ analysis_outcome: 'context_only',
+    analysis_evidence_source: 'text', analysis_content_chars: 37 }), /received 37 extracted text characters/);
+  assert.match(review.comparisonProvenance({ analysis_outcome: 'context_only',
+    analysis_evidence_source: 'filename_only' }), /content was not read/);
+  assert.match(review.comparisonProvenance({ analysis_outcome: 'skipped' }), /No content analysis/);
   await review.requestApproval(near);
   assert.equal(posts.length, 0, 'opening the comparison must not approve');
   assert.equal(review.duplicateReview.duplicate_evidence.keeper_id, 20);
@@ -109,6 +123,10 @@ listeners.get('alpine:init')();
   assert.match(html, /duplicateReviewFiles\.candidate\.path/);
   assert.match(html, /duplicateReviewFiles\.keeper\.path/);
   assert.match(html, /duplicateReviewFiles\.keeper\.mime_type/);
+  assert.match(html, /comparisonProvenance\(duplicateReviewFiles\.candidate\)/);
+  assert.match(html, /comparisonProvenance\(duplicateReviewFiles\.keeper\)/);
+  const css = fs.readFileSync(path.join(web, 'static', 'style.css'), 'utf8');
+  assert.match(css, /@media \(max-width: 600px\)[\s\S]*?\.duplicate-comparison-grid \{ grid-template-columns: minmax\(0, 1fr\)/);
   assert.match(html, /hasImage\(p\.duplicate_evidence\.keeper_id, p\.duplicate_evidence\.keeper_mime_type\)/);
   assert.match(html, /x-teleport="body"/);
   assert.match(html, /@keydown\.tab="trapDialogTab\(\$event\)"/);

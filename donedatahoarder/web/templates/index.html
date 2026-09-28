@@ -170,6 +170,7 @@
             <div class="card">
               <div class="card-label">Pending Proposals</div>
               <div class="card-value" x-text="(stats.proposal_counts.pending || 0).toLocaleString()"></div>
+              <button type="button" class="btn btn-outline btn-sm mt-1" x-show="$store.session.current_session_id && stats.proposal_counts.pending" @click="openReviewQueue()">Review pending</button>
             </div>
             <div class="card">
               <div class="card-label">Duplicate &amp; similarity groups</div>
@@ -188,6 +189,17 @@
             </div>
             <p class="text-sm text-dim mt-1" x-text="executionDetail()"></p>
             <p class="text-sm mt-1" x-show="reviewWaiting()" x-text="reviewWaiting()"></p>
+          </div>
+
+          <div class="card mb-2" x-show="$store.session.current_session_id && pendingReviewTypes().length">
+            <div class="card-label">Pending review by type</div>
+            <div class="pending-review-links">
+              <template x-for="item in pendingReviewTypes()" :key="item.type">
+                <button type="button" class="btn btn-outline btn-sm" @click="openReviewQueue(item.type)"
+                        :aria-label="'Review ' + item.count + ' pending ' + item.label.toLowerCase()"
+                        x-text="item.label + ' · ' + item.count.toLocaleString()"></button>
+              </template>
+            </div>
           </div>
 
           <h3 class="mb-1" style="font-size:1rem;">File status breakdown</h3>
@@ -265,10 +277,15 @@
               <option :value="r.filename" x-text="r.filename + ' (' + new Date(r.saved_at).toLocaleString() + ')'"></option>
             </template>
           </select>
-          <button class="btn btn-outline btn-sm" @click="saveResults('files')" title="Save current results">Save</button>
+          <button class="btn btn-outline btn-sm" @click="saveResults('files')" :disabled="snapshotMode" title="Save this session's files snapshot">Save</button>
         </div>
 
         <span class="text-dim text-sm" x-text="total.toLocaleString() + ' files'"></span>
+      </div>
+
+      <div class="card mb-2 coverage-warning" x-show="snapshotMode" role="status">
+        Historical snapshot, read-only. <span x-text="'Showing ' + snapshotItems.length + ' saved of ' + snapshotSavedTotal + ' files as of ' + snapshotAsOf + '. ' "></span>
+        <button type="button" class="btn btn-outline btn-sm" @click="load()">Refresh live files</button>
       </div>
 
       <!-- Table -->
@@ -306,7 +323,7 @@
                   <div class="text-dim" x-show="f.analysis_outcome && f.analysis_outcome !== 'content_verified'" x-text="`${f.analysis_outcome}: ${f.analysis_reason || f.analysis_evidence_source || 'content not verified'}`"></div>
                   <div style="color:var(--danger)" x-show="f.error_message" x-text="f.error_message"></div>
                 </td>
-                <td><button class="btn btn-ghost btn-sm" @click="viewFile(f.id)">View</button></td>
+                <td><button class="btn btn-ghost btn-sm" :disabled="snapshotMode" @click="viewFile(f.id)">View</button></td>
               </tr>
             </template>
           </tbody>
@@ -404,6 +421,7 @@
           <option value="rename_folder">Rename folder</option>
           <option value="move">Move</option>
           <option value="add_tags">Tags</option>
+          <option value="update_metadata">Metadata</option>
           <option value="mark_duplicate">Duplicates</option>
         </select>
 
@@ -414,7 +432,7 @@
             <option :value="r.filename" x-text="r.filename + ' (' + new Date(r.saved_at).toLocaleString() + ')'"></option>
           </template>
         </select>
-        <button class="btn btn-outline btn-sm" @click="saveResults('proposals')" title="Save current results">Save</button>
+          <button class="btn btn-outline btn-sm" @click="saveResults('proposals')" :disabled="snapshotMode" title="Save this session's pending proposals snapshot">Save</button>
 
         <div class="spacer"></div>
 
@@ -423,8 +441,13 @@
           <label class="text-sm text-dim">Min confidence:</label>
           <input type="number" class="input input-sm" x-model.number="bulkConfidence"
                  min="0" max="100" style="width:60px;"> <span class="text-sm text-dim">%</span>
-          <button class="btn btn-success btn-sm" @click="bulkApprove()">Approve matching</button>
+          <button class="btn btn-success btn-sm" :disabled="snapshotMode" @click="bulkApprove()">Approve matching</button>
         </div>
+      </div>
+
+      <div class="card mb-2 coverage-warning" x-show="snapshotMode" role="status">
+        Historical pending-proposal snapshot, read-only. <span x-text="'Showing ' + snapshotItems.length + ' saved of ' + snapshotSavedTotal + ' pending proposals as of ' + snapshotAsOf + '. ' "></span>
+        <button type="button" class="btn btn-outline btn-sm" @click="load()">Refresh live review</button>
       </div>
 
       <!-- Table -->
@@ -502,13 +525,13 @@
                 <td>
                   <div class="btn-group">
                     <template x-if="p.status === 'pending' || p.status === 'modified'">
-                      <button class="btn btn-success btn-sm" @click="requestApproval(p)" :aria-label="'Approve proposal for ' + p.filename" title="Approve">&#10003;</button>
+                      <button class="btn btn-success btn-sm" :disabled="snapshotMode" @click="requestApproval(p)" :aria-label="'Approve proposal for ' + p.filename" title="Approve">&#10003;</button>
                     </template>
                     <template x-if="p.status === 'pending' || p.status === 'modified'">
-                      <button class="btn btn-danger btn-sm" @click="reject(p.id)" :aria-label="'Reject proposal for ' + p.filename" title="Reject">&#10005;</button>
+                      <button class="btn btn-danger btn-sm" :disabled="snapshotMode" @click="reject(p.id)" :aria-label="'Reject proposal for ' + p.filename" title="Reject">&#10005;</button>
                     </template>
                     <template x-if="p.status === 'pending' || p.status === 'modified'">
-                      <button class="btn btn-outline btn-sm" @click="startEdit(p)" :aria-label="'Edit proposal for ' + p.filename" title="Edit">&#9998;</button>
+                      <button class="btn btn-outline btn-sm" :disabled="snapshotMode" @click="startEdit(p)" :aria-label="'Edit proposal for ' + p.filename" title="Edit">&#9998;</button>
                     </template>
                   </div>
                 </td>
@@ -537,12 +560,13 @@
               <p class="review-note" style="color:var(--warning)">This is an unverified similarity comparison. These files may serve different purposes. Approval will move the candidate to .ddh_trash when you commit; it does not prove the files are interchangeable.</p>
               <p class="text-sm" x-text="duplicateEvidenceText(duplicateReview.duplicate_evidence)"></p>
               <p class="text-sm text-dim">File details below come from the current indexed records. Inspect the original files when these previews do not show enough content.</p>
-              <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin:14px 0;">
+              <div class="duplicate-comparison-grid">
                 <div style="min-width:0;overflow-wrap:anywhere;">
                   <strong>Candidate to be moved to trash</strong>
                   <template x-if="hasImage(duplicateReviewFiles.candidate.id, duplicateReviewFiles.candidate.mime_type)"><img :src="'/api/files/' + duplicateReviewFiles.candidate.id + '/thumbnail?size=400'" loading="lazy" alt="Candidate image" style="display:block;max-width:100%;max-height:300px;margin:8px 0;"></template>
                   <div x-text="duplicateReviewFiles.candidate.path"></div>
                   <div class="text-sm" x-text="(duplicateReviewFiles.candidate.mime_type || 'Unknown type') + ' · ' + duplicateReviewFiles.candidate.size_bytes + ' bytes'"></div>
+                  <div class="review-note" x-text="comparisonProvenance(duplicateReviewFiles.candidate)"></div>
                   <div class="text-sm" x-text="duplicateReviewFiles.candidate.ai_description || 'No content description'"></div>
                   <pre class="text-sm" x-show="duplicateReviewFiles.candidate.ai_transcript" x-text="duplicateReviewFiles.candidate.ai_transcript" style="white-space:pre-wrap;"></pre>
                 </div>
@@ -551,11 +575,12 @@
                   <template x-if="hasImage(duplicateReviewFiles.keeper.id, duplicateReviewFiles.keeper.mime_type)"><img :src="'/api/files/' + duplicateReviewFiles.keeper.id + '/thumbnail?size=400'" loading="lazy" alt="Selected keeper image" style="display:block;max-width:100%;max-height:300px;margin:8px 0;"></template>
                   <div x-text="duplicateReviewFiles.keeper.path"></div>
                   <div class="text-sm" x-text="(duplicateReviewFiles.keeper.mime_type || 'Unknown type') + ' · ' + duplicateReviewFiles.keeper.size_bytes + ' bytes'"></div>
+                  <div class="review-note" x-text="comparisonProvenance(duplicateReviewFiles.keeper)"></div>
                   <div class="text-sm" x-text="duplicateReviewFiles.keeper.ai_description || 'No content description'"></div>
                   <pre class="text-sm" x-show="duplicateReviewFiles.keeper.ai_transcript" x-text="duplicateReviewFiles.keeper.ai_transcript" style="white-space:pre-wrap;"></pre>
                 </div>
               </div>
-              <div style="display:flex;justify-content:flex-end;gap:8px;">
+              <div class="duplicate-comparison-actions">
                 <button type="button" class="btn btn-outline" @click="cancelDuplicateReview()">Keep both for now</button>
                 <button type="button" class="btn btn-danger" @click="approveReviewedDuplicate()">Approve candidate for trash on commit</button>
               </div>
@@ -583,7 +608,12 @@
             <option :value="r.filename" x-text="r.filename + ' (' + new Date(r.saved_at).toLocaleString() + ')'"></option>
           </template>
         </select>
-        <button class="btn btn-outline btn-sm" @click="saveResults('duplicates')" title="Save current results">Save</button>
+          <button class="btn btn-outline btn-sm" @click="saveResults('duplicates')" :disabled="snapshotMode" title="Save this session's duplicate-group snapshot">Save</button>
+      </div>
+
+      <div class="card mb-2 coverage-warning" x-show="snapshotMode" role="status">
+        Historical duplicate-group snapshot, read-only. <span x-text="'Showing ' + snapshotItems.length + ' saved of ' + snapshotSavedTotal + ' groups as of ' + snapshotAsOf + '. ' "></span>
+        <button type="button" class="btn btn-outline btn-sm" @click="load()">Refresh live groups</button>
       </div>
 
       <p class="text-dim mb-2" x-text="total + ' comparison groups found'"></p>
@@ -633,7 +663,7 @@
                   </div>
                   <div class="review-note" x-show="f.sequence_comparison"
                        x-text="f.sequence_comparison?.note + ' Frame ' + f.sequence_comparison?.ordinal + ' versus ' + f.sequence_comparison?.keeper_ordinal + '.'"></div>
-                  <button class="btn btn-outline btn-sm mt-1" @click="setKeeper(g.id, f.id)">Keep candidate instead</button>
+                  <button class="btn btn-outline btn-sm mt-1" :disabled="snapshotMode" @click="setKeeper(g.id, f.id)">Keep candidate instead</button>
                 </div>
               </div>
             </template>
