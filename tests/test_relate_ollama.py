@@ -1,6 +1,7 @@
 """Bounded Ollama requests used by the relation grouping step."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,9 +12,11 @@ from donedatahoarder.ai import ollama_client
 from donedatahoarder.ai.json_utils import extract_json
 from donedatahoarder.ai.ollama_client import OllamaClient
 from donedatahoarder.core.relate import (
-    _call_llm_for_group, _llm_cross_script_cluster, _numbered_frame_groups, relate,
+    _call_llm_for_group, _link_singletons_to_folder_groups,
+    _llm_cross_script_cluster, _numbered_frame_groups, relate,
 )
-from donedatahoarder.db.models import Base, File, FileStatus, RelationGroup, UserSession
+from donedatahoarder.db.models import Base, File, FileStatus, RelationGroup, RelationMember, UserSession
+from donedatahoarder.db.session import init_db
 
 
 def _files(count):
@@ -249,3 +252,74 @@ def test_cross_script_rejects_generic_numeric_names_across_formats():
                                 "filenames": [file.filename for file in files]}])
 
     assert _llm_cross_script_cluster(Client(), files) == []
+
+
+def test_singleton_linkage_uses_bounded_indexes_and_earliest_match(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'singletons.db'}")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        user = UserSession(root_path=str(tmp_path))
+        db.add(user)
+        db.flush()
+        groups = [RelationGroup(session_id=user.id, label=label, confidence=0.8,
+                                dir_path=str(tmp_path))
+                  for label in ("drawing_1080p", "project_archive", "project_108", "fonts_archive")]
+        db.add_all(groups)
+        db.flush()
+        files = [File(session_id=user.id, path=str(tmp_path / name), filename=name,
+                      status=FileStatus.ENRICHED)
+                 for name in ("108_project_notes.txt", "108_random_notes.txt",
+                              "font_notes.txt", "109_misc.txt")]
+        db.add_all(files)
+        db.commit()
+
+        assert _link_singletons_to_folder_groups(db, user.id) == 3
+        assignments = dict(db.query(File.filename, RelationMember.group_id)
+                           .join(RelationMember, RelationMember.file_id == File.id).all())
+        assert assignments == {
+            "108_project_notes.txt": groups[1].id,  # first alpha match wins
+            "108_random_notes.txt": groups[2].id,   # not drawing_1080p
+            "font_notes.txt": groups[3].id,          # fonts -> font
+        }
+
+
+def test_relate_keeps_frame_companions_in_their_own_directories_on_rerun(tmp_path):
+    engine = init_db(tmp_path / "relation.db")
+    with Session(engine) as db:
+        user = UserSession(root_path=str(tmp_path))
+        db.add(user)
+        db.flush()
+        session_id = user.id
+        for directory in ("project_A", "project_B"):
+            parent = tmp_path / directory
+            db.add_all([
+                File(session_id=session_id, path=str(parent / f"{number:05}.jpg"),
+                     filename=f"{number:05}.jpg", extension=".jpg",
+                     status=FileStatus.ENRICHED)
+                for number in range(28, 36)
+            ])
+            db.add(File(session_id=session_id, path=str(parent / "frame_notes.txt"),
+                        filename="frame_notes.txt", extension=".txt",
+                        status=FileStatus.ENRICHED))
+        db.commit()
+
+    class EmptyClient:
+        def generate_json(self, *_args, **_kwargs):
+            return []
+
+        def generate(self, *_args, **_kwargs):
+            return "[]"
+
+    for _ in range(2):
+        summary = relate(session_id, client=EmptyClient())
+        assert summary == {"directories": 2, "groups": 2, "members": 18,
+                           "llm_groups": 0, "backstop_groups": 2}
+        with Session(engine) as db:
+            companions = (db.query(File.path, RelationGroup.dir_path)
+                          .join(RelationMember, RelationMember.file_id == File.id)
+                          .join(RelationGroup, RelationGroup.id == RelationMember.group_id)
+                          .filter(File.session_id == session_id,
+                                  File.filename == "frame_notes.txt").all())
+            assert len(companions) == 2
+            assert all(str(Path(path).parent) == group_dir
+                       for path, group_dir in companions)

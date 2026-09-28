@@ -1,0 +1,6 @@
+Alpine.js 3.15.12 (MIT)
+Package: https://registry.npmjs.org/alpinejs/-/alpinejs-3.15.12.tgz
+Package integrity: sha512-nJvPAQVNPdZZ0NrExJ/kzQco3ijR8LwvCOadQecllESiqT4NyZ/57sN9V2XyvhlBGAbmlKYgeWZvYdKq99ij/Q==
+Script SHA-256: 57b37d7cae9a27d965fdae4adcc844245dfdc407e655aee85dcfff3a08036a3f
+License: https://raw.githubusercontent.com/alpinejs/alpine/v3.15.12/LICENSE.md
+License SHA-256: 08b7502da6e7aa1d0bbdc97d220fbf669b9366c61bd0f072238283c89bc4773a

@@ -26,6 +26,8 @@ THREED_EXTENSIONS = {
 }
 
 MAX_HEADER_LINES = 80   # OBJ comment / group lines to extract
+MAX_OBJ_LINE_BYTES = 4096
+MAX_OBJ_HEADER_CHARS = 16000
 MAX_FBX_CHARS = 2000    # characters from FBX ASCII header
 
 THREED_PROMPT = """\
@@ -70,16 +72,25 @@ def _extract_obj_header(path: Path) -> str:
     """
     lines: list[str] = []
     try:
-        with open(path, encoding="utf-8", errors="ignore") as fh:
-            for i, raw in enumerate(fh):
-                if i > 500:
+        with open(path, "rb") as fh:
+            for _ in range(501):
+                raw = fh.readline(MAX_OBJ_LINE_BYTES + 1)
+                if not raw:
                     break
-                stripped = raw.strip()
+                if len(raw) > MAX_OBJ_LINE_BYTES and not raw.endswith(b"\n"):
+                    # Consume the rest of this oversized line in bounded chunks.
+                    while chunk := fh.readline(MAX_OBJ_LINE_BYTES + 1):
+                        if chunk.endswith(b"\n"):
+                            break
+                    continue
+                stripped = raw.decode("utf-8", errors="ignore").strip()
                 if stripped.startswith(("#", "mtllib", "usemtl", "o ", "g ")):
                     lines.append(stripped)
+                if len(lines) >= MAX_HEADER_LINES or sum(map(len, lines)) >= MAX_OBJ_HEADER_CHARS:
+                    break
     except OSError:
         pass
-    return "\n".join(lines[:MAX_HEADER_LINES])
+    return "\n".join(lines)[:MAX_OBJ_HEADER_CHARS]
 
 
 def _extract_fbx_header(path: Path) -> str:

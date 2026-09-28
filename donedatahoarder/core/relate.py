@@ -25,6 +25,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from donedatahoarder.ai.json_utils import extract_json
@@ -38,6 +39,31 @@ logger = logging.getLogger(__name__)
 # LLM groups at 0.8, backstop at 0.3 — consumers can filter on confidence.
 LLM_CONFIDENCE = 0.8
 BACKSTOP_CONFIDENCE = 0.3
+MAX_RELATION_UNIT_FILES = 20_000
+
+
+def _iter_relation_units(reader: Session, session_id: str, scope: str):
+    """Stream files with a hard cap on one relation unit's ORM objects."""
+    query = reader.query(File).filter(
+        File.session_id == session_id, File.status != FileStatus.ERROR,
+    )
+    if scope == "per_directory":
+        parent = func.substr(File.path, 1,
+                             func.length(File.path) - func.length(File.filename) - 1)
+        query = query.order_by(parent, File.id)
+    else:
+        query = query.order_by(File.id)
+    current_dir = None
+    unit: list[File] = []
+    for file in query.yield_per(500):
+        directory = str(Path(file.path).parent) if scope == "per_directory" else "<whole tree>"
+        if unit and (directory != current_dir or len(unit) >= MAX_RELATION_UNIT_FILES):
+            yield current_dir, unit, current_dir if scope == "per_directory" else None
+            unit = []
+        current_dir = directory
+        unit.append(file)
+    if unit:
+        yield current_dir, unit, current_dir if scope == "per_directory" else None
 
 # Cap on filenames sent to the LLM in one call to avoid prompt AND response
 # overruns. Smaller dirs get one call; larger dirs get chunked (see _chunk).
@@ -517,14 +543,24 @@ def _call_llm_for_group(
 
 def _wipe_existing_groups(session: Session, session_id: str) -> int:
     """Delete all existing RelationGroups for this session. Idempotent re-run."""
-    existing = session.query(RelationGroup).filter(
-        RelationGroup.session_id == session_id,
-    ).all()
-    n = len(existing)
-    for g in existing:
-        session.delete(g)
-    session.commit()
-    return n
+    removed = 0
+    while True:
+        ids = [row[0] for row in session.query(RelationGroup.id).filter(
+            RelationGroup.session_id == session_id,
+        ).order_by(RelationGroup.id).limit(500)]
+        if not ids:
+            break
+        # Explicit child deletion also works for tests/legacy databases that
+        # opened SQLite without foreign_keys=ON.
+        session.query(RelationMember).filter(
+            RelationMember.group_id.in_(ids),
+        ).delete(synchronize_session=False)
+        session.query(RelationGroup).filter(
+            RelationGroup.id.in_(ids),
+        ).delete(synchronize_session=False)
+        session.commit()
+        removed += len(ids)
+    return removed
 
 
 def _save_groups(
@@ -712,31 +748,55 @@ def _link_singletons_to_folder_groups(
     """
     linked = 0
 
-    # Get singleton files (not in any RelationMember)
-    all_files = session.query(File).filter(File.session_id == session_id).all()
-    file_ids_in_groups = {
-        m.file_id for m in session.query(RelationMember.file_id)
-        .filter(
-            RelationMember.group_id.in_(
-                session.query(RelationGroup.id).filter(
-                    RelationGroup.session_id == session_id
-                )
-            )
-        )
-    }
-    singletons = [f for f in all_files if f.id not in file_ids_in_groups]
-
-    if not singletons:
-        return 0
-
-    # Get candidate groups (confidence >= 0.5)
-    candidate_groups = session.query(RelationGroup).filter(
+    # Keep singleton selection in SQL; large collections must not materialize
+    # every File ORM row just to identify ungrouped records.
+    assigned = (
+        session.query(RelationMember.file_id)
+        .join(RelationGroup, RelationMember.group_id == RelationGroup.id)
+        .filter(RelationGroup.session_id == session_id)
+    )
+    # Build O(1) lookup tables before streaming singleton rows. Preserve the
+    # old first-matching-group rule by retaining each key's earliest row.
+    # Per-directory groups can only receive files from that directory.
+    # Cross-directory groups use a None directory key and remain eligible
+    # across the tree when they were explicitly discovered as such.
+    numeric_tokens: dict[tuple[str | None, str], tuple[int, int]] = {}
+    numeric_digits: dict[tuple[str | None, str], tuple[int, int]] = {}
+    alpha_tokens: dict[tuple[str | None, str], tuple[int, int]] = {}
+    candidate_groups = session.query(
+        RelationGroup.id, RelationGroup.label, RelationGroup.scope, RelationGroup.dir_path,
+    ).filter(
         RelationGroup.session_id == session_id,
         RelationGroup.confidence >= 0.5,
-    ).all()
+    ).order_by(RelationGroup.id).yield_per(500)
+    group_count = 0
+    for group_count, group in enumerate(candidate_groups, start=1):
+        label = group.label.lower()
+        choice = (group_count, group.id)
+        if group.scope == "per_directory":
+            if not group.dir_path:
+                continue
+            directory = group.dir_path
+        elif group.scope == "cross_directory":
+            directory = None
+        else:
+            continue
+        for token in label.split("_"):
+            if token.isdigit():
+                numeric_tokens.setdefault((directory, token), choice)
+        digits = re.sub(r"\D", "", label)
+        if digits:
+            numeric_digits.setdefault((directory, digits), choice)
+        first_token = label.split("_", 1)[0]
+        if len(first_token) >= 4:
+            alpha_tokens.setdefault((directory, _singularize(first_token)), choice)
 
-    if not candidate_groups:
+    if not group_count:
         return 0
+
+    singletons = session.query(File.id, File.filename, File.path).filter(
+        File.session_id == session_id, ~File.id.in_(assigned),
+    ).yield_per(500)
 
     # For each singleton, try to link it
     for singleton in singletons:
@@ -747,43 +807,31 @@ def _link_singletons_to_folder_groups(
         numeric_prefix = numeric_match.group(1) if numeric_match else None
 
         # Extract first alpha token >= 4 chars
-        alpha_match = re.search(r"\b([a-z]{4,})\b", stem)
+        # Underscores and digits separate words in filenames even though
+        # regex \b treats underscores as word characters.
+        alpha_match = re.search(r"(?:^|[^a-z])([a-z]{4,})(?=[^a-z]|$)", stem)
         alpha_token = alpha_match.group(1) if alpha_match else None
+        keys = (str(Path(singleton.path).parent), None)
 
-        for group in candidate_groups:
-            group_label = group.label.lower()
-
-            # Numeric prefix match: the prefix must appear as a whole token
-            # in the label ("_108_" boundary), or equal the label's digits
-            # with separators stripped ("108" vs "project_10_8" -> "108").
-            # Plain substring matching would falsely link "108" to labels
-            # like "drawings_1080p".
-            matched = False
-            if numeric_prefix:
-                bounded_label = f"_{group_label}_"
-                label_digits = re.sub(r"\D", "", group_label)
-                if (
-                    f"_{numeric_prefix}_" in bounded_label
-                    or (label_digits and label_digits == numeric_prefix)
-                ):
-                    matched = True
-
-            # Alpha token match: compare against the label's first token with
-            # naive plural normalization so "fonts" links to
-            # "font_configurations".
-            if not matched and alpha_token:
-                first_label_token = group_label.split("_", 1)[0]
-                if len(first_label_token) >= 4 and _singularize(first_label_token) == _singularize(alpha_token):
-                    matched = True
-
-            if matched:
-                session.add(RelationMember(
-                    group_id=group.id,
-                    file_id=singleton.id,
-                    role=RelationRole.SIBLING,
-                ))
-                linked += 1
-                break
+        options = []
+        if numeric_prefix:
+            for directory in keys:
+                options.extend(choice for choice in (
+                    numeric_tokens.get((directory, numeric_prefix)),
+                    numeric_digits.get((directory, numeric_prefix)),
+                ) if choice is not None)
+        if alpha_token:
+            for directory in keys:
+                choice = alpha_tokens.get((directory, _singularize(alpha_token)))
+                if choice is not None:
+                    options.append(choice)
+        if options:
+            session.add(RelationMember(
+                group_id=min(options)[1],
+                file_id=singleton.id,
+                role=RelationRole.SIBLING,
+            ))
+            linked += 1
 
     if linked:
         session.commit()
@@ -850,50 +898,28 @@ def _relate_impl(
         if wiped:
             logger.info("Wiped %d stale RelationGroups for session %s", wiped, session_id)
 
-        # Pull all scanned-or-later files (we work on filenames, not content,
-        # so PENDING / ENRICHED / ANALYZED / PROPOSED / SKIPPED all qualify;
-        # APPLIED files already moved on disk but the DB still holds their
-        # identity — we include them so re-runs don't lose groupings).
-        files = (
-            session.query(File)
-            .filter(File.session_id == session_id)
-            .filter(File.status != FileStatus.ERROR)
-            .all()
-        )
-        if not files:
-            return summary
-
-        # Bucket by directory
-        dir_buckets: dict[str, list[File]] = defaultdict(list)
-        for f in files:
-            dir_buckets[str(Path(f.path).parent)].append(f)
-
-        # Recognize a full numbered frame sequence before the 100-file LLM
-        # chunks. This gives one stable identity to the entire directory.
-        sequence_file_ids: set[int] = set()
-        for directory, directory_files in dir_buckets.items():
-            sequence_groups, placed_ids = _numbered_frame_groups(directory_files)
+        # A separate read cursor avoids retaining all ORM rows while groups
+        # are committed. SQLite WAL permits the writer to advance alongside it.
+        with Session(engine) as reader:
+          for dir_label, unit_files, dir_path in _iter_relation_units(
+              reader, session_id, scope,
+          ):
+            summary["directories"] += 1
+            sequence_groups, placed_ids = _numbered_frame_groups(unit_files)
             if sequence_groups:
-                fn_to_id = {file.filename: file.id for file in directory_files}
+                fn_to_id = {file.filename: file.id for file in unit_files}
                 saved = _save_groups(session, sequence_groups, session_id,
-                                     "per_directory", directory, fn_to_id)
+                                     "per_directory", dir_label if scope == "per_directory" else None,
+                                     fn_to_id)
                 summary["groups"] += saved
+                summary["backstop_groups"] += saved
                 summary["members"] += sum(len(group["members"]) for group in sequence_groups)
-                sequence_file_ids.update(placed_ids)
-
-        # Determine the call pattern based on scope
-        if scope == "cross_directory":
-            remaining = [file for file in files if file.id not in sequence_file_ids]
-            call_units = [("<whole tree>", remaining, None)] if len(remaining) >= 2 else []
-        else:
-            call_units = [
-                (d, [file for file in fs if file.id not in sequence_file_ids], d)
-                for d, fs in dir_buckets.items()
-                if len([file for file in fs if file.id not in sequence_file_ids]) >= 2
-            ]
-
-        summary["directories"] = len(call_units)
-        for i, (dir_label, dir_files, dir_path) in enumerate(call_units):
+            dir_files = [file for file in unit_files if file.id not in placed_ids]
+            if len(dir_files) < 2:
+                if progress_cb:
+                    progress_cb({"dir": dir_label, "done": summary["directories"],
+                                 "total": None, **summary})
+                continue
             # Map filename (basename) → file_id for this unit.
             # For per_directory scope, filenames are unique within the dir.
             # For cross_directory, collisions across dirs are possible — the
@@ -941,25 +967,23 @@ def _relate_impl(
             if progress_cb:
                 progress_cb({
                     "dir": dir_label,
-                    "done": i + 1,
-                    "total": len(call_units),
+                    "done": summary["directories"],
+                    "total": None,
                     **summary,
                 })
 
         # Cross-script clustering pass: for singletons (files not in any group yet),
         # run an LLM pass to find Hebrew↔English equivalents and semantic synonyms.
         if client is not None:
-            placed_ids = {
-                m.file_id for m in session.query(RelationMember)
-                .filter(
-                    RelationMember.group_id.in_(
-                        session.query(RelationGroup.id).filter(
-                            RelationGroup.session_id == session_id
-                        )
-                    )
-                )
-            }
-            singletons = [f for f in files if f.id not in placed_ids]
+            assigned = (
+                session.query(RelationMember.file_id)
+                .join(RelationGroup, RelationMember.group_id == RelationGroup.id)
+                .filter(RelationGroup.session_id == session_id)
+            )
+            singletons = session.query(File).filter(
+                File.session_id == session_id, File.status != FileStatus.ERROR,
+                ~File.id.in_(assigned),
+            ).order_by(File.id).limit(2001).all()
 
             if 5 <= len(singletons) <= 2000:
                 cross_script_groups: list[dict] = []
@@ -988,6 +1012,7 @@ def _relate_impl(
             linked = _link_singletons_to_folder_groups(session, session_id)
             if linked:
                 logger.info("Linked %d singletons to folder groups", linked)
+                summary["members"] += linked
         except Exception:
             # Best-effort — don't break the pipeline
             logger.warning("Singleton-to-folder linkage failed", exc_info=True)

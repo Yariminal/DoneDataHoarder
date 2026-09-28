@@ -83,3 +83,6 @@ pythonpath = ["."]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["donedatahoarder*"]
+
+[tool.setuptools.package-data]
+"donedatahoarder.web" = ["templates/*.html", "static/*.css", "static/*.js", "static/vendor/*"]

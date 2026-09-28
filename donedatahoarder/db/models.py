@@ -172,6 +172,9 @@ class File(Base):
     analysis_prompt_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     analysis_extractor_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     analysis_content_chars: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    analysis_context_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    analysis_detected_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    analysis_cache_hit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # --- status ---
     status: Mapped[FileStatus] = mapped_column(
@@ -203,6 +206,26 @@ class File(Base):
 
     def __repr__(self) -> str:
         return f"<File id={self.id} status={self.status} path={self.path!r}>"
+
+
+class AnalysisCache(Base):
+    """Reusable analysis of identical bytes in an identical prompt context."""
+    __tablename__ = "analysis_cache"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    context_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_tag: Mapped[str] = mapped_column(String, nullable=False)
+    model_digest: Mapped[str] = mapped_column(String, nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String, nullable=False)
+    extractor_version: Mapped[str] = mapped_column(String, nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    __table_args__ = (UniqueConstraint(
+        "content_sha256", "context_sha256", "model_tag", "model_digest",
+        "prompt_version", "extractor_version", name="uq_analysis_cache_identity",
+    ),)
 
 
 # ---------------------------------------------------------------------------

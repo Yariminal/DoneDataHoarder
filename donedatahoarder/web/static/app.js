@@ -4,6 +4,18 @@
 
 document.addEventListener('alpine:init', () => {
 
+  window.trapDialogTab = function (event) {
+    const dialog = event.currentTarget;
+    const choices = [...dialog.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), a[href]')]
+      .filter(el => el.getClientRects().length);
+    if (!choices.length) { event.preventDefault(); dialog.focus(); return; }
+    if (event.shiftKey && document.activeElement === choices[0]) {
+      event.preventDefault(); choices[choices.length - 1].focus();
+    } else if (!event.shiftKey && document.activeElement === choices[choices.length - 1]) {
+      event.preventDefault(); choices[0].focus();
+    }
+  };
+
   /* ----------------------------------------------------------
    * Global store
    * -------------------------------------------------------- */
@@ -23,6 +35,33 @@ document.addEventListener('alpine:init', () => {
     },
   });
 
+  Alpine.store('dedupCoverage', {
+    sessionId: null,
+    jobState: null,
+    stages: {},
+    async load() {
+      const sid = Alpine.store('session').current_session_id;
+      if (!sid) { this.sessionId = null; this.jobState = null; this.stages = {}; return; }
+      try {
+        const result = await api.get(`/pipeline/dedup/coverage?session_id=${encodeURIComponent(sid)}`);
+        if (sid !== Alpine.store('session').current_session_id) return;
+        this.sessionId = sid;
+        this.jobState = result.job_state;
+        this.stages = result.stages || {};
+      } catch (_) { /* Preserve the last known coverage until the service reconnects. */ }
+    },
+    get incompleteStages() {
+      return ['perceptual', 'semantic', 'text_near']
+        .filter(name => this.stages[name]?.candidate_coverage === 'bounded_incomplete');
+    },
+    get deferredLabel() {
+      const values = this.incompleteStages.map(name => this.stages[name]?.candidate_pair_opportunities_deferred);
+      return values.some(value => value == null)
+        ? 'some candidate pairs were deferred; exact count unknown'
+        : `${values.reduce((sum, value) => sum + value, 0).toLocaleString()} candidate pair opportunities deferred`;
+    },
+  });
+
   /* ----------------------------------------------------------
    * Modal store — in-app confirm / prompt.
    * Native dialogs never surface inside the embedded window.
@@ -37,6 +76,41 @@ document.addEventListener('alpine:init', () => {
     cancelLabel: 'Cancel',
     danger: false,
     _resolve: null,
+    _returnFocus: null,
+
+    _activateFocus() {
+      document.querySelector('.app-shell')?.setAttribute('inert', '');
+      requestAnimationFrame(() => {
+        const dialog = document.querySelector('.app-dialog .modal');
+        if (!dialog) return;
+        const initial = this.mode === 'prompt'
+          ? dialog.querySelector('input')
+          : dialog.querySelector('button.btn-outline');
+        (initial || dialog).focus();
+      });
+    },
+
+    _releaseFocus() {
+      document.querySelector('.app-shell')?.removeAttribute('inert');
+      const target = this._returnFocus;
+      this._returnFocus = null;
+      requestAnimationFrame(() => target?.isConnected && target.focus());
+    },
+
+    trapTab(event) {
+      if (!this.open) return;
+      const dialog = document.querySelector('.app-dialog .modal');
+      if (!dialog) return;
+      const choices = [...dialog.querySelectorAll('button:not([disabled]), input:not([disabled])')]
+        .filter(el => el.getClientRects().length);
+      if (!choices.length) { event.preventDefault(); dialog.focus(); return; }
+      const first = choices[0], last = choices[choices.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault(); last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault(); first.focus();
+      }
+    },
 
     ask(opts = {}) {
       if (this._resolve) {
@@ -51,7 +125,9 @@ document.addEventListener('alpine:init', () => {
       this.confirmLabel = opts.confirmLabel || 'OK';
       this.cancelLabel = opts.cancelLabel || 'Cancel';
       this.danger = !!opts.danger;
+      this._returnFocus = document.activeElement;
       this.open = true;
+      this._activateFocus();
       return new Promise((resolve) => {
         this._resolve = resolve;
       });
@@ -63,6 +139,7 @@ document.addEventListener('alpine:init', () => {
       const result = this.mode === 'prompt' ? this.value : true;
       this._resolve = null;
       this.open = false;
+      this._releaseFocus();
       resolve(result);
     },
 
@@ -72,6 +149,7 @@ document.addEventListener('alpine:init', () => {
       const result = this.mode === 'prompt' ? null : false;
       this._resolve = null;
       this.open = false;
+      this._releaseFocus();
       resolve(result);
     },
 
@@ -183,6 +261,7 @@ document.addEventListener('alpine:init', () => {
       this.file_count = data.file_count || 0;
       this.proposal_count = data.proposal_count || 0;
       this.duplicate_count = data.duplicate_count || 0;
+      window.dispatchEvent(new CustomEvent('datahoarder:session-loaded'));
     },
   });
 
@@ -539,6 +618,7 @@ document.addEventListener('alpine:init', () => {
 
     async init() {
       await this.initResults();
+      await Alpine.store('dedupCoverage').load();
       await this.load();
       document.addEventListener('datahoarder:refresh', () => this.load());
       this.$watch(() => Alpine.store('app').tab, (tab) => {
@@ -567,6 +647,7 @@ document.addEventListener('alpine:init', () => {
 
     async viewFile(id) {
       try {
+        this._fileDialogReturnFocus = document.activeElement;
         this.selectedFile = await api.get(`/files/${id}`);
         this.showModal = true;
       } catch (e) {
@@ -574,7 +655,10 @@ document.addEventListener('alpine:init', () => {
       }
     },
 
-    closeModal() { this.showModal = false; this.selectedFile = null; },
+    closeModal() {
+      this.showModal = false; this.selectedFile = null;
+      this.$nextTick(() => this._fileDialogReturnFocus?.isConnected && this._fileDialogReturnFocus.focus());
+    },
 
     isImage(f) {
       return f.mime_type && f.mime_type.startsWith('image/');
@@ -614,6 +698,7 @@ document.addEventListener('alpine:init', () => {
 
     async init() {
       await this.initResults();
+      await Alpine.store('dedupCoverage').load();
       await this.load();
       document.addEventListener('datahoarder:refresh', () => this.load());
       this.$watch(() => Alpine.store('app').tab, (tab) => {
@@ -849,21 +934,41 @@ document.addEventListener('alpine:init', () => {
     skippedFolders: [],
     dbPath: '',
 
+    syncFromLoadedSession() {
+      const session = Alpine.store('session');
+      if (!session.current_session_id) return;
+      this.selectedFolder = session.root_path || '';
+      this.selectedAnalyzeModel = session.analyze_model || session.model || '';
+      this.selectedProposeModel = session.propose_model || session.model || '';
+      this.selectedBackend = session.backend || 'ollama';
+      this.selectedWorkers = Number(session.workers) || 1;
+      this.preferredLanguage = session.preferred_language || 'leave_as_is';
+      this.relateScope = session.relate_scope || 'per_directory';
+    },
+
     async init() {
+      window.addEventListener('datahoarder:session-loaded', () => this.syncFromLoadedSession());
+      this.syncFromLoadedSession();
       await this.loadOllamaStatus();
       await this.loadInstalledModels();
       await this.loadDbPath();
+      this.syncFromLoadedSession();
       // Reset folder/model fields when a new session is created
       window.addEventListener('datahoarder:new-session', () => {
         this.selectedFolder = '';
         this.selectedAnalyzeModel = '';
         this.selectedProposeModel = '';
+        this.selectedBackend = 'ollama';
+        this.selectedWorkers = 1;
         this.subfolders = [];
         this.skippedFolders = [];
       });
       this.$watch('showBrowser', (val) => {
-        if (val && !this.currentPath) {
-          this.browsePath('');
+        if (val) {
+          this._browserReturnFocus = document.activeElement;
+          if (!this.currentPath) this.browsePath('');
+        } else {
+          this.$nextTick(() => this._browserReturnFocus?.isConnected && this._browserReturnFocus.focus());
         }
       });
       this.recommendedModels = [
@@ -1160,6 +1265,12 @@ document.addEventListener('alpine:init', () => {
     running: null,
     result: null,
     commitPreview: null,
+    preflight: null,
+    preflightBusy: false,
+    preflightError: null,
+    organizationCoverage: null,
+    sequenceSampleStride: 0,
+    useAnalysisCache: true,
     // Progress tracking for background jobs (one per type)
     analyzeProgress: null,
     enrichProgress: null,
@@ -1196,10 +1307,43 @@ document.addEventListener('alpine:init', () => {
 
     async init() {
       // Check for an active background job (reconnect after page refresh)
+      await Alpine.store('dedupCoverage').load();
       await this.checkActiveJob();
       await this.checkRunPlan();
       await this.loadAnalysisErrors();
+      await this.loadOrganizationCoverage();
       this._runPlanPoll = setInterval(() => this.checkRunPlan(), 2500);
+    },
+
+    async loadPreflight() {
+      const sid = Alpine.store('session').current_session_id;
+      if (!sid) {
+        this.preflightError = 'Choose a session folder in Setup first.';
+        return;
+      }
+      this.preflightBusy = true;
+      this.preflightError = null;
+      this.preflight = null;
+      try {
+        const stride = Number(this.sequenceSampleStride) || 0;
+        const mode = stride ? 'representative' : 'full';
+        const skips = (Alpine.store('session').skip_dirs || [])
+          .map(dir => `&skip_dirs=${encodeURIComponent(dir)}`).join('');
+        this.preflight = await api.get(`/pipeline/preflight?session_id=${encodeURIComponent(sid)}&mode=${mode}&sequence_sample_stride=${stride}${skips}`);
+      } catch (e) {
+        this.preflightError = e.message;
+      } finally {
+        this.preflightBusy = false;
+      }
+    },
+
+    async loadOrganizationCoverage() {
+      const sid = Alpine.store('session').current_session_id;
+      if (!sid) { this.organizationCoverage = null; return; }
+      try {
+        const value = await api.get(`/pipeline/organize/coverage?session_id=${encodeURIComponent(sid)}`);
+        if (sid === Alpine.store('session').current_session_id) this.organizationCoverage = value;
+      } catch (_) { this.organizationCoverage = null; }
     },
 
     async checkRunPlan() {
@@ -1234,6 +1378,10 @@ document.addEventListener('alpine:init', () => {
           return;
         }
         const previous = this.runPlanState;
+        if (this.runPlanId !== plan.plan_id) {
+          this.sequenceSampleStride = Number(plan.options?.sequence_sample_stride) || 0;
+          this.useAnalysisCache = plan.options?.use_cache !== false;
+        }
         this.runPlanId = plan.plan_id;
         this.runPlanState = plan.state;
         this.runPlanError = response.last_failure?.error || null;
@@ -1345,6 +1493,12 @@ document.addEventListener('alpine:init', () => {
       if (size > 1024 * 1024) return (size / 1024 / 1024).toFixed(1) + ' MB';
       if (size > 1024) return (size / 1024).toFixed(0) + ' KB';
       return size + ' B';
+    },
+
+    formatBytes(size) {
+      if (size >= 1024 ** 4) return (size / 1024 ** 4).toFixed(1) + ' TB';
+      if (size >= 1024 ** 3) return (size / 1024 ** 3).toFixed(1) + ' GB';
+      return this.formatSize(size);
     },
 
     escapeHtml(s) {
@@ -1566,6 +1720,8 @@ document.addEventListener('alpine:init', () => {
         body.backend = settings.backend;
         body.model = settings.analyzeModel || settings.model;
         body.workers = settings.workers;
+        body.sequence_sample_stride = Number(this.sequenceSampleStride) || 0;
+        body.use_cache = this.useAnalysisCache;
       } else if (type === 'relate' || type === 'organize' || type === 'propose') {
         body.backend = settings.backend;
         body.model = settings.proposeModel || settings.model;
@@ -1654,7 +1810,7 @@ document.addEventListener('alpine:init', () => {
         switch (type) {
           case 'analyze':
             Alpine.store('app').toast(
-              `Analyze complete: ${data.analyzed || 0} analyzed, ${data.skipped || 0} skipped, ${data.errors || 0} errors`,
+              `Analyze complete: ${data.analyzed || 0} fresh, ${data.cached || 0} cached, ${data.sampled || 0} sampled out, ${data.skipped || 0} unsupported, ${data.errors || 0} errors`,
               'success',
             );
             break;
@@ -1669,6 +1825,7 @@ document.addEventListener('alpine:init', () => {
               `Dedup complete: ${exact} exact + ${perc} perceptual groups, ${props} proposals`,
               'success',
             );
+            await Alpine.store('dedupCoverage').load();
             break;
           }
           case 'relate':
@@ -1691,6 +1848,7 @@ document.addEventListener('alpine:init', () => {
                 data.after_tree = trees.after_tree;
               }
             } catch (_) { /* tree fetch is best-effort */ }
+            await this.loadOrganizationCoverage();
             break;
           case 'execute-dry':
           case 'execute':
@@ -1845,6 +2003,8 @@ document.addEventListener('alpine:init', () => {
           propose_model: settings.proposeModel, workers: settings.workers,
           relate_scope: Alpine.store('session').relate_scope || 'per_directory',
           skip_dirs: Alpine.store('session').skip_dirs || [],
+          sequence_sample_stride: Number(this.sequenceSampleStride) || 0,
+          use_cache: this.useAnalysisCache,
         });
         this.runPlanId = response.plan.plan_id;
         await this.checkRunPlan();

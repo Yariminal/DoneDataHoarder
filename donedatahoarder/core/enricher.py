@@ -77,6 +77,20 @@ def _md5(path: Path) -> Optional[str]:
         return None
 
 
+def _content_hashes(path: Path) -> tuple[Optional[str], Optional[str]]:
+    """Compute both index hashes in one bounded streaming read."""
+    md5 = hashlib.md5()
+    sha256 = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            while chunk := f.read(CHUNK):
+                md5.update(chunk)
+                sha256.update(chunk)
+        return md5.hexdigest(), sha256.hexdigest()
+    except OSError:
+        return None, None
+
+
 def _mime_type(path: Path) -> str:
     """Best-effort MIME type detection."""
     if _HAS_MAGIC:
@@ -153,7 +167,7 @@ def _disk_metadata(path: Path) -> dict:
         return {"missing": True}
 
     mime = _mime_type(path) or ""
-    digest = _md5(path)
+    digest, sha256 = _content_hashes(path)
     date_exif = None
     perceptual = None
     have_exif = False
@@ -174,6 +188,7 @@ def _disk_metadata(path: Path) -> dict:
     return {
         "mime_type": mime,
         "hash_md5": digest,
+        "hash_sha256": sha256,
         "date_exif": date_exif,
         "have_exif": have_exif,
         "hash_perceptual": perceptual,
@@ -206,6 +221,7 @@ def _apply_disk_result(file_rec: File, result: dict) -> str:
 
     file_rec.mime_type = result["mime_type"]
     file_rec.hash_md5 = result["hash_md5"]
+    file_rec.hash_sha256 = result["hash_sha256"]
     if result["have_exif"]:
         file_rec.date_exif = result["date_exif"]
     if result["have_phash"]:

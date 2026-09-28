@@ -1,11 +1,9 @@
 """
 Post-pass helpers for rename proposals — run after the main proposal loop:
 sibling propagation, relation-group propagation, generic-stem disambiguation,
-useless-stem / hygiene fallbacks, spelling normalisation, and near-duplicate
-flagging.
+useless-stem / hygiene fallbacks, and spelling normalisation.
 """
 import re
-from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -156,16 +154,14 @@ def _disambiguate_generic_stems_in_dir(session_id: str | None) -> int:
     digits). For every such proposal, force-prepend the distinguishing
     prefix derived from the ORIGINAL filename.
 
-    Also catches the case where the LLM produced two different-but-equally-
-    generic stems for sibling files by checking token-set overlap >= 0.8
-    within the directory.
+    Also distinguishes exact normalized stem collisions. Fuzzy filename
+    similarity is deliberately excluded: it cannot establish shared content
+    and a quadratic scan is costly in directories with many files.
 
     Returns the number of proposals rewritten.
     """
     if not session_id:
         return 0
-
-    from difflib import SequenceMatcher
 
     engine = get_engine()
     rewritten = 0
@@ -181,53 +177,53 @@ def _disambiguate_generic_stems_in_dir(session_id: str | None) -> int:
             Proposal.status == ProposalStatus.PENDING,
         )
 
-        for prop in proposals_q.all():
+        for prop in proposals_q.yield_per(1000):
             parent = str(Path(prop.proposed_value).parent)
             if parent not in proposals_by_dir:
                 proposals_by_dir[parent] = []
             proposals_by_dir[parent].append(prop)
 
-        # For each directory, check for generic stems
+        # For each directory, count normalized stems once. This is linear in
+        # the number of proposals rather than pairwise name comparisons.
         for dir_path, dir_proposals in proposals_by_dir.items():
             if len(dir_proposals) < 2:
                 continue
 
+            def _core(stem: str) -> str:
+                return re.sub(r"^\d+[_\.]", "", stem, count=1)
+
+            def _normalized(stem: str) -> str:
+                return re.sub(r"[^\w]+", "_", stem.casefold()).strip("_")
+
+            core_by_id = {
+                prop.id: _core(Path(prop.proposed_value).stem)
+                for prop in dir_proposals if prop.proposed_value
+            }
+            normalized_counts = {}
+            for core in core_by_id.values():
+                key = _normalized(core)
+                normalized_counts[key] = normalized_counts.get(key, 0) + 1
+
             # Get the original stems for these files
             file_ids = {p.file_id for p in dir_proposals}
-            files_by_id = {
-                f.id: f for f in session.query(File).filter(File.id.in_(file_ids))
-            }
+            files_by_id = {}
+            ids = sorted(file_ids)
+            for start in range(0, len(ids), 500):
+                files_by_id.update({
+                    f.id: f for f in session.query(File).filter(
+                        File.id.in_(ids[start:start + 500])
+                    )
+                })
 
-            # Check each proposal for generic stem
+            reserved_paths = {Path(p.proposed_value) for p in dir_proposals if p.proposed_value}
+            next_suffixes: dict[Path, int] = {}
+            # Prefix known generic names and repeated normalized names.
             for prop in dir_proposals:
                 if not prop.proposed_value:
                     continue
-
-                proposed_stem = Path(prop.proposed_value).stem
-                # Strip leading digits to get the core tokens
-                core_stem = re.sub(r"^\d+[_\.]", "", proposed_stem, count=1)
-
-                # Check if core stem is in generic tokens or if multiple siblings
-                # have very similar stems (80%+ token overlap)
-                is_generic = core_stem in _GENERIC_STEM_TOKENS
-
-                if not is_generic:
-                    # Check for token-set overlap with other proposals in same dir
-                    for other_prop in dir_proposals:
-                        if other_prop.file_id == prop.file_id:
-                            continue
-                        other_core = re.sub(r"^\d+[_\.]", "",
-                                           Path(other_prop.proposed_value).stem, count=1)
-                        if other_core == core_stem:
-                            is_generic = True
-                            break
-                        # Also check similarity
-                        sm = SequenceMatcher(None, core_stem, other_core)
-                        if sm.ratio() >= 0.8:
-                            is_generic = True
-                            break
-
-                if is_generic:
+                core_stem = core_by_id[prop.id]
+                key = _normalized(core_stem)
+                if core_stem.casefold() in _GENERIC_STEM_TOKENS or normalized_counts[key] > 1:
                     # Prepend the original file's distinguishing prefix
                     orig_file = files_by_id.get(prop.file_id)
                     if orig_file:
@@ -238,8 +234,10 @@ def _disambiguate_generic_stems_in_dir(session_id: str | None) -> int:
                             proposed_path = _resolve_collision(
                                 Path(dir_path) / new_name,
                                 Path(orig_file.path),
-                                reserved_names={Path(p.proposed_value) for p in dir_proposals}
+                                reserved_names=reserved_paths,
+                                next_suffixes=next_suffixes,
                             )
+                            reserved_paths.add(proposed_path)
                             prop.proposed_value = str(proposed_path)
                             rewritten += 1
 
@@ -250,108 +248,13 @@ def _disambiguate_generic_stems_in_dir(session_id: str | None) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Post-pass: flag near-duplicate proposals
+# Legacy compatibility hook; duplicate evidence belongs to core.dedup
 # ---------------------------------------------------------------------------
 
 def _flag_near_duplicate_proposals(session_id: str | None) -> int:
-    """
-    Post-pass: for PENDING RENAME proposals in the same parent directory whose
-    proposed stems are >= 0.92 similar AND share extension AND share size_bytes,
-    reject the later-mtime file's RENAME and add a MARK_DUPLICATE proposal
-    pointing at the earlier-mtime file.
-
-    Returns the number of MARK_DUPLICATE proposals created.
-    """
-    if not session_id:
-        return 0
-
-    from difflib import SequenceMatcher
-
-    engine = get_engine()
-    marked = 0
-
-    with Session(engine) as session:
-        # Get all files in this session with their proposals
-        files_q = session.query(File).filter(File.session_id == session_id)
-        files = {f.id: f for f in files_q}
-
-        # Group PENDING RENAME proposals by directory
-        proposals_by_dir: dict[str, list[Proposal]] = {}
-        for prop in session.query(Proposal).filter(
-            Proposal.file_id.in_(files.keys()),
-            Proposal.proposal_type == ProposalType.RENAME,
-            Proposal.status == ProposalStatus.PENDING,
-        ):
-            parent = str(Path(prop.proposed_value).parent)
-            if parent not in proposals_by_dir:
-                proposals_by_dir[parent] = []
-            proposals_by_dir[parent].append(prop)
-
-        # For each directory, find near-duplicates
-        for dir_path, dir_proposals in proposals_by_dir.items():
-            # Compare all pairs
-            for i, prop1 in enumerate(dir_proposals):
-                file1 = files.get(prop1.file_id)
-                if not file1 or not prop1.proposed_value:
-                    continue
-
-                for prop2 in dir_proposals[i + 1:]:
-                    file2 = files.get(prop2.file_id)
-                    if not file2 or not prop2.proposed_value:
-                        continue
-
-                    path1 = Path(prop1.proposed_value)
-                    path2 = Path(prop2.proposed_value)
-
-                    # Must have same extension and size
-                    if path1.suffix.lower() != path2.suffix.lower():
-                        continue
-                    if file1.size_bytes != file2.size_bytes:
-                        continue
-
-                    # Check stem similarity
-                    stem1 = path1.stem.lower()
-                    stem2 = path2.stem.lower()
-                    sm = SequenceMatcher(None, stem1, stem2)
-                    if sm.ratio() < 0.92:
-                        continue
-
-                    # This is a near-duplicate pair
-                    # Mark the later-mtime file as duplicate of the earlier one
-                    if (file2.modified_at or datetime.min) > (file1.modified_at or datetime.min):
-                        duplicate_file, canonical_file = file2, file1
-                        dup_prop, canon_prop = prop2, prop1
-                    else:
-                        duplicate_file, canonical_file = file1, file2
-                        dup_prop, canon_prop = prop1, prop2
-
-                    # Remove the RENAME proposal from the duplicate file
-                    session.delete(dup_prop)
-
-                    # Add a MARK_DUPLICATE proposal pointing at the canonical file
-                    existing_dup = session.query(Proposal).filter(
-                        Proposal.file_id == duplicate_file.id,
-                        Proposal.proposal_type == ProposalType.MARK_DUPLICATE,
-                    ).first()
-                    if not existing_dup:
-                        session.add(Proposal(
-                            file_id=duplicate_file.id,
-                            proposal_type=ProposalType.MARK_DUPLICATE,
-                            current_value=duplicate_file.path,
-                            proposed_value=canonical_file.path,
-                            reasoning=(
-                                f"Near-duplicate of {Path(canonical_file.path).name} "
-                                f"(stem similarity: {sm.ratio():.1%})"
-                            ),
-                            confidence=0.9,
-                            status=ProposalStatus.PENDING,
-                        ))
-                        marked += 1
-
-        if marked:
-            session.commit()
-
-    return marked
+    """Retired: proposed names and equal sizes cannot prove duplicate bytes."""
+    _ = session_id
+    return 0
 
 
 def _generate_hygiene_fallback(session_id: str | None) -> int:
@@ -386,22 +289,22 @@ def _generate_hygiene_fallback(session_id: str | None) -> int:
                 FileStatus.PROPOSED,
             ]),
         )
-        files = files_q.all()
-        if not files:
-            return 0
+        files = files_q.yield_per(1000)
+        eligible_ids = files_q.with_entities(File.id)
 
         existing_renames: set[int] = {
             file_id
             for (file_id,) in session.query(Proposal.file_id).filter(
                 Proposal.proposal_type == ProposalType.RENAME,
-                Proposal.file_id.in_([f.id for f in files]),
+                Proposal.file_id.in_(eligible_ids),
             )
         }
 
         reserved_paths: set[Path] = set()
+        next_suffixes: dict[Path, int] = {}
         for (proposed_value,) in session.query(Proposal.proposed_value).filter(
             Proposal.proposal_type == ProposalType.RENAME,
-            Proposal.file_id.in_([f.id for f in files]),
+            Proposal.file_id.in_(eligible_ids),
         ):
             if proposed_value:
                 reserved_paths.add(Path(proposed_value))
@@ -420,7 +323,8 @@ def _generate_hygiene_fallback(session_id: str | None) -> int:
             if new_name == path.name:
                 continue
             proposed_path = _resolve_collision(
-                path.parent / new_name, path, reserved_names=reserved_paths
+                path.parent / new_name, path, reserved_names=reserved_paths,
+                next_suffixes=next_suffixes,
             )
             reserved_paths.add(proposed_path)
             session.add(Proposal(
@@ -484,16 +388,15 @@ def _generate_fallback_for_useless_stems(session_id: str | None) -> int:
                 FileStatus.PROPOSED,
             ]),
         )
-        files = files_q.all()
-        if not files:
-            return 0
+        files = files_q.yield_per(1000)
+        eligible_ids = files_q.with_entities(File.id)
 
         # Pre-load existing RENAME proposals so we don't duplicate.
         existing_renames: set[int] = {
             file_id
             for (file_id,) in session.query(Proposal.file_id).filter(
                 Proposal.proposal_type == ProposalType.RENAME,
-                Proposal.file_id.in_([f.id for f in files]),
+                Proposal.file_id.in_(eligible_ids),
             )
         }
 
@@ -501,9 +404,10 @@ def _generate_fallback_for_useless_stems(session_id: str | None) -> int:
         # don't generate a fallback that collides with another file's planned
         # new path.
         reserved_paths: set[Path] = set()
+        next_suffixes: dict[Path, int] = {}
         for (proposed_value,) in session.query(Proposal.proposed_value).filter(
             Proposal.proposal_type == ProposalType.RENAME,
-            Proposal.file_id.in_([f.id for f in files]),
+            Proposal.file_id.in_(eligible_ids),
         ):
             if proposed_value:
                 reserved_paths.add(Path(proposed_value))
@@ -522,7 +426,8 @@ def _generate_fallback_for_useless_stems(session_id: str | None) -> int:
             if new_name == path.name:
                 continue
             proposed_path = _resolve_collision(
-                path.parent / new_name, path, reserved_names=reserved_paths
+                path.parent / new_name, path, reserved_names=reserved_paths,
+                next_suffixes=next_suffixes,
             )
             reserved_paths.add(proposed_path)
             session.add(Proposal(
@@ -603,7 +508,7 @@ def _propagate_renames_to_siblings(session_id: str | None) -> int:
                     ProposalStatus.APPLIED,
                 ]),
             )
-            .all()
+            .yield_per(1000)
         )
         if not rename_rows:
             return 0
@@ -629,7 +534,7 @@ def _propagate_renames_to_siblings(session_id: str | None) -> int:
         # .shx, .ctb, .zip, .rar, .log) as SKIPPED, NOT as PENDING. Without
         # SKIPPED in this filter, sibling propagation never sees the very
         # files it most needs to rescue.
-        files = (
+        files_q = (
             session.query(File)
             .filter(
                 File.session_id == session_id,
@@ -641,28 +546,26 @@ def _propagate_renames_to_siblings(session_id: str | None) -> int:
                     FileStatus.SKIPPED,
                 ]),
             )
-            .all()
         )
-        if not files:
-            return 0
-
-        file_ids = [f.id for f in files]
+        files = files_q.yield_per(1000)
+        eligible_ids = files_q.with_entities(File.id)
 
         # Files already carrying a RENAME proposal — don't overwrite them.
         existing_renames: set[int] = {
             file_id
             for (file_id,) in session.query(Proposal.file_id).filter(
                 Proposal.proposal_type == ProposalType.RENAME,
-                Proposal.file_id.in_(file_ids),
+                Proposal.file_id.in_(eligible_ids),
             )
         }
 
         # Paths already reserved by RENAME proposals, so we don't generate a
         # sibling rename that collides with the primary's new path.
         reserved_paths: set[Path] = set()
+        next_suffixes: dict[Path, int] = {}
         for (proposed_value,) in session.query(Proposal.proposed_value).filter(
             Proposal.proposal_type == ProposalType.RENAME,
-            Proposal.file_id.in_(file_ids),
+            Proposal.file_id.in_(eligible_ids),
         ):
             if proposed_value:
                 reserved_paths.add(Path(proposed_value))
@@ -693,7 +596,8 @@ def _propagate_renames_to_siblings(session_id: str | None) -> int:
                 continue
 
             proposed_path = _resolve_collision(
-                path.parent / new_name, path, reserved_names=reserved_paths
+                path.parent / new_name, path, reserved_names=reserved_paths,
+                next_suffixes=next_suffixes,
             )
             reserved_paths.add(proposed_path)
 
@@ -759,7 +663,7 @@ def _propagate_renames_via_relation_groups(session_id: str | None) -> int:
     if not session_id:
         return 0
 
-    from donedatahoarder.db.models import RelationGroup, RelationRole
+    from donedatahoarder.db.models import RelationGroup, RelationMember, RelationRole
     engine = get_engine()
     created = 0
     # Lower the bar: LLM groups at 0.8 pass; backstop (0.3) does not.
@@ -784,10 +688,16 @@ def _propagate_renames_via_relation_groups(session_id: str | None) -> int:
         if not all_file_ids:
             return 0
 
+        member_ids = (
+            session.query(RelationMember.file_id)
+            .join(RelationGroup, RelationMember.group_id == RelationGroup.id)
+            .filter(RelationGroup.session_id == session_id,
+                    RelationGroup.confidence >= _MIN_CONF)
+        )
         file_by_id: dict[int, File] = {
             f.id: f
             for f in session.query(File)
-            .filter(File.id.in_(all_file_ids))
+            .filter(File.id.in_(member_ids))
             .all()
         }
 
@@ -796,7 +706,7 @@ def _propagate_renames_via_relation_groups(session_id: str | None) -> int:
         for p in (
             session.query(Proposal)
             .filter(
-                Proposal.file_id.in_(all_file_ids),
+                Proposal.file_id.in_(member_ids),
                 Proposal.proposal_type == ProposalType.RENAME,
                 Proposal.status.in_([
                     ProposalStatus.PENDING,
@@ -812,11 +722,12 @@ def _propagate_renames_via_relation_groups(session_id: str | None) -> int:
         # Running reservation set across all groups — prevents two groups
         # from proposing the same destination path.
         reserved_paths: set[Path] = set()
+        next_suffixes: dict[Path, int] = {}
         for pv in (
             session.query(Proposal.proposed_value)
             .filter(
                 Proposal.proposal_type == ProposalType.RENAME,
-                Proposal.file_id.in_(all_file_ids),
+                Proposal.file_id.in_(member_ids),
             )
         ):
             if pv[0]:
@@ -880,6 +791,7 @@ def _propagate_renames_via_relation_groups(session_id: str | None) -> int:
 
                 proposed_path = _resolve_collision(
                     path.parent / new_name, path, reserved_names=reserved_paths,
+                    next_suffixes=next_suffixes,
                 )
                 reserved_paths.add(proposed_path)
 

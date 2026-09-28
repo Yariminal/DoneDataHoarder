@@ -397,6 +397,8 @@ class JobManager:
         model: str = "gemma3:12b",
         workers: int = 1,
         retry_errors: bool = False,
+        sequence_sample_stride: int = 0,
+        use_cache: bool = True,
         run_plan_id: str | None = None,
         expected_index: int | None = None,
     ) -> str:
@@ -415,6 +417,8 @@ class JobManager:
                     workers=workers,
                     session_id=session_id,
                     retry_errors=retry_errors,
+                    sequence_sample_stride=sequence_sample_stride,
+                    use_cache=use_cache,
                     pause_event=job.pause_event,
                     cancel_check=lambda: self._cancel_requested(job),
                 )) as stream:
@@ -772,6 +776,8 @@ class JobManager:
                                       model=options.get("analyze_model", "gemma3:12b"),
                                       workers=options.get("workers", 1),
                                       retry_errors=options.get("retry_errors", False),
+                                      sequence_sample_stride=options.get("sequence_sample_stride", 0),
+                                      use_cache=options.get("use_cache", True),
                                       **common)
         if step == "propose":
             return self.start_propose(sid, backend=options.get("backend", "ollama"),

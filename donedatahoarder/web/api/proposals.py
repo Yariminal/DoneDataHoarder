@@ -9,7 +9,8 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from sqlalchemy.orm import Session
 
-from donedatahoarder.core.dependency_protection import ProtectionIndex
+from donedatahoarder.core.dependency_protection import ProtectionIndex, cached_protection_index
+from donedatahoarder.core.dedup import sequence_comparison_metadata
 from donedatahoarder.db.models import (
     DuplicateGroup, File, Proposal, ProposalStatus, ProposalType, UserSession,
 )
@@ -149,12 +150,21 @@ def list_proposals(
             if f and f.session_id not in protection_by_session:
                 owner = session.get(UserSession, f.session_id)
                 root = Path(owner.root_path) if owner and owner.root_path else None
-                protection_by_session[f.session_id] = ProtectionIndex(root) if root and root.is_dir() else None
+                protection_by_session[f.session_id] = cached_protection_index(root) if root and root.is_dir() else None
             protection = protection_by_session.get(f.session_id) if f else None
             target = Path(p.current_value or f.path) if f else None
             decision = protection.assess(target) if protection and target else None
             current_name = Path(p.current_value).name if p.current_value else (f.filename if f else "")
             proposed_name = Path(p.proposed_value).name if p.proposed_value and p.proposal_type == ProposalType.RENAME else p.proposed_value
+            name_date_source = None
+            if f and p.proposal_type == ProposalType.RENAME and p.proposed_value:
+                from donedatahoarder.proposals.namer.naming import _is_meaningful_date
+                date_value = (f.date_exif or f.date_modified) if _is_meaningful_date(f) else None
+                if date_value and date_value.strftime("%Y-%m-%d") in Path(p.proposed_value).stem:
+                    name_date_source = (
+                        "EXIF capture time" if f.date_exif
+                        else "filesystem modified time; may differ from document creation or event date"
+                    )
             duplicate_evidence = None
             group_id = getattr(p, "duplicate_group_id", None)
             if f and p.proposal_type == ProposalType.MARK_DUPLICATE and group_id:
@@ -174,6 +184,7 @@ def list_proposals(
                         "similarity_score": membership.similarity_score if membership else None,
                         "distance_to_keeper": getattr(membership, "distance_to_keeper", None) if membership else None,
                         "perceptual_bits": len(f.hash_perceptual) * 4 if f.hash_perceptual else None,
+                        "sequence_comparison": sequence_comparison_metadata(f, keeper),
                     }
             items.append({
                 "id": p.id,
@@ -194,6 +205,7 @@ def list_proposals(
                 "analysis_reason": getattr(f, "analysis_reason", None) if f else None,
                 "analysis_evidence_source": getattr(f, "analysis_evidence_source", None) if f else None,
                 "analysis_model_tag": getattr(f, "analysis_model_tag", None) if f else None,
+                "name_date_source": name_date_source,
                 "duplicate_evidence": duplicate_evidence,
                 "review_kind": getattr(p, "review_kind", None),
                 "protected": bool(decision and decision.protected),

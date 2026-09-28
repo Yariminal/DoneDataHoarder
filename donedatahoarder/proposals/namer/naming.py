@@ -419,7 +419,14 @@ def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str
     # Try AI's suggested_name first — it's the most specific and preserves proper nouns
     # (e.g. "liberman_house_final_submission", "greece_partnership_agreement")
     if file_rec.ai_suggested_name:
-        stem_from_desc = _safe(file_rec.ai_suggested_name)
+        # A single render can support the subject without establishing a
+        # precise silhouette. Drop speculative single-letter geometry while
+        # retaining useful color/material/object words.
+        suggestion = re.sub(
+            r"(?i)(?:^|[\s_-])(?:l|u|v|t|s|c|z)[\s_-]?shap(?:e|ed)(?=$|[\s_-])",
+            " ", file_rec.ai_suggested_name,
+        )
+        stem_from_desc = _safe(suggestion)
 
     # Fallback: try tags (more specific than a free-text description)
     if not stem_from_desc and tags_str:
@@ -441,7 +448,8 @@ def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str
                     return True
                 return False
 
-            specific_tags = [t.lower().replace(" ", "_") for t in tags if not _is_generic(t)]
+            specific_tags = [t.lower().replace(" ", "_") for t in tags if not _is_generic(t)
+                             and not re.fullmatch(r"[luvtscz][_-]?shap(?:e|ed)", t.lower().replace(" ", "_"))]
 
             if specific_tags:
                 # Use first 2-3 most relevant tags for more descriptive names
@@ -454,7 +462,10 @@ def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str
 
     # Fallback: use description if tags didn't work or were empty
     if not stem_from_desc and desc:
-        words = re.sub(r"[^a-zA-Z0-9\s]", " ", desc).split()
+        broad_desc = re.sub(
+            r"(?i)\b(?:l|u|v|t|s|c|z)[\s-]?shap(?:e|ed)\b", " ", desc,
+        )
+        words = re.sub(r"[^a-zA-Z0-9\s]", " ", broad_desc).split()
         stem_from_desc = "_".join(w.lower() for w in words[:6] if len(w) > 2)
         stem_from_desc = _deduplicate_stem_words(stem_from_desc)
         stem_from_desc = _safe(stem_from_desc)
@@ -581,6 +592,7 @@ def _resolve_collision(
     proposed_path: Path,
     original_path: Path,
     reserved_names: set[Path] | None = None,
+    next_suffixes: dict[Path, int] | None = None,
 ) -> Path:
     """
     Resolve filename collisions, preferring an informative discriminator
@@ -607,6 +619,8 @@ def _resolve_collision(
         proposed_path: The desired target path
         original_path: The current file path (allow renaming to self)
         reserved_names: Set of paths already proposed in this batch
+        next_suffixes: Optional per-batch next counter for a target basename.
+            Keep it with the same reservation set; never persist it across runs.
 
     Returns:
         A non-conflicting path.
@@ -614,7 +628,7 @@ def _resolve_collision(
     reserved = reserved_names or set()
 
     # If no conflict, return as-is
-    if (not proposed_path.exists() and proposed_path not in reserved) or proposed_path == original_path:
+    if (proposed_path not in reserved and not proposed_path.exists()) or proposed_path == original_path:
         return proposed_path
 
     stem = proposed_path.stem
@@ -628,14 +642,17 @@ def _resolve_collision(
     stem_has_date = bool(re.match(r"^\d{4}-\d{2}-\d{2}", stem))
     if prefix and not stem.startswith(f"{prefix}_") and not stem_has_date:
         candidate = parent / f"{prefix}_{stem}{ext}"
-        if (not candidate.exists() and candidate not in reserved) or candidate == original_path:
+        if (candidate not in reserved and not candidate.exists()) or candidate == original_path:
             return candidate
         # Prefixed collision too → base future counters on the prefixed stem
         stem = f"{prefix}_{stem}"
 
-    counter = 1
+    suffix_key = parent / f"{stem}{ext}"
+    counter = next_suffixes.get(suffix_key, 1) if next_suffixes is not None else 1
     while True:
         candidate = parent / f"{stem}_{counter}{ext}"
-        if (not candidate.exists() and candidate not in reserved) or candidate == original_path:
+        if (candidate not in reserved and not candidate.exists()) or candidate == original_path:
+            if next_suffixes is not None:
+                next_suffixes[suffix_key] = counter + 1
             return candidate
         counter += 1

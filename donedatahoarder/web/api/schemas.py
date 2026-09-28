@@ -89,6 +89,8 @@ class PipelineRequest(BaseModel):
     session_id: str = ""
     skip_dirs: list[str] = []
     retry_errors: bool = False
+    sequence_sample_stride: int = Field(default=0, ge=0, le=1000)
+    use_cache: bool = True
 
 
 class RunPlanRequest(PipelineRequest):

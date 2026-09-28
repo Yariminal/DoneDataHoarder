@@ -10,10 +10,13 @@ The "keep" file in each group defaults to the one with the earliest
 best-date (i.e. original) and longest path (i.e. most specific location).
 """
 import json
+from bisect import bisect_right
 from collections import defaultdict
 from datetime import datetime
 from difflib import SequenceMatcher
-from functools import wraps
+from functools import lru_cache, wraps
+from itertools import islice
+from pathlib import Path
 from typing import Callable
 
 from rich.progress import (
@@ -31,6 +34,7 @@ from donedatahoarder.db.session import get_engine
 from donedatahoarder.config import load_phash_config
 from donedatahoarder.phash import hash_distance
 from donedatahoarder.core.process_lock import operation_lock
+from donedatahoarder.proposals.sequence_identity import numbered_frame_identity
 
 try:
     import imagehash
@@ -40,14 +44,95 @@ except ImportError:
 
 # Threshold loaded from user config (defaults to 8)
 AI_SIMILARITY_THRESHOLD = 0.55  # min similarity score for AI-based duplicates
-AI_SIMILARITY_THRESHOLD = 0.55  # min similarity score for AI-based duplicates
+SEMANTIC_DENSE_BUCKET = 20_000  # compare a bounded lexical neighborhood above this
+SEMANTIC_NEIGHBORS = 16
 TEXT_NEAR_THRESHOLD = 0.90  # min SequenceMatcher ratio for near-identical text files
 TEXT_DEDUP_SIZE_CAP = 200_000  # skip text files larger than ~200 KB to keep O(n^2) bounded
+TEXT_MAX_NEIGHBORS = 32
+PERCEPTUAL_MAX_CANDIDATE_PAIRS = 250_000
+KEEPER_QUERY_CHUNK = 500
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".html", ".htm", ".xml", ".json", ".yaml", ".yml",
     ".csv", ".tsv", ".log", ".srt", ".vtt", ".rst", ".ini", ".cfg",
     ".py", ".js", ".ts", ".css", ".scss",
 }
+
+SEQUENCE_REVIEW_SAMPLES = 3
+def _sequence_identity(path: str) -> tuple[tuple[str, str, int, str], int] | None:
+    """A possible visual frame family; actual adjacency is checked per run."""
+    item = Path(path)
+    identity = numbered_frame_identity(item)
+    if identity is None:
+        return None
+    prefix, ordinal, width = identity
+    return (str(item.parent).casefold(), prefix.casefold(), width,
+            item.suffix.casefold()), ordinal
+
+
+def _confirmed_sequence_families(
+    ordinals: dict[tuple[str, str, int, str], set[int]],
+) -> set[tuple[str, str, int, str]]:
+    """Require a four-frame consecutive run before suppressing comparisons."""
+    return {family for family, numbers in ordinals.items()
+            if any(all(number + offset in numbers for offset in range(1, 4))
+                   for number in numbers)}
+
+
+def sequence_comparison_metadata(
+    candidate: File, keeper: File | None, family_count: int | None = None,
+) -> dict | None:
+    """Explain when a similarity candidate is another frame in one sequence.
+
+    This is review context, never evidence that either frame is disposable.
+    """
+    if keeper is None:
+        return None
+    left = _sequence_identity(candidate.path)
+    right = _sequence_identity(keeper.path)
+    if left is None or right is None or left[0] != right[0] or left[1] == right[1]:
+        return None
+    parent, base, width, extension = left[0]
+    return {
+        "classification": "sequence_frame_comparison",
+        "family": f"{base}*{extension}",
+        "ordinal": left[1],
+        "keeper_ordinal": right[1],
+        "family_count": family_count,
+        "note": "Different numbered frames; similarity alone does not identify a disposable copy.",
+    }
+
+
+def closest_perceptual_peer(
+    target_id: int, target_hash: str | None,
+    peers: list[tuple[int, str, str | None]], *, total_members: int,
+) -> dict | None:
+    """Best direct pHash peer from a caller-bounded group member sample.
+
+    The result is comparison evidence only; it never changes the group's
+    keeper or a proposal's action target. The caller limits the peer query and
+    passes total_members so incomplete sampling is disclosed explicitly.
+    """
+    best: tuple[int, int, str] | None = None
+    supplied = 0
+    scored = 0
+    for file_id, path, phash in peers:
+        if file_id == target_id:
+            continue
+        supplied += 1
+        distance = hash_distance(target_hash, phash)
+        if distance is None:
+            continue
+        scored += 1
+        if best is None or (distance, file_id) < (best[0], best[1]):
+            best = (distance, file_id, path)
+    if best is None:
+        return None
+    return {
+        "file_id": best[1], "path": best[2], "distance": best[0],
+        "comparison_coverage": "exact" if supplied >= max(0, total_members - 1) else "sampled",
+        "peers_scored": scored, "total_other_members": max(0, total_members - 1),
+        "evidence_type": "direct_phash",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +161,37 @@ def _pick_keeper(files: list[File]) -> int:
         return (date, -len(f.path), -(f.size_bytes or 0))
 
     return min(files, key=sort_key).id
+
+
+def _pick_keeper_ids(session: Session, file_ids) -> int:
+    """Choose a keeper without SQLite's IN limit or loading a huge ORM set."""
+    iterator = iter(file_ids)
+    best: tuple[tuple, int] | None = None
+    while chunk := list(islice(iterator, KEEPER_QUERY_CHUNK)):
+        rows = session.query(
+            File.id, File.date_best, File.date_modified, File.date_created,
+            File.path, File.size_bytes,
+        ).filter(File.id.in_(chunk)).all()
+        for file_id, date_best, date_modified, date_created, path, size in rows:
+            date = date_best or date_modified or date_created or datetime(9999, 1, 1)
+            key = (date, -len(path or ""), -(size or 0))
+            if best is None or key < best[0]:
+                best = (key, file_id)
+    if best is None:
+        raise ValueError("Duplicate group has no existing files")
+    return best[1]
+
+
+def _read_bounded_text(path: str, size_cap: int) -> str | None:
+    """Bound actual bytes read, even if indexed size is stale."""
+    try:
+        with Path(path).open("rb") as stream:
+            data = stream.read(size_cap + 1)
+    except OSError:
+        return None
+    if len(data) > size_cap:
+        return None
+    return data.decode("utf-8", errors="replace")
 
 
 def _upsert_group(
@@ -109,24 +225,40 @@ def _upsert_group(
     # A chosen keeper must be known before scores are attached. The score of
     # a transitive edge is never evidence about a different keeper.
     if group.keep_file_id is None:
-        files = session.query(File).filter(File.id.in_(file_ids)).all()
-        group.keep_file_id = _pick_keeper(files)
+        group.keep_file_id = _pick_keeper_ids(session, file_ids)
 
-    existing_members = {m.file_id: m for m in group.members}
+    # Query only IDs and write in batches. A dense 50k-file similarity group
+    # must not materialize 50k ORM member objects in one session.
+    existing_members = dict(
+        session.query(DuplicateMember.file_id, DuplicateMember.id)
+        .filter(DuplicateMember.group_id == group.id).all()
+    )
+    inserts: list[dict] = []
+    updates: list[dict] = []
+
+    def flush_members() -> None:
+        if inserts:
+            session.bulk_insert_mappings(DuplicateMember, inserts)
+            inserts.clear()
+        if updates:
+            session.bulk_update_mappings(DuplicateMember, updates)
+            updates.clear()
+
     for fid in file_ids:
         score, distance = (
             compare_to_keeper(group.keep_file_id, fid)
             if compare_to_keeper else (similarity, None)
         )
-        member = existing_members.get(fid)
-        if member is None:
-            member = DuplicateMember(
-                group_id=group.id,
-                file_id=fid,
-            )
-            session.add(member)
-        member.similarity_score = score
-        member.distance_to_keeper = distance
+        member_id = existing_members.get(fid)
+        if member_id is None:
+            inserts.append({"group_id": group.id, "file_id": fid,
+                            "similarity_score": score, "distance_to_keeper": distance})
+        else:
+            updates.append({"id": member_id, "similarity_score": score,
+                            "distance_to_keeper": distance})
+        if len(inserts) + len(updates) >= 1000:
+            flush_members()
+    flush_members()
 
 
 def _score_member_to_keeper(group: DuplicateGroup, keeper: File, member: File) -> tuple[float, float | None]:
@@ -146,16 +278,21 @@ def _score_member_to_keeper(group: DuplicateGroup, keeper: File, member: File) -
                  + 0.6 * _tags_overlap(_parse_tags(keeper.ai_tags), _parse_tags(member.ai_tags)))
         return score, None
     if group.dupe_type == DupeType.CONTENT:
-        try:
-            if max(keeper.size_bytes or 0, member.size_bytes or 0) > TEXT_DEDUP_SIZE_CAP:
-                return 0.0, None
-            from pathlib import Path
-            left = Path(keeper.path).read_text(encoding="utf-8", errors="replace")
-            right = Path(member.path).read_text(encoding="utf-8", errors="replace")
-            return SequenceMatcher(None, left, right).ratio(), None
-        except (OSError, UnicodeError):
+        if max(keeper.size_bytes or 0, member.size_bytes or 0) > TEXT_DEDUP_SIZE_CAP:
             return 0.0, None
+        left = _read_bounded_text(keeper.path, TEXT_DEDUP_SIZE_CAP)
+        right = _read_bounded_text(member.path, TEXT_DEDUP_SIZE_CAP)
+        return (SequenceMatcher(None, left, right).ratio(), None) if left is not None and right is not None else (0.0, None)
     return 0.0, None
+
+
+def _direct_score_qualifies(dupe_type: DupeType, score: float) -> bool:
+    """A transitive group does not establish similarity to its keeper."""
+    if dupe_type == DupeType.SEMANTIC:
+        return score >= AI_SIMILARITY_THRESHOLD
+    if dupe_type == DupeType.CONTENT:
+        return score >= TEXT_NEAR_THRESHOLD
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +310,8 @@ def find_exact_duplicates(session_id: str | None = None) -> dict:
         q = (
             session.query(File.id, File.hash_md5)
             .filter(File.hash_md5.isnot(None))
-            .filter(File.status.in_([FileStatus.ENRICHED, FileStatus.ANALYZED, FileStatus.PROPOSED]))
+            .filter(File.status.in_([FileStatus.ENRICHED, FileStatus.ANALYZED,
+                                     FileStatus.PROPOSED, FileStatus.SKIPPED, FileStatus.ERROR]))
         )
         if session_id:
             q = q.filter(File.session_id == session_id)
@@ -273,7 +411,11 @@ def _perceptual_bitstring(hex_hash: str) -> str | None:
     return bits
 
 
-def _perceptual_candidate_pairs(hexes: list[str], threshold: int) -> list[tuple[str, str]]:
+def _perceptual_candidate_pairs(
+    hexes: list[str], threshold: int, *,
+    max_pairs: int = PERCEPTUAL_MAX_CANDIDATE_PAIRS,
+    stats: dict | None = None,
+) -> list[tuple[str, str]]:
     """Pairs that share a hash band.
 
     threshold + 1 bands is the pigeonhole cut: Hamming distance <= threshold
@@ -294,12 +436,17 @@ def _perceptual_candidate_pairs(hexes: list[str], threshold: int) -> list[tuple[
 
     seen: set[tuple[str, str]] = set()
     pairs: list[tuple[str, str]] = []
+    truncated = False
 
     def _add_pair(left: str, right: str) -> None:
+        nonlocal truncated
         if left == right:
             return
         key = (left, right) if left <= right else (right, left)
         if key in seen:
+            return
+        if len(pairs) >= max_pairs:
+            truncated = True
             return
         seen.add(key)
         pairs.append(key)
@@ -313,6 +460,12 @@ def _perceptual_candidate_pairs(hexes: list[str], threshold: int) -> list[tuple[
             for i in range(len(group)):
                 for j in range(i + 1, len(group)):
                     _add_pair(group[i], group[j])
+                    if truncated:
+                        break
+                if truncated:
+                    break
+            if truncated:
+                break
             continue
 
         buckets: dict[tuple[int, str], list[str]] = defaultdict(list)
@@ -330,6 +483,20 @@ def _perceptual_candidate_pairs(hexes: list[str], threshold: int) -> list[tuple[
             for i in range(len(members)):
                 for j in range(i + 1, len(members)):
                     _add_pair(members[i], members[j])
+                    if truncated:
+                        break
+                if truncated:
+                    break
+            if truncated:
+                break
+        if truncated:
+            break
+    if stats is not None and truncated:
+        stats["candidate_coverage"] = "bounded_incomplete"
+        stats["candidate_pair_cap"] = max_pairs
+        stats["candidate_pair_opportunities_deferred"] = None  # not enumerated
+        stats["candidate_pair_opportunities_deferred_lower_bound"] = 1
+        stats["candidate_truncation_reason"] = "dense perceptual hash band"
     return pairs
 
 
@@ -407,7 +574,8 @@ def find_perceptual_duplicates(threshold: int | None = None, session_id: str | N
             for file_id in ids[1:]:
                 uf.union(anchor, file_id)
 
-    candidates = _perceptual_candidate_pairs(list(hash_to_ids), threshold)
+    candidate_stats: dict = {}
+    candidates = _perceptual_candidate_pairs(list(hash_to_ids), threshold, stats=candidate_stats)
     with Progress(
         SpinnerColumn(),
         TextColumn("[bold yellow]{task.description}"),
@@ -435,8 +603,7 @@ def find_perceptual_duplicates(threshold: int | None = None, session_id: str | N
         for component in uf.components().values():
             remaining = set(component)
             while len(remaining) > 1:
-                files = session.query(File).filter(File.id.in_(remaining)).all()
-                keep_id = _pick_keeper(files)
+                keep_id = _pick_keeper_ids(session, remaining)
                 keep_hash = hash_by_id[keep_id]
                 group = sorted(
                     fid for fid in remaining
@@ -461,6 +628,7 @@ def find_perceptual_duplicates(threshold: int | None = None, session_id: str | N
                 counts["duplicates"] += len(group) - 1
         session.commit()
 
+    counts.update(candidate_stats)
     return counts
 
 
@@ -495,12 +663,14 @@ def find_semantic_duplicates(session_id: str | None = None) -> dict:
     """
     engine = get_engine()
     counts = {"groups": 0, "duplicates": 0}
+    deferred_pair_opportunities = 0
 
     with Session(engine) as session:
         # Only consider analyzed files with descriptions or tags
         q = (
-            session.query(File.id, File.ai_description, File.ai_tags, File.mime_type)
+            session.query(File.id, File.ai_description, File.ai_tags, File.mime_type, File.path)
             .filter(File.status.in_([FileStatus.ANALYZED, FileStatus.PROPOSED]))
+            .filter(File.analysis_outcome == "content_verified")
             .filter((File.ai_description.isnot(None)) | (File.ai_tags.isnot(None)))
         )
         if session_id:
@@ -512,13 +682,22 @@ def find_semantic_duplicates(session_id: str | None = None) -> dict:
 
     # file_id, description, tags, mime group (part before '/')
     records: list[tuple[int, str, list[str], str]] = []
-    for file_id, desc, tags_raw, mime in rows:
+    sequence_ordinals: dict[tuple[str, str, int, str], set[int]] = defaultdict(set)
+    for _file_id, _desc, _tags, _mime, path in rows:
+        identity = _sequence_identity(path)
+        if identity:
+            sequence_ordinals[identity[0]].add(identity[1])
+    confirmed_sequences = _confirmed_sequence_families(sequence_ordinals)
+    sequence_keys: list[tuple[tuple[str, str, str], int] | None] = []
+    for file_id, desc, tags_raw, mime, path in rows:
         records.append((
             file_id,
             desc or "",
             _parse_tags(tags_raw),
             (mime or "").split("/")[0],
         ))
+        identity = _sequence_identity(path)
+        sequence_keys.append(identity if identity and identity[0] in confirmed_sequences else None)
 
     buckets: dict[tuple[str, str], list[int]] = defaultdict(list)
     for index, (_file_id, _desc, tags, mime_group) in enumerate(records):
@@ -528,9 +707,6 @@ def find_semantic_duplicates(session_id: str | None = None) -> dict:
     uf = _UnionFind()
     for file_id, _desc, _tags, _mime_group in records:
         uf.add(file_id)
-
-    seen_pairs: set[tuple[int, int]] = set()
-    links: list[tuple[int, int, float]] = []
 
     with Progress(
         SpinnerColumn(),
@@ -545,28 +721,70 @@ def find_semantic_duplicates(session_id: str | None = None) -> dict:
         )
         if not buckets:
             progress.advance(task)
-        for indexes in buckets.values():
+        for (_mime_group, tag), indexes in buckets.items():
             progress.advance(task)
             if len(indexes) < 2:
                 continue
-            for left in range(len(indexes)):
-                ia = indexes[left]
+            # A numbered sibling family is a single comparison block. Only
+            # equal frame ordinals can be copies within it; distinct ordinals
+            # are left intact. Other families can still compare across blocks.
+            blocks: dict[object, dict[int, list[int]]] = defaultdict(lambda: defaultdict(list))
+            for index in indexes:
+                sequence = sequence_keys[index]
+                key = sequence[0] if sequence else ("single", index)
+                ordinal = sequence[1] if sequence else 0
+                blocks[key][ordinal].append(index)
+            block_values = list(blocks.values())
+
+            def consider(ia: int, ib: int) -> None:
                 id_a, desc_a, tags_a, _mime_a = records[ia]
-                for right in range(left + 1, len(indexes)):
-                    ib = indexes[right]
-                    pair = (ia, ib) if ia < ib else (ib, ia)
-                    if pair in seen_pairs:
-                        continue
-                    seen_pairs.add(pair)
-                    id_b, desc_b, tags_b, _mime_b = records[ib]
-                    # 40% description, 60% tags (tags are more consistent)
-                    combined = (
-                        0.4 * _string_similarity(desc_a, desc_b)
-                        + 0.6 * _tags_overlap(tags_a, tags_b)
-                    )
-                    if combined >= AI_SIMILARITY_THRESHOLD:
-                        uf.union(id_a, id_b)
-                        links.append((id_a, id_b, combined))
+                id_b, desc_b, tags_b, _mime_b = records[ib]
+                # A pair sharing several tags is scored in one canonical
+                # bucket, avoiding an O(pairs) seen-set in dense collections.
+                if tag != min(set(tags_a) & set(tags_b)):
+                    return
+                combined = (0.4 * _string_similarity(desc_a, desc_b)
+                            + 0.6 * _tags_overlap(tags_a, tags_b))
+                if combined >= AI_SIMILARITY_THRESHOLD:
+                    uf.union(id_a, id_b)
+
+            block_ids = [[index for item in block.values() for index in item]
+                         for block in block_values]
+            within = sum(len(item) * (len(item) - 1) // 2
+                         for block in block_values for item in block.values())
+            cross = 0
+            prior_size = 0
+            for item in block_ids:
+                cross += prior_size * len(item)
+                prior_size += len(item)
+            opportunities = within + cross
+            if opportunities > SEMANTIC_DENSE_BUCKET:
+                # Dense generic tags create quadratic false-candidate work.
+                # Compare nearby descriptions in deterministic order and
+                # explicitly report all unexamined pair opportunities.
+                ordered = sorted(indexes, key=lambda i: (records[i][1].casefold(), records[i][0]))
+                attempted = 0
+                for position, ia in enumerate(ordered):
+                    for ib in ordered[position + 1:position + 1 + SEMANTIC_NEIGHBORS]:
+                        left_sequence, right_sequence = sequence_keys[ia], sequence_keys[ib]
+                        if (left_sequence and right_sequence
+                                and left_sequence[0] == right_sequence[0]
+                                and left_sequence[1] != right_sequence[1]):
+                            continue
+                        consider(ia, ib)
+                        attempted += 1
+                deferred_pair_opportunities += max(0, opportunities - attempted)
+            else:
+                for block in block_values:
+                    for same_ordinal in block.values():
+                        for left in range(len(same_ordinal)):
+                            for right in range(left + 1, len(same_ordinal)):
+                                consider(same_ordinal[left], same_ordinal[right])
+                for left in range(len(block_ids)):
+                    for right in range(left + 1, len(block_ids)):
+                        for ia in block_ids[left]:
+                            for ib in block_ids[right]:
+                                consider(ia, ib)
 
     records_by_id = {row[0]: row for row in records}
 
@@ -597,6 +815,9 @@ def find_semantic_duplicates(session_id: str | None = None) -> dict:
             counts["duplicates"] += len(group) - 1
         session.commit()
 
+    if deferred_pair_opportunities:
+        counts["candidate_pair_opportunities_deferred"] = deferred_pair_opportunities
+        counts["candidate_coverage"] = "bounded_incomplete"
     return counts
 
 
@@ -626,10 +847,9 @@ def find_text_near_duplicates(
     - Pre-filter pairs by length: skip if lengths differ by more than 10%
     - Use SequenceMatcher ratio; group if >= threshold
     """
-    from pathlib import Path as _P
-
     engine = get_engine()
     counts = {"groups": 0, "duplicates": 0}
+    deferred_pair_opportunities = 0
 
     with Session(engine) as session:
         q = (
@@ -659,18 +879,28 @@ def find_text_near_duplicates(
     if len(candidates) < 2:
         return counts
 
-    # Read content (best-effort) — skip files that can't be decoded
-    contents: dict[int, tuple[str, str, int]] = {}  # id -> (text, ext, size)
+    # Keep only bounded metadata in memory. Full text is loaded lazily into a
+    # small LRU for actual comparisons; large collections must not retain
+    # every <=200 KB file in RAM at once.
+    contents: dict[int, tuple[str, str, int, bytes]] = {}  # id -> (path, ext, actual size, prefix)
     for fid, fpath, ext_lc, size in candidates:
         try:
-            text = _P(fpath).read_text(encoding="utf-8", errors="replace")
-        except (OSError, UnicodeError):
+            actual_size = Path(fpath).stat().st_size
+            if not 0 < actual_size <= size_cap:
+                continue
+            with Path(fpath).open("rb") as stream:
+                prefix = stream.read(96)
+        except OSError:
             continue
-        contents[fid] = (text, ext_lc, size)
+        contents[fid] = (fpath, ext_lc, actual_size, prefix)
+
+    @lru_cache(maxsize=64)
+    def read_text(file_id: int) -> str | None:
+        return _read_bounded_text(contents[file_id][0], size_cap)
 
     # Bucket by extension to avoid cross-ext comparisons (.py vs .html etc.)
     by_ext: dict[str, list[int]] = defaultdict(list)
-    for fid, (_text, ext_lc, _size) in contents.items():
+    for fid, (_path, ext_lc, _size, _prefix) in contents.items():
         by_ext[ext_lc].append(fid)
 
     visited: set[int] = set()
@@ -686,21 +916,32 @@ def find_text_near_duplicates(
         task = progress.add_task("Comparing text content…", total=len(contents))
 
         for ext_lc, ids in by_ext.items():
+            ids.sort(key=lambda fid: (contents[fid][2], contents[fid][3], fid))
+            sizes = [contents[fid][2] for fid in ids]
             for i, id_a in enumerate(ids):
                 progress.advance(task)
                 if id_a in visited:
                     continue
-                text_a, _, size_a = contents[id_a]
+                _path_a, _, size_a, _prefix_a = contents[id_a]
+                text_a = read_text(id_a)
+                if text_a is None:
+                    continue
                 group = [id_a]
                 sims: list[float] = []
-                for id_b in ids[i + 1:]:
+                end = bisect_right(sizes, size_a / 0.9, lo=i + 1)
+                candidate_end = min(end, i + 1 + TEXT_MAX_NEIGHBORS)
+                deferred_pair_opportunities += max(0, end - candidate_end)
+                for id_b in ids[i + 1:candidate_end]:
                     if id_b in visited:
                         continue
-                    text_b, _, size_b = contents[id_b]
+                    _path_b, _, size_b, _prefix_b = contents[id_b]
                     # Cheap length pre-filter: if sizes differ by >10%, skip
                     if size_a == 0 or size_b == 0:
                         continue
                     if abs(size_a - size_b) / max(size_a, size_b) > 0.10:
+                        continue
+                    text_b = read_text(id_b)
+                    if text_b is None:
                         continue
                     ratio = SequenceMatcher(None, text_a, text_b).quick_ratio()
                     if ratio < threshold:
@@ -717,7 +958,11 @@ def find_text_near_duplicates(
                     groups.append((group, round(avg_sim, 3)))
 
     def direct_content(keeper: int, member: int) -> tuple[float, None]:
-        return (SequenceMatcher(None, contents[keeper][0], contents[member][0]).ratio(), None)
+        left = read_text(keeper)
+        right = read_text(member)
+        if left is None or right is None:
+            return 0.0, None
+        return SequenceMatcher(None, left, right).ratio(), None
 
     with Session(engine) as session:
         for group, _avg_sim in groups:
@@ -734,6 +979,9 @@ def find_text_near_duplicates(
             counts["duplicates"] += len(group) - 1
         session.commit()
 
+    if deferred_pair_opportunities:
+        counts["candidate_pair_opportunities_deferred"] = deferred_pair_opportunities
+        counts["candidate_coverage"] = "bounded_incomplete"
     return counts
 
 
@@ -764,7 +1012,9 @@ def generate_dedup_proposals(session_id: str | None = None) -> dict:
     a near-match score as permission to discard a file.
     """
     engine = get_engine()
-    counts = {"groups": 0, "created": 0, "skipped": 0, "no_keeper": 0}
+    counts = {"groups": 0, "created": 0, "skipped": 0, "no_keeper": 0,
+              "sequence_sampled": 0, "sequence_deferred": 0,
+              "weak_direct_evidence_deferred": 0}
 
     type_label = {
         DupeType.EXACT:      "exact byte-for-byte duplicate",
@@ -785,6 +1035,42 @@ def generate_dedup_proposals(session_id: str | None = None) -> dict:
         if not groups:
             return counts
 
+        # Repeated frame names are common in renders and video exports. A
+        # pHash/tag match between two numbered siblings is a comparison to
+        # inspect, not a copy to discard. Keep three spread-out comparisons
+        # per family in review and leave every other frame without an action.
+        path_query = session.query(File.id, File.path)
+        if session_id:
+            path_query = path_query.filter(File.session_id == session_id)
+        paths = dict(path_query.all())
+        family_members: dict[tuple[str, str, int, str], set[int]] = defaultdict(set)
+        family_ordinals: dict[tuple[str, str, int, str], set[int]] = defaultdict(set)
+        for file_id, path in paths.items():
+            identity = _sequence_identity(path)
+            if identity:
+                family_members[identity[0]].add(file_id)
+                family_ordinals[identity[0]].add(identity[1])
+        confirmed_sequences = _confirmed_sequence_families(family_ordinals)
+        sequence_candidates: dict[tuple[str, str, int, str], dict[int, int]] = defaultdict(dict)
+        for group in groups:
+            if group.dupe_type == DupeType.EXACT or group.keep_file_id not in paths:
+                continue
+            keeper_identity = _sequence_identity(paths[group.keep_file_id])
+            if keeper_identity is None or keeper_identity[0] not in confirmed_sequences:
+                continue
+            member_ids = session.query(DuplicateMember.file_id).filter_by(group_id=group.id).all()
+            for (member_id,) in member_ids:
+                identity = _sequence_identity(paths.get(member_id, ""))
+                if (member_id != group.keep_file_id and identity is not None
+                        and identity[0] == keeper_identity[0]
+                        and identity[1] != keeper_identity[1]):
+                    sequence_candidates[identity[0]][member_id] = identity[1]
+        sampled_sequence_ids: set[int] = set()
+        for candidates in sequence_candidates.values():
+            ordered = sorted(candidates, key=lambda file_id: (candidates[file_id], file_id))
+            positions = {0, len(ordered) // 2, len(ordered) - 1}
+            sampled_sequence_ids.update(ordered[pos] for pos in sorted(positions))
+
         # Pre-load every existing MARK_DUPLICATE proposal so we don't double up
         # when the dedup endpoint is re-run after a partial application.
         existing_marked: set[int] = {
@@ -794,6 +1080,7 @@ def generate_dedup_proposals(session_id: str | None = None) -> dict:
             )
         }
 
+        pending_insert: list[dict] = []
         for group in groups:
             counts["groups"] += 1
 
@@ -803,32 +1090,47 @@ def generate_dedup_proposals(session_id: str | None = None) -> dict:
             # detection).
             keep_id = group.keep_file_id
             if keep_id is None:
-                member_files = [
-                    session.get(File, m.file_id) for m in group.members
-                ]
-                member_files = [f for f in member_files if f is not None]
-                if len(member_files) < 2:
+                member_ids = [file_id for (file_id,) in session.query(
+                    DuplicateMember.file_id).filter_by(group_id=group.id).all()]
+                if len(member_ids) < 2:
                     counts["no_keeper"] += 1
                     continue
-                keep_id = _pick_keeper(member_files)
+                keep_id = _pick_keeper_ids(session, member_ids)
                 group.keep_file_id = keep_id
 
-            keep_file = session.get(File, keep_id)
-            keep_path = keep_file.path if keep_file else "(unknown)"
+            keep_path = paths.get(keep_id, "(unknown)")
+            keeper_identity = _sequence_identity(keep_path)
             label = type_label.get(group.dupe_type, str(group.dupe_type))
 
-            for m in group.members:
-                if m.file_id == keep_id:
+            member_rows = session.query(
+                DuplicateMember.file_id, DuplicateMember.similarity_score,
+            ).filter_by(group_id=group.id).all()
+            for member_id, member_similarity in member_rows:
+                if member_id == keep_id:
                     continue
-                if m.file_id in existing_marked:
+                if member_id in existing_marked:
                     counts["skipped"] += 1
                     continue
-                victim = session.get(File, m.file_id)
-                if victim is None:
+                victim_path = paths.get(member_id)
+                if victim_path is None:
                     counts["skipped"] += 1
                     continue
 
-                similarity = m.similarity_score or 0.0
+                victim_identity = _sequence_identity(victim_path)
+                is_sequence = bool(
+                    group.dupe_type != DupeType.EXACT and keeper_identity and victim_identity
+                    and victim_identity[0] == keeper_identity[0]
+                    and victim_identity[1] != keeper_identity[1]
+                    and victim_identity[0] in confirmed_sequences
+                )
+                if is_sequence and member_id not in sampled_sequence_ids:
+                    counts["sequence_deferred"] += 1
+                    continue
+
+                similarity = member_similarity or 0.0
+                if not _direct_score_qualifies(group.dupe_type, similarity):
+                    counts["weak_direct_evidence_deferred"] += 1
+                    continue
                 # Candidate similarity is evidence, not a calibrated
                 # probability. Only exact matches receive auto-approval
                 # confidence; all other classes require individual review.
@@ -838,20 +1140,27 @@ def generate_dedup_proposals(session_id: str | None = None) -> dict:
                     f"{label} (direct keeper similarity={similarity:.3f}). "
                     f"Candidate for individual review; keeper: {keep_path}"
                 )
+                if is_sequence:
+                    reasoning += (
+                        " Numbered sequence comparison sampled for review; "
+                        "other frames were not proposed for disposal."
+                    )
+                    counts["sequence_sampled"] += 1
 
-                session.add(Proposal(
-                    file_id=victim.id,
-                    proposal_type=ProposalType.MARK_DUPLICATE,
-                    current_value=victim.path,
-                    proposed_value=keep_path,
-                    reasoning=reasoning,
-                    confidence=confidence,
-                    status=ProposalStatus.PENDING,
-                    duplicate_group_id=group.id,
-                ))
-                existing_marked.add(victim.id)
+                pending_insert.append({
+                    "file_id": member_id, "proposal_type": ProposalType.MARK_DUPLICATE,
+                    "current_value": victim_path, "proposed_value": keep_path,
+                    "reasoning": reasoning, "confidence": confidence,
+                    "status": ProposalStatus.PENDING, "duplicate_group_id": group.id,
+                })
+                if len(pending_insert) >= 1000:
+                    session.bulk_insert_mappings(Proposal, pending_insert)
+                    pending_insert.clear()
+                existing_marked.add(member_id)
                 counts["created"] += 1
 
+        if pending_insert:
+            session.bulk_insert_mappings(Proposal, pending_insert)
         session.commit()
 
     return counts
@@ -880,6 +1189,61 @@ def refresh_group_proposals(session: Session, group_id: int) -> dict[str, int]:
         raise ValueError("Undo applied duplicate proposals before changing keeper")
     by_file = {p.file_id: p for p in proposals}
     changed = created = 0
+    # Keeper changes must not expand a sampled frame family back into a full
+    # action queue. Recompute a bounded sample against the newly chosen keeper.
+    sampled_sequence_ids: set[int] = set()
+    confirmed_sequence = False
+    keeper_identity = _sequence_identity(keeper.path)
+    if group.dupe_type != DupeType.EXACT and keeper_identity is not None:
+        path_by_id = dict(session.query(File.id, File.path).filter(
+            File.session_id == group.session_id).all()) if group.session_id else {
+            member_id: session.get(File, member_id).path for member_id in members
+            if session.get(File, member_id) is not None
+        }
+        ordinals: dict[tuple[str, str, int, str], set[int]] = defaultdict(set)
+        candidates: dict[int, int] = {}
+        for path in path_by_id.values():
+            identity = _sequence_identity(path)
+            if identity:
+                ordinals[identity[0]].add(identity[1])
+        confirmed_sequence = keeper_identity[0] in _confirmed_sequence_families(ordinals)
+        for member_id in members:
+            identity = _sequence_identity(path_by_id.get(member_id, ""))
+            if (identity and member_id != keeper.id
+                    and identity[0] == keeper_identity[0]
+                    and identity[1] != keeper_identity[1]):
+                candidates[member_id] = identity[1]
+        if confirmed_sequence and candidates:
+            # Other evidence groups can already expose comparisons from the
+            # same frame family. Keep one review budget across this session,
+            # not three additional comparisons each time a keeper changes.
+            active_other = set()
+            query = (session.query(Proposal.file_id, Proposal.proposed_value)
+                     .join(DuplicateGroup,
+                           DuplicateGroup.id == Proposal.duplicate_group_id)
+                     .filter(Proposal.proposal_type == ProposalType.MARK_DUPLICATE,
+                             Proposal.duplicate_group_id != group.id,
+                             Proposal.status.in_((ProposalStatus.PENDING,
+                                                  ProposalStatus.APPROVED,
+                                                  ProposalStatus.MODIFIED)),
+                             DuplicateGroup.dupe_type != DupeType.EXACT))
+            if group.session_id:
+                query = query.filter(DuplicateGroup.session_id == group.session_id)
+            for file_id, proposed_path in query:
+                victim_identity = _sequence_identity(path_by_id.get(file_id, ""))
+                other_keeper_identity = _sequence_identity(proposed_path or "")
+                if (victim_identity and other_keeper_identity
+                        and victim_identity[0] == keeper_identity[0]
+                        and other_keeper_identity[0] == keeper_identity[0]
+                        and victim_identity[1] != other_keeper_identity[1]):
+                    active_other.add(file_id)
+            budget = max(0, SEQUENCE_REVIEW_SAMPLES - len(active_other))
+            ordered = sorted(candidates, key=lambda file_id: (candidates[file_id], file_id))
+            positions = ({len(ordered) // 2} if budget == 1 else
+                         {0, len(ordered) - 1} if budget == 2 else
+                         {0, len(ordered) // 2, len(ordered) - 1}
+                         if budget >= 3 else set())
+            sampled_sequence_ids = {ordered[pos] for pos in positions}
     for member_id, member in members.items():
         victim = session.get(File, member_id)
         if victim is None:
@@ -894,6 +1258,24 @@ def refresh_group_proposals(session: Session, group_id: int) -> dict[str, int]:
                 proposal.status = ProposalStatus.REJECTED
                 proposal.review_kind = None
                 proposal.user_notes = "Keeper changed; this file is now kept"
+                changed += 1
+            continue
+        identity = _sequence_identity(victim.path)
+        if (group.dupe_type != DupeType.EXACT and keeper_identity is not None
+                and identity is not None and identity[0] == keeper_identity[0]
+                and identity[1] != keeper_identity[1]
+                and confirmed_sequence and member_id not in sampled_sequence_ids):
+            if proposal is not None:
+                proposal.status = ProposalStatus.REJECTED
+                proposal.review_kind = None
+                proposal.user_notes = "Sequence comparison deferred after keeper change"
+                changed += 1
+            continue
+        if not _direct_score_qualifies(group.dupe_type, score):
+            if proposal is not None:
+                proposal.status = ProposalStatus.REJECTED
+                proposal.review_kind = None
+                proposal.user_notes = "Direct similarity to the new keeper is below the candidate threshold"
                 changed += 1
             continue
         if proposal is None:
@@ -920,6 +1302,11 @@ def refresh_group_proposals(session: Session, group_id: int) -> dict[str, int]:
             f"{group.dupe_type.value} candidate; direct keeper similarity={score:.3f}. "
             f"Keeper: {keeper.path}"
         )
+        if member_id in sampled_sequence_ids:
+            proposal.reasoning += (
+                " Numbered sequence comparison sampled for review; "
+                "other frames were not proposed for disposal."
+            )
         proposal.status = ProposalStatus.PENDING
         proposal.review_kind = None
         proposal.applied_at = None

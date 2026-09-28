@@ -9,8 +9,14 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import stat
+import threading
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 
 _CAD_MODELS = {".dwg", ".dxf", ".dwt", ".dws"}
@@ -25,6 +31,36 @@ _ETRANSMIT_REFERENCE = re.compile(
     r"pat|lin|png|jpe?g|tiff?|bmp|tga|dds|fmp|pc3|pmp))\s*$", re.I,
 )
 _MTL_MAP = re.compile(r"^(?:map_[\w]+|bump|disp|decal|refl)\s+(.+)$", re.I)
+_CSS_URL = re.compile(r"url\(\s*(['\"]?)(.*?)\1\s*\)|@import\s+['\"]([^'\"]+)['\"]", re.I)
+_LINKED_HINT = re.compile(
+    rb"(?:[A-Za-z0-9_. -]+[/\\])*[A-Za-z0-9_. -]+\.(?:png|jpe?g|tiff?|psd|svg|pdf|eps|ai)", re.I,
+)
+_REFERENCE_READ_LIMIT = 2_000_000
+
+
+class _LocalHTMLReferences(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.references: list[str] = []
+        self.base_href: str | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "base":
+            self.base_href = next((value for key, value in attrs if key == "href"), None)
+        for key, value in attrs:
+            if not value:
+                continue
+            if key in {"src", "href", "poster", "data", "background"}:
+                self.references.append(value)
+            elif key == "srcset":
+                self.references.extend(part.strip().split()[0] for part in value.split(",")
+                                       if part.strip())
+            elif key == "style":
+                self.references.extend(_css_references(value))
+
+
+def _css_references(text: str) -> list[str]:
+    return [match.group(2) or match.group(3) for match in _CSS_URL.finditer(text)]
 
 
 @dataclass(frozen=True)
@@ -40,17 +76,35 @@ class ProtectionIndex:
     def __init__(self, root: Path):
         self.root = root.resolve()
         self._reasons: dict[Path, set[str]] = {}
+        self._opaque_scopes: set[tuple[Path, str]] = set()
         self._build()
 
     def _add(self, path: Path, reason: str) -> None:
-        resolved = path.resolve()
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError):
+            return
         if resolved.is_relative_to(self.root):
             self._reasons.setdefault(resolved, set()).add(reason)
 
+    @staticmethod
+    def _is_link(path: Path) -> bool:
+        """Windows junctions are reparse points but are not symlinks."""
+        try:
+            if path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)()):
+                return True
+            attributes = getattr(path.lstat(), "st_file_attributes", 0)
+            return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+
     def _safe_reference_path(self, source: Path, raw: str) -> Path | None:
         """Resolve an in-root relative reference without probing outside it."""
-        name = raw.strip().strip('"').replace("\\", "/")
-        if not name or re.match(r"^[A-Za-z]:", name) or name.startswith("/"):
+        name = unquote(raw.strip().strip('"')).replace("\\", "/")
+        if (not name or re.match(r"^[A-Za-z]:", name) or name.startswith("/")
+                or name.startswith("//")):
             return None
         # Normalize parent traversal lexically before touching the filesystem.
         lexical = Path(os.path.normpath(str(source.parent / name)))
@@ -60,10 +114,120 @@ class ProtectionIndex:
         # looks local. Reject it without following its target.
         current = lexical
         while current != self.root:
-            if current.is_symlink():
+            if self._is_link(current):
                 return None
             current = current.parent
-        return lexical.resolve()
+        try:
+            resolved = lexical.resolve()
+        except (OSError, RuntimeError):
+            return None
+        return resolved if resolved.is_relative_to(self.root) else None
+
+    def _web_reference(self, source: Path, raw: str, kind: str) -> None:
+        """Ignore remote/data anchors; retain paths for local or ambiguous links."""
+        raw = raw.strip()
+        if not raw or raw.startswith("#"):
+            return
+        try:
+            parsed = urlsplit(raw)
+        except ValueError:
+            self._add(source, f"Malformed {kind} reference: {raw[:120]}")
+            self._protect_opaque_subtree(source, "web")
+            return
+        if parsed.scheme in {"http", "https", "mailto", "tel", "data", "javascript"}:
+            return
+        if parsed.scheme or parsed.netloc:
+            self._add(source, f"Unresolved {kind} reference: {raw[:120]}")
+            return
+        if parsed.path:
+            if parsed.path.startswith("/"):
+                # A site-root URL may refer beneath the collection root, but
+                # the actual serving root is unknown. Keep any local match.
+                target = self._safe_reference_path(
+                    self.root / "_site_root_marker", parsed.path.lstrip("/"))
+                self._add(source, f"Site-root {kind} reference: {raw[:120]}")
+                if target is not None and target.is_file():
+                    self._add(target, f"Referenced by {source.name}: {raw[:120]}")
+                # The serving root is unknown even when the collection-root
+                # spelling exists: /assets/foo may resolve beneath a nested
+                # site instead. Do not treat one path as exhaustive evidence.
+                self._protect_opaque_subtree(source, "web", scope=self.root)
+            else:
+                self._referenced(source, parsed.path, kind)
+
+    def _protect_opaque_subtree(
+        self, source: Path, kind: str, *, scope: Path | None = None,
+    ) -> None:
+        """Keep likely local assets in the smallest known source subtree.
+
+        A root-level page has no narrower verified site root, so guard known
+        web/design asset formats under the collection rather than every file.
+        """
+        search_root = scope or source.parent
+        scope_key = (search_root, kind)
+        if scope_key in self._opaque_scopes:
+            return
+        self._opaque_scopes.add(scope_key)
+        suffixes = (_TEXTURES | {".svg", ".css", ".js", ".mjs", ".json", ".html",
+                                 ".htm", ".woff", ".woff2", ".ttf", ".otf", ".ico"}
+                    if kind == "web" else
+                    _TEXTURES | {".psd", ".ai", ".eps", ".svg", ".pdf"})
+        for candidate in self._iter_tree(search_root):
+            if candidate.is_file() and candidate.suffix.lower() in suffixes:
+                self._add(candidate, f"Potential unresolved {kind} dependency of {source.name}")
+
+    def _inspect_web_file(self, path: Path, ext: str) -> None:
+        try:
+            with path.open("rb") as stream:
+                data = stream.read(_REFERENCE_READ_LIMIT + 1)
+        except OSError:
+            self._add(path, "Web dependency references could not be inspected")
+            self._protect_opaque_subtree(path, "web")
+            return
+        if len(data) > _REFERENCE_READ_LIMIT:
+            self._add(path, "Web references beyond inspected prefix are unknown")
+            self._protect_opaque_subtree(path, "web")
+        content = data[:_REFERENCE_READ_LIMIT].decode("utf-8", errors="replace")
+        refs: list[str] = []
+        if ext in {".html", ".htm"}:
+            parser = _LocalHTMLReferences()
+            try:
+                parser.feed(content)
+                refs.extend(parser.references)
+                if parser.base_href:
+                    base = urlsplit(parser.base_href)
+                    if base.scheme or base.netloc or base.path.startswith("/"):
+                        self._add(path, "HTML base URL changes reference resolution")
+                        self._protect_opaque_subtree(path, "web", scope=self.root)
+                    elif base.path:
+                        refs = [str(Path(base.path) / ref) if not urlsplit(ref).scheme
+                                and not ref.startswith(("/", "#")) else ref for ref in refs]
+            except Exception:
+                self._add(path, "HTML references could not be fully parsed")
+                self._protect_opaque_subtree(path, "web")
+        refs.extend(_css_references(content))
+        for raw in refs:
+            self._web_reference(path, raw, "web asset")
+
+    def _inspect_design_links(self, path: Path) -> None:
+        """Recover inspectable local path hints; opaque formats stay protected."""
+        self._add(path, "Design source may contain opaque linked assets")
+        try:
+            with path.open("rb") as stream:
+                data = stream.read(_REFERENCE_READ_LIMIT + 1)
+        except OSError:
+            self._add(path, "Design links could not be inspected")
+            self._protect_opaque_subtree(path, "design")
+            return
+        if len(data) > _REFERENCE_READ_LIMIT:
+            self._add(path, "Design links beyond inspected prefix are unknown")
+        for raw in set(_LINKED_HINT.findall(data[:_REFERENCE_READ_LIMIT])):
+            hint = raw.decode("utf-8", errors="replace").strip()
+            if hint and hint != path.name:
+                self._referenced(path, hint, "design asset")
+        # Binary PSD/AI link records can be encoded or compressed. Nearby
+        # resources remain in place when no complete link inventory exists.
+        self._protect_opaque_subtree(path, "design")
 
     def _referenced(self, source: Path, raw: str, kind: str) -> None:
         """Protect an existing reference, or its source if parsing is uncertain."""
@@ -77,13 +241,43 @@ class ProtectionIndex:
             self._add(target, f"Referenced by {source.name}: {raw}")
         else:
             self._add(source, f"Unresolved {kind} reference: {raw}")
-            suffixes = {".mtl"} if kind == "OBJ material" else _TEXTURES
+            suffixes = ({".mtl"} if kind == "OBJ material" else
+                        _TEXTURES | {".css", ".js", ".svg", ".html", ".htm", ".woff", ".woff2"}
+                        if kind == "web asset" else _TEXTURES)
             self._protect_potential_resources(source, suffixes, kind)
+            if kind == "web asset":
+                self._protect_opaque_subtree(source, "web")
+            elif kind == "design asset":
+                self._protect_opaque_subtree(source, "design")
+
+    def _iter_tree(self, start: Path | None = None):
+        """Walk without entering Windows junctions or symlinked directories."""
+        for directory, names, files in os.walk(start or self.root, followlinks=False):
+            parent = Path(directory)
+            safe_names = []
+            for name in names:
+                child = parent / name
+                if self._is_link(child):
+                    self._add(parent, f"Contains linked directory: {name}")
+                else:
+                    safe_names.append(name)
+                    yield child
+            names[:] = safe_names
+            for name in files:
+                child = parent / name
+                if self._is_link(child):
+                    self._add(parent, f"Contains linked file: {name}")
+                else:
+                    yield child
 
     def _protect_potential_resources(self, source: Path, suffixes: set[str], kind: str) -> None:
-        for sibling in source.parent.iterdir():
-            if sibling.is_file() and sibling.suffix.lower() in suffixes:
-                self._add(sibling, f"Potential unresolved {kind} dependency of {source.name}")
+        try:
+            siblings = source.parent.iterdir()
+            for sibling in siblings:
+                if not self._is_link(sibling) and sibling.is_file() and sibling.suffix.lower() in suffixes:
+                    self._add(sibling, f"Potential unresolved {kind} dependency of {source.name}")
+        except OSError:
+            self._add(source, f"Potential {kind} dependencies could not be inspected")
 
     def _read_lines(self, path: Path):
         try:
@@ -137,7 +331,7 @@ class ProtectionIndex:
             # Do not assume that mangled Hebrew paths or missing external
             # resources enumerate the bundle completely. This is bounded to
             # the report's subtree and recognized CAD/raster/font formats.
-            for candidate in report.parent.rglob("*"):
+            for candidate in self._iter_tree(report.parent):
                 if candidate.is_file() and candidate.suffix.lower() in _ETRANSMIT_RESOURCES:
                     self._add(candidate, f"Possible unresolved eTransmit dependency of {report.name}")
 
@@ -145,7 +339,7 @@ class ProtectionIndex:
         # Stream the tree; retain only directories with recognized CAD
         # members, rather than buffering every path in a large collection.
         cad_by_dir: dict[Path, tuple[list[Path], list[Path], list[Path]]] = {}
-        for path in self.root.rglob("*"):
+        for path in self._iter_tree():
             if path.is_dir():
                 if path.suffix.lower() == ".fbm":
                     self._add(path, "Media bundle directory (.fbm)")
@@ -167,6 +361,10 @@ class ProtectionIndex:
             if ext in _OPAQUE_3D:
                 self._add(path, "3D source may contain opaque relative resource references")
                 self._protect_potential_resources(path, _TEXTURES | {".mtl"}, "3D model")
+            if ext in {".html", ".htm", ".css"}:
+                self._inspect_web_file(path, ext)
+            if ext in {".ai", ".psd"}:
+                self._inspect_design_links(path)
             if ext in {".shx", ".ctb", ".stb", ".fon"}:
                 # These are addressable CAD/font resources even when the
                 # referencing drawing is outside the indexed tree.
@@ -248,7 +446,17 @@ class ProtectionIndex:
                     self._add(item, f"CAD drawing sidecar for {item.stem}")
 
     def assess(self, path: Path) -> ProtectionDecision:
-        resolved = path.resolve()
+        if self._is_link(path):
+            reason = "Linked path cannot be safely relocated"
+            return ProtectionDecision(True, reason, (reason,))
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError):
+            reason = "Path could not be resolved for dependency protection"
+            return ProtectionDecision(True, reason, (reason,))
+        if not resolved.is_relative_to(self.root):
+            reason = "Path resolves outside the collection root"
+            return ProtectionDecision(True, reason, (reason,))
         reasons = set(self._reasons.get(resolved, ()))
         if path.is_dir():
             for protected, items in self._reasons.items():
@@ -256,6 +464,34 @@ class ProtectionIndex:
                     reasons.update(items)
         evidence = tuple(sorted(reasons))
         return ProtectionDecision(bool(evidence), evidence[0] if evidence else None, evidence)
+
+
+_READ_CACHE_LOCK = threading.Lock()
+_READ_CACHE: OrderedDict[Path, tuple[float, int, ProtectionIndex]] = OrderedDict()
+_READ_CACHE_MAX_ROOTS = 8
+
+
+def cached_protection_index(root: Path, ttl_seconds: float = 5.0) -> ProtectionIndex:
+    """Short-lived snapshot for read-only review pages.
+
+    Review data can be a few seconds old; preview and commit must construct a
+    fresh ProtectionIndex and independently enforce the current filesystem.
+    """
+    resolved = root.resolve()
+    stamp = resolved.stat().st_mtime_ns
+    now = time.monotonic()
+    with _READ_CACHE_LOCK:
+        cached = _READ_CACHE.get(resolved)
+        if cached and now - cached[0] < ttl_seconds and cached[1] == stamp:
+            _READ_CACHE.move_to_end(resolved)
+            return cached[2]
+    index = ProtectionIndex(resolved)
+    with _READ_CACHE_LOCK:
+        _READ_CACHE[resolved] = (time.monotonic(), stamp, index)
+        _READ_CACHE.move_to_end(resolved)
+        while len(_READ_CACHE) > _READ_CACHE_MAX_ROOTS:
+            _READ_CACHE.popitem(last=False)
+    return index
 
 
 def assess_protection(

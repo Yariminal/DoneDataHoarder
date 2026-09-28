@@ -71,25 +71,18 @@ def _propagate_moves_to_skipped_siblings(session_id: str) -> int:
             return 0
 
         # Pull SKIPPED siblings — these are the files we want to rescue.
-        skipped_files = (
-            db.query(File)
-            .filter(
-                File.session_id == session_id,
-                File.status == FileStatus.SKIPPED,
-            )
-            .all()
+        skipped_query = db.query(File).filter(
+            File.session_id == session_id,
+            File.status == FileStatus.SKIPPED,
         )
-        if not skipped_files:
-            return 0
-
-        skipped_ids = [f.id for f in skipped_files]
+        skipped_files = skipped_query.yield_per(1000)
 
         # Pre-load existing MOVE proposals so we don't double-propose.
         existing_moves: set[int] = {
             file_id
             for (file_id,) in db.query(Proposal.file_id).filter(
                 Proposal.proposal_type == ProposalType.MOVE,
-                Proposal.file_id.in_(skipped_ids),
+                Proposal.file_id.in_(skipped_query.with_entities(File.id)),
             )
         }
 
@@ -363,17 +356,23 @@ def _emit_relation_group_moves(session_id: str, root_path: str) -> int:
             all_file_ids.update(m.file_id for m in g.members)
         if not all_file_ids:
             return 0
+        member_ids = (
+            db.query(RelationMember.file_id)
+            .join(RelationGroup, RelationMember.group_id == RelationGroup.id)
+            .filter(RelationGroup.session_id == session_id,
+                    RelationGroup.confidence >= _MIN_CONF)
+        )
 
         file_by_id: dict[int, File] = {
             f.id: f
-            for f in db.query(File).filter(File.id.in_(all_file_ids)).all()
+            for f in db.query(File).filter(File.id.in_(member_ids)).all()
         }
 
         # Files that already have a MOVE proposal — leave them alone.
         existing_moves: set[int] = {
             fid
             for (fid,) in db.query(Proposal.file_id).filter(
-                Proposal.file_id.in_(all_file_ids),
+                Proposal.file_id.in_(member_ids),
                 Proposal.proposal_type == ProposalType.MOVE,
             )
         }
@@ -384,7 +383,7 @@ def _emit_relation_group_moves(session_id: str, root_path: str) -> int:
         for p in (
             db.query(Proposal)
             .filter(
-                Proposal.file_id.in_(all_file_ids),
+                Proposal.file_id.in_(member_ids),
                 Proposal.proposal_type == ProposalType.RENAME,
                 Proposal.status.in_([
                     ProposalStatus.PENDING,
@@ -539,13 +538,15 @@ def _backstop_mojibake_folders(session_id: str, root_path: str) -> int:
         # Existing RENAME_FOLDER proposals (any status) for these folders —
         # skip anything already handled by the LLM or previously applied.
         already: set[str] = set()
-        existing_rows = db.query(Proposal.current_value).filter(
-            Proposal.proposal_type == ProposalType.RENAME_FOLDER,
-            Proposal.current_value.in_(list(mojibake_folders.keys())),
-        ).all()
-        for (cv,) in existing_rows:
-            if cv:
-                already.add(cv)
+        keys = list(mojibake_folders)
+        for start in range(0, len(keys), 500):
+            existing_rows = db.query(Proposal.current_value).filter(
+                Proposal.proposal_type == ProposalType.RENAME_FOLDER,
+                Proposal.current_value.in_(keys[start:start + 500]),
+            )
+            for (cv,) in existing_rows:
+                if cv:
+                    already.add(cv)
 
         import re
         for src_abs, recovered_name in mojibake_folders.items():

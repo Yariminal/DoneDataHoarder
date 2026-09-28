@@ -7,6 +7,7 @@ All writes are batched (BATCH_SIZE) to keep SQLite happy on large drives.
 Respects .ddhignore files in the root directory (gitignore-style patterns).
 """
 import os
+import stat
 import sys
 from datetime import datetime
 from donedatahoarder.timeutils import utcnow
@@ -82,6 +83,18 @@ JUNK_FILE_EXTENSIONS: set[str] = {".tmp", ".part", ".ctb", ".plt"}
 SKIP_FILENAME_PREFIXES: tuple[str, ...] = ("._",)
 
 
+def _is_link_or_reparse(path: Path) -> bool:
+    """Reject symlinks and Windows junction/reparse entries without following."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return True
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
 def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[Path]:
     """
     Yield Path objects for every regular file under *root*.
@@ -92,9 +105,18 @@ def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[
     - extra_skip_dirs parameter
     """
     skip = SKIP_DIRS | (extra_skip_dirs or set())
+    if _is_link_or_reparse(root):
+        return
     ddhignore = load_ddhignore(root)
 
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    def _walk_error(exc: OSError) -> None:
+        logger.warning("Cannot read directory during scan", extra={
+            "path": getattr(exc, "filename", None), "error": str(exc),
+        })
+
+    for dirpath, dirnames, filenames in os.walk(
+        root, followlinks=False, onerror=_walk_error,
+    ):
         dirpath_obj = Path(dirpath)
 
         # Prune unwanted dirs in-place so os.walk won't descend into them
@@ -104,6 +126,8 @@ def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[
                 continue
             # Check .ddhignore patterns
             dir_path = dirpath_obj / d
+            if _is_link_or_reparse(dir_path):
+                continue
             if ddhignore.should_ignore(dir_path, is_dir=True):
                 continue
             dirnames_filtered.append(d)
@@ -119,6 +143,8 @@ def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[
                 continue
             # Check .ddhignore patterns
             file_path = dirpath_obj / name
+            if _is_link_or_reparse(file_path):
+                continue
             if ddhignore.should_ignore(file_path, is_dir=False):
                 continue
             yield file_path
@@ -296,6 +322,8 @@ def _scan_unlocked(
     """
     import concurrent.futures
 
+    if _is_link_or_reparse(root):
+        raise ValueError("Collection root is a symlink, junction, or unreadable")
     engine = get_engine()
 
     with Session(engine) as session:
@@ -385,6 +413,9 @@ def _scan_unlocked(
                     existing.analysis_prompt_version = None
                     existing.analysis_extractor_version = None
                     existing.analysis_content_chars = None
+                    existing.analysis_context_hash = None
+                    existing.analysis_detected_date = None
+                    existing.analysis_cache_hit = False
                     existing.analyzed_at = None
                     existing.enriched_at = None
                     existing.error_message = record.get("error_message")

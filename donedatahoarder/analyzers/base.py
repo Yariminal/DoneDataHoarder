@@ -17,7 +17,7 @@ Your job is to analyze files and return structured metadata to help rename and c
 Be concise, factual, and consistent. Always respond in valid JSON.
 """
 PROMPT_VERSION = "analysis-v2-2026-09-27"
-EXTRACTOR_VERSION = "extractors-v2-2026-09-27"
+EXTRACTOR_VERSION = "extractors-v3-2026-09-28"
 
 # Tags the LLM commonly emits that carry no information for organisation.
 # Lower-cased, with spaces normalised to underscores.
@@ -234,6 +234,8 @@ class BaseAnalyzer(ABC):
             )
             f.analysis_reason = result.reason
             f.analysis_content_chars = result.content_chars
+            f.analysis_detected_date = result.detected_date if did_infer else None
+            f.analysis_cache_hit = False
             f.ai_transcript = result.transcript or None
             # AI-detected dates are hints only — never overwrite real EXIF dates,
             # and only use as date_best if no real filesystem date exists either.

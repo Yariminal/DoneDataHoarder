@@ -64,10 +64,9 @@ class ArchiveAnalyzer(BaseAnalyzer):
 
         try:
             with zipfile.ZipFile(path, "r") as zf:
-                entries = zf.namelist()
-                total_entries = len(entries)
-                for entry in entries[:MAX_ENTRIES]:
-                    manifest_lines.append(entry)
+                total_entries = len(zf.filelist)
+                for entry in zf.filelist[:MAX_ENTRIES]:
+                    manifest_lines.append(entry.filename[:512])
                 if total_entries > MAX_ENTRIES:
                     truncated = True
         except zipfile.BadZipFile:
