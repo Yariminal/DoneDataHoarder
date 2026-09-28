@@ -69,6 +69,11 @@ class BulkRejectRequest(BaseModel):
 
 class ReviewProposalRequest(BaseModel):
     session_id: str = Field(min_length=1)
+    expected_duplicate_group_id: Optional[int] = None
+    expected_duplicate_type: Optional[str] = None
+    expected_keeper_id: Optional[int] = None
+    expected_candidate_path: Optional[str] = None
+    expected_keeper_path: Optional[str] = None
 
 
 class EditProposalRequest(BaseModel):

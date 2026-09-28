@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from donedatahoarder.core.dependency_protection import ProtectionIndex, cached_protection_index
 from donedatahoarder.core.dedup import sequence_comparison_metadata
 from donedatahoarder.db.models import (
-    DuplicateGroup, File, Proposal, ProposalStatus, ProposalType, UserSession,
+    DupeType, DuplicateGroup, File, Proposal, ProposalStatus, ProposalType, UserSession,
 )
 from donedatahoarder.db.session import get_engine
 
@@ -177,6 +177,8 @@ def list_proposals(
                         "type": group.dupe_type.value,
                         "keeper_id": keeper.id if keeper else None,
                         "keeper_path": keeper.path if keeper else None,
+                        "keeper_mime_type": keeper.mime_type if keeper else None,
+                        "keeper_size_bytes": keeper.size_bytes if keeper else None,
                         "keeper_description": keeper.ai_description if keeper else None,
                         "keeper_analysis_outcome": getattr(keeper, "analysis_outcome", None) if keeper else None,
                         "exact_bytes": stored_sha256_match(f, keeper),
@@ -226,6 +228,20 @@ def approve_proposal(proposal_id: int, body: ReviewProposalRequest):
             protected = _protected_reason(p, file, _protection_index(user_session))
             if protected:
                 raise HTTPException(409, f"Protected resource: {protected}")
+            if p.proposal_type == ProposalType.MARK_DUPLICATE:
+                group = session.get(DuplicateGroup, p.duplicate_group_id) if p.duplicate_group_id else None
+                if group is None or group.session_id != file.session_id:
+                    raise HTTPException(409, "Duplicate evidence group changed")
+                if group.dupe_type != DupeType.EXACT:
+                    keeper = session.get(File, group.keep_file_id) if group.keep_file_id else None
+                    if (keeper is None or keeper.session_id != file.session_id
+                            or body.expected_duplicate_group_id != group.id
+                            or body.expected_duplicate_type != group.dupe_type.value
+                            or body.expected_keeper_id != keeper.id
+                            or body.expected_candidate_path != file.path
+                            or body.expected_keeper_path != keeper.path
+                            or p.current_value != file.path or p.proposed_value != keeper.path):
+                        raise HTTPException(409, "Duplicate comparison changed; review this pair again")
             p.status = ProposalStatus.APPROVED
             p.review_kind = "individual"
             session.commit()

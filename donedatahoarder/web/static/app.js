@@ -693,6 +693,11 @@ document.addEventListener('alpine:init', () => {
     search: '',
     minConfidence: 0,
     bulkConfidence: 80,
+    duplicateReview: null,
+    duplicateReviewFiles: null,
+    duplicateReviewSessionId: null,
+    duplicateReviewReturnFocus: null,
+    duplicateReviewRequestId: 0,
     _loadedVersion: -1,
     ...resultsMixin,
 
@@ -708,6 +713,7 @@ document.addEventListener('alpine:init', () => {
 
     async load() {
       try {
+        this.cancelDuplicateReview();
         let url = `/proposals?page=${this.page}&per_page=${this.perPage}`;
         if (this.statusFilter) url += `&status=${this.statusFilter}`;
         if (this.typeFilter)   url += `&proposal_type=${this.typeFilter}`;
@@ -724,9 +730,85 @@ document.addEventListener('alpine:init', () => {
       }
     },
 
-    async approve(id) {
+    async requestApproval(p) {
+      if (p.proposal_type !== 'mark_duplicate' || p.duplicate_evidence?.type === 'exact') {
+        return this.approve(p.id);
+      }
+      if (!p.duplicate_evidence?.keeper_id || !p.duplicate_evidence?.keeper_path) {
+        Alpine.store('app').toast('Keeper comparison is unavailable', 'error');
+        return;
+      }
+      const sid = Alpine.store('session').current_session_id;
+      const requestId = ++this.duplicateReviewRequestId;
+      const returnFocus = document.activeElement;
       try {
-        await api.post(`/proposals/${id}/approve`, { session_id: Alpine.store('session').current_session_id });
+        const [candidate, keeper] = await Promise.all([
+          api.get(`/files/${p.file_id}`),
+          api.get(`/files/${p.duplicate_evidence.keeper_id}`),
+        ]);
+        if (!sid || requestId !== this.duplicateReviewRequestId ||
+            sid !== Alpine.store('session').current_session_id ||
+            candidate.id !== p.file_id || candidate.path !== p.file_path ||
+            keeper.id !== p.duplicate_evidence.keeper_id ||
+            keeper.path !== p.duplicate_evidence.keeper_path ||
+            !this.proposals.some(item => item.id === p.id &&
+              (item.status === 'pending' || item.status === 'modified'))) {
+          throw new Error('Comparison changed');
+        }
+        this.duplicateReviewSessionId = sid;
+        this.duplicateReviewReturnFocus = returnFocus;
+        this.duplicateReviewFiles = { candidate, keeper };
+        this.duplicateReview = p;
+        this.$nextTick(() => {
+          if (this.duplicateReview !== p) return;
+          document.querySelector('.app-shell')?.setAttribute('inert', '');
+          document.querySelector('.duplicate-review-dialog button.btn-outline')?.focus();
+        });
+      } catch (_) {
+        Alpine.store('app').toast('Could not load the current candidate and keeper; review again', 'error');
+      }
+    },
+
+    cancelDuplicateReview() {
+      this.duplicateReviewRequestId += 1;
+      if (!this.duplicateReview && !this.duplicateReviewFiles) return;
+      const returnFocus = this.duplicateReviewReturnFocus;
+      this.duplicateReview = null;
+      this.duplicateReviewFiles = null;
+      this.duplicateReviewSessionId = null;
+      this.duplicateReviewReturnFocus = null;
+      document.querySelector('.app-shell')?.removeAttribute('inert');
+      this.$nextTick(() => returnFocus?.isConnected && returnFocus.focus());
+    },
+
+    async approveReviewedDuplicate() {
+      const candidate = this.duplicateReview;
+      const files = this.duplicateReviewFiles;
+      const sid = Alpine.store('session').current_session_id;
+      if (!candidate || !files || !sid || sid !== this.duplicateReviewSessionId ||
+          !this.proposals.some(p => p.id === candidate.id &&
+            (p.status === 'pending' || p.status === 'modified'))) {
+        this.cancelDuplicateReview();
+        Alpine.store('app').toast('Comparison changed; load proposals again', 'error');
+        return;
+      }
+      const comparison = {
+        expected_duplicate_group_id: candidate.duplicate_evidence.group_id,
+        expected_duplicate_type: candidate.duplicate_evidence.type,
+        expected_keeper_id: files.keeper.id,
+        expected_candidate_path: files.candidate.path,
+        expected_keeper_path: files.keeper.path,
+      };
+      this.cancelDuplicateReview();
+      await this.approve(candidate.id, comparison);
+    },
+
+    async approve(id, comparison = null) {
+      try {
+        await api.post(`/proposals/${id}/approve`, {
+          session_id: Alpine.store('session').current_session_id,
+          ...(comparison || {}),
+        });
         this.proposals = this.proposals.map(p => p.id === id ? { ...p, status: 'approved' } : p);
         Alpine.store('app').toast('Approved', 'success');
       } catch (e) {

@@ -138,6 +138,48 @@ def test_project_subtree_preserved_while_mixed_inbox_and_root_files_group(tmp_pa
         assert any("Invoice" in p.proposed_value for p in moves)
 
 
+def test_named_document_collections_are_not_loose_by_category_mix(tmp_path):
+    """A named project needs context even without a recognized manifest."""
+    engine = init_db(tmp_path / "named-folders.db")
+    root = tmp_path / "collection"
+    paths = {
+        "solar_interview": root / "Solar Decathlon 2018" / "interview.docx",
+        "solar_drawing": root / "Solar Decathlon 2018" / "drawing.pdf",
+        "solar_image": root / "Solar Decathlon 2018" / "hero.png",
+        "bipa_slides": root / "BIPA 2021" / "Milestone" / "slides.pptx",
+        "bipa_notes": root / "BIPA 2021" / "Milestone" / "notes.docx",
+        "bipa_image": root / "BIPA 2021" / "Milestone" / "sketch.png",
+        "named_under_downloads": root / "Downloads" / "Client Folder" / "brief.pdf",
+        "generic_chain": root / "Downloads" / "Inbox" / "receipt.pdf",
+        "root_loose": root / "report.pdf",
+    }
+    with Session(engine) as db:
+        owner = UserSession(root_path=str(root))
+        db.add(owner)
+        db.flush()
+        for path in paths.values():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"synthetic")
+            db.add(File(session_id=owner.id, path=str(path), filename=path.name,
+                        extension=path.suffix,
+                        mime_type="image/png" if path.suffix == ".png" else "application/pdf",
+                        status=FileStatus.PROPOSED))
+        db.commit()
+        sid = owner.id
+
+    assert _emit_standalone_moves(sid, str(root)) == 2
+    with Session(engine) as db:
+        moves = db.query(Proposal).filter(Proposal.proposal_type == ProposalType.MOVE).all()
+        assert {Path(p.current_value) for p in moves} == {
+            paths["generic_chain"], paths["root_loose"],
+        }
+    from donedatahoarder.web.api.pipeline import get_organize_coverage
+    coverage = get_organize_coverage(sid)
+    assert coverage["independent_proposed"] == 2
+    assert coverage["already_ordered"] == 7
+    assert coverage["total_indexed"] == 9
+
+
 def test_project_subtree_rename_is_suppressed_but_loose_rename_survives(tmp_path):
     engine = init_db(tmp_path / "rename-quality.db")
     root = tmp_path / "collection"

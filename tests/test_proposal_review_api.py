@@ -271,7 +271,32 @@ def test_near_duplicate_requires_individual_review_not_bulk(review_db):
     response = client.post("/api/proposals/bulk-approve", json={"session_id": sid})
     assert response.json()["approved"] == 0
     assert response.json()["skipped_near_duplicate"] == 1
-    assert client.post(f"/api/proposals/{victim_id}/approve", json={"session_id": sid}).status_code == 200
+    review = client.get(f"/api/proposals?session_id={sid}").json()["items"][0]
+    evidence = review["duplicate_evidence"]
+    comparison = {
+        "session_id": sid,
+        "expected_duplicate_group_id": evidence["group_id"],
+        "expected_duplicate_type": evidence["type"],
+        "expected_keeper_id": evidence["keeper_id"],
+        "expected_candidate_path": review["file_path"],
+        "expected_keeper_path": evidence["keeper_path"],
+    }
+    assert client.post(f"/api/proposals/{victim_id}/approve", json={"session_id": sid}).status_code == 409
+    assert client.post(f"/api/proposals/{victim_id}/approve", json={
+        **comparison, "expected_keeper_id": -1,
+    }).status_code == 409
+    with Session(get_engine()) as db:
+        other = File(session_id=sid, path=str(root / "other.png"), filename="other.png")
+        db.add(other)
+        db.flush()
+        db.get(DuplicateGroup, evidence["group_id"]).keep_file_id = other.id
+        db.commit()
+    assert client.post(f"/api/proposals/{victim_id}/approve", json=comparison).status_code == 409
+    with Session(get_engine()) as db:
+        db.get(DuplicateGroup, evidence["group_id"]).keep_file_id = evidence["keeper_id"]
+        assert db.get(Proposal, victim_id).status == ProposalStatus.PENDING
+        db.commit()
+    assert client.post(f"/api/proposals/{victim_id}/approve", json=comparison).status_code == 200
     with Session(get_engine()) as db:
         assert db.get(Proposal, victim_id).review_kind == "individual"
     listed = client.get(f"/api/proposals?session_id={sid}&status=approved").json()["items"]

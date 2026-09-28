@@ -444,6 +444,8 @@
                   <template x-if="editingId !== p.id">
                     <div>
                       <span class="proposed-name truncate" x-text="p.proposed_value" :title="p.proposed_path || p.proposed_value"></span>
+                      <div class="review-note" x-show="p.proposal_type === 'mark_duplicate' && p.duplicate_evidence?.type !== 'exact'"
+                           style="color:var(--warning)">Similarity only. Approval would move this candidate to trash on commit; compare it with the selected keeper first.</div>
                       <details class="text-sm text-dim mt-1" style="max-width:420px; overflow-wrap:anywhere;">
                         <summary style="cursor:pointer;">Why and full paths</summary>
                         <div><strong>Source:</strong> <span x-text="p.current_path || p.file_path"></span></div>
@@ -466,7 +468,7 @@
                                 <div x-text="p.ai_description || 'No content description'"></div>
                               </div>
                               <div style="min-width:0;"><strong>Selected keeper</strong>
-                                <template x-if="p.duplicate_evidence && p.duplicate_evidence.keeper_id && hasImage(p.duplicate_evidence.keeper_id, p.mime_type)"><img :src="'/api/files/' + p.duplicate_evidence.keeper_id + '/thumbnail?size=180'" loading="lazy" alt="Keeper image" style="display:block;max-width:100%;max-height:180px;margin:5px 0;"></template>
+                                <template x-if="p.duplicate_evidence && p.duplicate_evidence.keeper_id && hasImage(p.duplicate_evidence.keeper_id, p.duplicate_evidence.keeper_mime_type)"><img :src="'/api/files/' + p.duplicate_evidence.keeper_id + '/thumbnail?size=180'" loading="lazy" alt="Keeper image" style="display:block;max-width:100%;max-height:180px;margin:5px 0;"></template>
                                 <div style="overflow-wrap:anywhere" x-text="p.duplicate_evidence?.keeper_path || 'Unknown keeper'"></div>
                                 <div x-text="p.duplicate_evidence?.keeper_description || 'No content description'"></div>
                               </div>
@@ -493,7 +495,7 @@
                 <td>
                   <div class="btn-group">
                     <template x-if="p.status === 'pending' || p.status === 'modified'">
-                      <button class="btn btn-success btn-sm" @click="approve(p.id)" :aria-label="'Approve proposal for ' + p.filename" title="Approve">&#10003;</button>
+                      <button class="btn btn-success btn-sm" @click="requestApproval(p)" :aria-label="'Approve proposal for ' + p.filename" title="Approve">&#10003;</button>
                     </template>
                     <template x-if="p.status === 'pending' || p.status === 'modified'">
                       <button class="btn btn-danger btn-sm" @click="reject(p.id)" :aria-label="'Reject proposal for ' + p.filename" title="Reject">&#10005;</button>
@@ -516,6 +518,44 @@
           </div>
         </div>
       </div>
+      <template x-if="duplicateReview">
+        <template x-teleport="body">
+          <div class="modal-backdrop" style="z-index:140;" @click.self="cancelDuplicateReview()"
+               @keydown.escape.prevent="cancelDuplicateReview()">
+            <div class="modal duplicate-review-dialog" role="dialog" aria-modal="true" tabindex="-1"
+                 aria-label="Compare similarity candidate with selected keeper"
+                 @keydown.tab="trapDialogTab($event)"
+                 style="max-width:900px; max-height:90vh; overflow:auto;">
+              <div class="modal-title">Compare candidate and selected keeper</div>
+              <p class="review-note" style="color:var(--warning)">This is an unverified similarity comparison. These files may serve different purposes. Approval will move the candidate to .ddh_trash when you commit; it does not prove the files are interchangeable.</p>
+              <p class="text-sm" x-text="duplicateEvidenceText(duplicateReview.duplicate_evidence)"></p>
+              <p class="text-sm text-dim">File details below come from the current indexed records. Inspect the original files when these previews do not show enough content.</p>
+              <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin:14px 0;">
+                <div style="min-width:0;overflow-wrap:anywhere;">
+                  <strong>Candidate to be moved to trash</strong>
+                  <template x-if="hasImage(duplicateReviewFiles.candidate.id, duplicateReviewFiles.candidate.mime_type)"><img :src="'/api/files/' + duplicateReviewFiles.candidate.id + '/thumbnail?size=400'" loading="lazy" alt="Candidate image" style="display:block;max-width:100%;max-height:300px;margin:8px 0;"></template>
+                  <div x-text="duplicateReviewFiles.candidate.path"></div>
+                  <div class="text-sm" x-text="(duplicateReviewFiles.candidate.mime_type || 'Unknown type') + ' · ' + duplicateReviewFiles.candidate.size_bytes + ' bytes'"></div>
+                  <div class="text-sm" x-text="duplicateReviewFiles.candidate.ai_description || 'No content description'"></div>
+                  <pre class="text-sm" x-show="duplicateReviewFiles.candidate.ai_transcript" x-text="duplicateReviewFiles.candidate.ai_transcript" style="white-space:pre-wrap;"></pre>
+                </div>
+                <div style="min-width:0;overflow-wrap:anywhere;">
+                  <strong>Selected keeper that will remain</strong>
+                  <template x-if="hasImage(duplicateReviewFiles.keeper.id, duplicateReviewFiles.keeper.mime_type)"><img :src="'/api/files/' + duplicateReviewFiles.keeper.id + '/thumbnail?size=400'" loading="lazy" alt="Selected keeper image" style="display:block;max-width:100%;max-height:300px;margin:8px 0;"></template>
+                  <div x-text="duplicateReviewFiles.keeper.path"></div>
+                  <div class="text-sm" x-text="(duplicateReviewFiles.keeper.mime_type || 'Unknown type') + ' · ' + duplicateReviewFiles.keeper.size_bytes + ' bytes'"></div>
+                  <div class="text-sm" x-text="duplicateReviewFiles.keeper.ai_description || 'No content description'"></div>
+                  <pre class="text-sm" x-show="duplicateReviewFiles.keeper.ai_transcript" x-text="duplicateReviewFiles.keeper.ai_transcript" style="white-space:pre-wrap;"></pre>
+                </div>
+              </div>
+              <div style="display:flex;justify-content:flex-end;gap:8px;">
+                <button type="button" class="btn btn-outline" @click="cancelDuplicateReview()">Keep both for now</button>
+                <button type="button" class="btn btn-danger" @click="approveReviewedDuplicate()">Approve candidate for trash on commit</button>
+              </div>
+            </div>
+          </div>
+        </template>
+      </template>
     </section>
 
     <!-- ====================== DUPLICATES ===================== -->

@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 from donedatahoarder.analyzers.archive import ArchiveAnalyzer
 from donedatahoarder.analyzers.base import BaseAnalyzer, AnalysisResult
 from donedatahoarder.analyzers.document import DocumentAnalyzer
+from donedatahoarder.analyzers.dxf import DxfAnalyzer
 from donedatahoarder.analyzers.image import ImageAnalyzer
 from donedatahoarder.analyzers.threedmodel import ThreeDModelAnalyzer
 from donedatahoarder.analyzers.video import VideoAnalyzer
@@ -35,6 +36,7 @@ from donedatahoarder.analyzers.cache import (
     context_hash, eligible_hash, remember, restore,
 )
 from donedatahoarder.core.context import build_context, clear_context_cache
+from donedatahoarder.core.scanner import _is_link_or_reparse
 from donedatahoarder.db.models import File, FileStatus
 from donedatahoarder.db.session import get_engine
 from donedatahoarder.logging import get_logger
@@ -116,13 +118,55 @@ def _get_analyzer(
     analyzers: list[BaseAnalyzer],
     mime_type: Optional[str],
     extension: Optional[str],
+    path: Optional[str] = None,
 ) -> Optional[BaseAnalyzer]:
     ext = (extension or "").lower()
-    mime = mime_type or ""
+    mime = (mime_type or "").lower()
+    # A CAD file must not reach ImageAnalyzer merely because a MIME detector
+    # calls it image/vnd.dwg. Backups are generic: block only recognized CAD
+    # MIME or DWG header, leaving unrelated readable .bak files routable.
+    if ext == ".dwg" or ext == ".bak" and _is_cad_backup(mime, path):
+        return None
+    if ext == ".dxf":
+        return next((a for a in analyzers if isinstance(a, DxfAnalyzer)), None)
     for a in analyzers:
         if a.can_handle(mime, ext):
             return a
     return None
+
+
+def _is_cad_backup(mime: str, path: Optional[str]) -> bool:
+    if mime in {"image/vnd.dwg", "application/acad", "application/x-acad",
+                "application/autocad_dwg", "image/x-dwg"}:
+        return True
+    if path:
+        try:
+            if _has_reparse_component(Path(path)):
+                return False
+            with Path(path).open("rb") as source:
+                return source.read(6) in {
+                    b"AC1009", b"AC1012", b"AC1014", b"AC1015", b"AC1018",
+                    b"AC1021", b"AC1024", b"AC1027", b"AC1032",
+                }
+        except OSError:
+            pass
+    return False
+
+
+def _has_reparse_component(path: Path) -> bool:
+    """Check a bounded lexical path chain before reading a backup header.
+
+    This closes the ordinary post-index symlink/junction swap path. It is not
+    an atomic no-follow open; the later content hash remains the staleness gate.
+    """
+    current = path
+    for _ in range(64):
+        if _is_link_or_reparse(current):
+            return True
+        if current == current.parent:
+            return False
+        current = current.parent
+    return True
 
 
 def _process_one_file(
@@ -150,6 +194,13 @@ def _process_one_file(
         )
 
         ext = file_rec.extension or ""
+        if ext.lower() == ".bak" and _has_reparse_component(Path(file_rec.path)):
+            file_rec.status = FileStatus.ERROR
+            file_rec.analysis_outcome = "failed"
+            file_rec.analysis_reason = "stale_enrichment"
+            file_rec.error_message = "Backup path changed or includes a reparse point; rescan before analysis"
+            session.commit()
+            return file_id, "error", file_rec.error_message
         if ext in skip_ext:
             file_rec.status = FileStatus.SKIPPED
             file_rec.analysis_outcome = "skipped"
@@ -180,12 +231,25 @@ def _process_one_file(
             session.commit()
             return file_id, "sampled", None
 
-        analyzer = _get_analyzer(analyzers, file_rec.mime_type, ext)
+        analyzer = _get_analyzer(analyzers, file_rec.mime_type, ext, file_rec.path)
         if not analyzer:
             file_rec.status = FileStatus.SKIPPED
             file_rec.analysis_outcome = "skipped"
             file_rec.analysis_reason = "unsupported_type"
             file_rec.analysis_evidence_source = "none"
+            file_rec.ai_suggested_name = None
+            file_rec.ai_tags = None
+            file_rec.ai_transcript = None
+            file_rec.ai_confidence = None
+            file_rec.ai_model = None
+            file_rec.analysis_model_tag = None
+            file_rec.analysis_model_digest = None
+            file_rec.analysis_prompt_version = None
+            file_rec.analysis_extractor_version = None
+            file_rec.analysis_content_chars = None
+            file_rec.analysis_context_hash = None
+            file_rec.analysis_detected_date = None
+            file_rec.analysis_cache_hit = False
             mime = file_rec.mime_type or ""
             if mime.startswith("video/") or ext in (
                 ".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v",
@@ -206,6 +270,7 @@ def _process_one_file(
         # share extraction dependencies, so conservatively treat both alike.
         cache_route_stable = not (
             isinstance(analyzer, VideoAnalyzer)
+            or isinstance(analyzer, DxfAnalyzer)
             or isinstance(analyzer, DocumentAnalyzer) and ext.lower() in {".pdf", ".ai"}
         )
         ctx = build_context(file_rec)
@@ -242,7 +307,7 @@ def _process_one_file(
                 or type(client).__name__
             )
             model_digest = None
-            if result.outcome != "skipped" and hasattr(client, "model_digest"):
+            if result.model_called and result.outcome != "skipped" and hasattr(client, "model_digest"):
                 model_digest = client.model_digest(model_name)
             analyzer.save_result(file_rec, result, model_name, model_digest)
             if content_digest:
@@ -267,7 +332,7 @@ def _process_one_file(
                     remember(session, saved, content_hash=content_digest,
                              context_digest=ctx_digest, analyzer=analyzer)
             logger.info(
-                "AI analysis complete",
+                "File analysis complete",
                 extra={
                     "file_id": file_id,
                     "file_name": file_rec.filename,
@@ -391,6 +456,7 @@ def _analyze_with_progress_unlocked(
 
     client = get_client()
     analyzer_list: list[BaseAnalyzer] = [
+        DxfAnalyzer(),
         ImageAnalyzer(client),
         VideoAnalyzer(client),
         DocumentAnalyzer(client),

@@ -110,6 +110,7 @@ class AnalysisResult:
         reason: str | None = None,
         content_chars: int | None = None,
         extractor: str = "none",
+        model_called: bool = True,
     ):
         self.description = description
         self.tags = tags or []
@@ -124,6 +125,7 @@ class AnalysisResult:
         self.reason = reason
         self.content_chars = content_chars
         self.extractor = extractor
+        self.model_called = model_called
 
     def to_dict(self) -> dict:
         return {
@@ -206,6 +208,7 @@ class BaseAnalyzer(ABC):
             # descriptions backed by actual content.
             description = result.description or ""
             confidence = result.confidence
+            did_infer = result.model_called and result.outcome != "skipped"
             if not result.content_available and result.outcome != "skipped" and description:
                 if not description.startswith(AnalysisResult.UNVERIFIED_PREFIX):
                     description = AnalysisResult.UNVERIFIED_PREFIX + description
@@ -218,8 +221,7 @@ class BaseAnalyzer(ABC):
             folder_name = _Path(f.path).parent.name if f.path else None
             cleaned_tags = _clean_tags(result.tags, f.filename, folder_name)
             f.ai_tags = json.dumps(cleaned_tags)
-            f.ai_confidence = confidence
-            did_infer = result.outcome != "skipped"
+            f.ai_confidence = confidence if did_infer else None
             f.ai_model = model_name if did_infer else None
             f.analysis_model_tag = model_name if did_infer else None
             f.analysis_model_digest = model_digest if did_infer else None
@@ -239,7 +241,7 @@ class BaseAnalyzer(ABC):
             f.ai_transcript = result.transcript or None
             # AI-detected dates are hints only — never overwrite real EXIF dates,
             # and only use as date_best if no real filesystem date exists either.
-            if result.detected_date and not f.date_exif and not f.date_best:
+            if did_infer and result.detected_date and not f.date_exif and not f.date_best:
                 f.date_best = result.detected_date
                 # Do NOT set date_exif — that column is reserved for real EXIF metadata
             f.status = FileStatus.SKIPPED if result.outcome == "skipped" else FileStatus.ANALYZED
