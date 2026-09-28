@@ -27,6 +27,202 @@ from .prompts import REORG_SYSTEM_PROMPT
 from .text_utils import _normalize_folder_name
 from .tree import _format_tree_for_prompt, build_folder_tree
 
+
+_DESTINATION_GENERIC = {
+    "file", "files", "document", "documents", "image", "images", "photo",
+    "photos", "group", "collection", "archive", "folder", "project", "new",
+}
+
+
+def _words(value: str) -> set[str]:
+    import re
+    words = {word.casefold() for word in re.findall(r"[^\W_]+", value) if len(word) >= 3}
+    return {word[:-1] if len(word) > 3 and word.endswith("s") and not word.endswith("ss")
+            else word for word in words}
+
+
+def _organizer_move_allowed(file_rec: File, destination: Path, root: Path,
+                            protected_index, sequence_ids: set[int]) -> bool:
+    """Require project and subject evidence before proposing a file move."""
+    source = Path(file_rec.path)
+    try:
+        source_relative = source.relative_to(root)
+        dest_relative = destination.relative_to(root)
+    except ValueError:
+        return False
+    if file_rec.id in sequence_ids or protected_index.assess(source).protected:
+        return False
+    if not dest_relative.parts or not source_relative.parts:
+        return False
+    # A move between existing top-level projects needs explicit human editing.
+    if len(source_relative.parts) > 1 and source_relative.parts[0].casefold() != dest_relative.parts[0].casefold():
+        return False
+    source_context = _words(str(source_relative.parent)) | _words(source.stem)
+    dest_context = _words(str(dest_relative.parent))
+    new_subjects = dest_context - source_context - _DESTINATION_GENERIC
+    if not new_subjects:
+        return True
+    verified = (
+        getattr(file_rec, "analysis_outcome", None) == "content_verified"
+        and getattr(file_rec, "analysis_evidence_source", None) in {"text", "vision"}
+    )
+    if not verified:
+        return False
+    observed = source_context | _words(file_rec.ai_description or "") | _words(file_rec.ai_tags or "")
+    return new_subjects <= observed
+
+
+def _folder_rename_keeps_identity(source: Path, destination: Path) -> bool:
+    """Keep milestone/version numbers and descriptive folder subjects."""
+    import re
+    if source.parent != destination.parent or source == destination:
+        return False
+    source_name = source.name
+    destination_name = destination.name
+    source_numbers = set(re.findall(r"\d+", source_name))
+    destination_numbers = set(re.findall(r"\d+", destination_name))
+    if not source_numbers <= destination_numbers:
+        return False
+    source_codes = {
+        token.casefold() for token in re.findall(r"[^\W_]+", source_name)
+        if (len(token) >= 2 and token.isupper())
+        or (any(char.isalpha() for char in token) and any(char.isdigit() for char in token))
+    }
+    destination_codes = {token.casefold() for token in re.findall(r"[^\W_]+", destination_name)}
+    if not source_codes <= destination_codes:
+        return False
+    source_subjects = _words(source_name) - _DESTINATION_GENERIC
+    destination_subjects = _words(destination_name)
+    return source_subjects <= destination_subjects
+
+
+def _grouping_move_key(proposal: Proposal) -> tuple[str, str, str] | None:
+    """Identify deterministic group moves, without constraining direct file moves."""
+    reasoning = proposal.reasoning or ""
+    if reasoning.startswith("Cluster move "):
+        kind = "cluster"
+    elif reasoning.startswith("Root-level ") and " grouping with other " in reasoning:
+        kind = "backstop"
+    else:
+        return None
+    destination = Path(proposal.proposed_value or "")
+    return kind, reasoning if kind == "cluster" else "", str(destination.parent).casefold()
+
+
+def _suppress_unsafe_organizer_proposals(session_id: str, root_path: str) -> dict:
+    """Last gate catches LLM, cluster and deterministic post-pass proposals."""
+    from donedatahoarder.core.dependency_protection import ProtectionIndex
+    from donedatahoarder.db.models import RelationGroup, RelationMember
+
+    root = Path(root_path).resolve()
+    protected_index = ProtectionIndex(root)
+    removed = {"move": 0, "rename_folder": 0}
+    reasons: dict[str, int] = {}
+    examples: list[dict[str, str]] = []
+    with Session(get_engine()) as db:
+        sequence_ids = {
+            fid for (fid,) in (
+                db.query(RelationMember.file_id)
+                .join(RelationGroup, RelationMember.group_id == RelationGroup.id)
+                .filter(RelationGroup.session_id == session_id,
+                        RelationGroup.label.like("frame_sequence_%"))
+            )
+        }
+        sequence_dirs = {
+            Path(path).parent for (path,) in db.query(File.path).filter(File.id.in_(sequence_ids))
+        } if sequence_ids else set()
+        proposals = (
+            db.query(Proposal, File)
+            .join(File, Proposal.file_id == File.id)
+            .filter(File.session_id == session_id, Proposal.status == ProposalStatus.PENDING,
+                    Proposal.proposal_type.in_([ProposalType.MOVE, ProposalType.RENAME_FOLDER]))
+            .all()
+        )
+        folder_destinations: dict[str, int] = {}
+        for proposal, _ in proposals:
+            if proposal.proposal_type == ProposalType.RENAME_FOLDER and proposal.proposed_value:
+                destination_key = str(Path(proposal.proposed_value)).casefold()
+                folder_destinations[destination_key] = folder_destinations.get(destination_key, 0) + 1
+        allowed_by_id: dict[int, bool] = {}
+        reason_by_id: dict[int, str] = {}
+        for proposal, file_rec in proposals:
+            if proposal.proposal_type == ProposalType.MOVE:
+                source = Path(file_rec.path)
+                protection = protected_index.assess(source)
+                allowed = bool(proposal.proposed_value) and _organizer_move_allowed(
+                    file_rec, Path(proposal.proposed_value), root, protected_index, sequence_ids
+                )
+                destination = Path(proposal.proposed_value or "")
+                grouping = _grouping_move_key(proposal)
+                redundant_nesting = bool(
+                    grouping and source.parent == destination.parent.parent
+                    and source.parent.name.casefold() == destination.parent.name.casefold()
+                )
+                if redundant_nesting:
+                    allowed = False
+                reason = (
+                    "Numbered frame sequence must keep its folder and order" if file_rec.id in sequence_ids
+                    else f"Protected resource: {protection.reason}" if protection.protected
+                    else "Grouping would repeat the existing folder name" if redundant_nesting
+                    else "Destination project or subject lacks source evidence"
+                )
+            else:
+                source = Path(proposal.current_value or "")
+                protection = protected_index.assess(source)
+                try:
+                    relative = source.relative_to(root)
+                except ValueError:
+                    allowed = False
+                else:
+                    # Preserve project roots and folders containing protected
+                    # references or a numbered frame sequence.
+                    allowed = (
+                        len(relative.parts) > 1
+                        and not protection.protected
+                        and bool(proposal.proposed_value)
+                        and _folder_rename_keeps_identity(source, Path(proposal.proposed_value or ""))
+                        and folder_destinations.get(str(Path(proposal.proposed_value or "")).casefold(), 0) == 1
+                        and not any(directory == source or source in directory.parents
+                                    for directory in sequence_dirs)
+                    )
+                reason = (
+                    f"Protected resource: {protection.reason}" if protection.protected
+                    else "Numbered frame sequence folder must keep its identity"
+                    if any(directory == source or source in directory.parents for directory in sequence_dirs)
+                    else "Folder rename loses identity, collides, or has an invalid destination"
+                )
+            allowed_by_id[proposal.id] = allowed
+            reason_by_id[proposal.id] = reason
+
+        # A grouping only makes sense if at least two members survive the
+        # evidence/dependency gate. Direct per-file moves are unaffected.
+        surviving_groups: dict[tuple[str, str, str], int] = {}
+        for proposal, _ in proposals:
+            if proposal.proposal_type != ProposalType.MOVE or not allowed_by_id[proposal.id]:
+                continue
+            key = _grouping_move_key(proposal)
+            if key is not None:
+                surviving_groups[key] = surviving_groups.get(key, 0) + 1
+
+        for proposal, file_rec in proposals:
+            allowed = allowed_by_id[proposal.id]
+            reason = reason_by_id[proposal.id]
+            if allowed and proposal.proposal_type == ProposalType.MOVE:
+                key = _grouping_move_key(proposal)
+                if key is not None and surviving_groups[key] < 2:
+                    allowed = False
+                    reason = "Grouping would leave a one-file folder after safety filters"
+            if not allowed:
+                removed[proposal.proposal_type.value] += 1
+                reasons[reason] = reasons.get(reason, 0) + 1
+                if len(examples) < 12:
+                    examples.append({"source": str(proposal.current_value or file_rec.path),
+                                     "destination": proposal.proposed_value or "",
+                                     "reason": reason})
+                db.delete(proposal)
+        db.commit()
+    return {**removed, "reasons": reasons, "examples": examples}
+
 logger = logging.getLogger(__name__)
 
 # LIKE escape that will not show up as a path separator.
@@ -57,7 +253,7 @@ def _path_within_folder(folder: str, file_path: str) -> bool:
     return True
 
 
-def generate_reorg_proposals(session_id: str) -> dict:
+def _generate_reorg_proposals_impl(session_id: str) -> dict:
     """
     Analyze the folder tree and generate MOVE and RENAME_FOLDER proposals for reorganization.
 
@@ -444,12 +640,30 @@ def generate_reorg_proposals(session_id: str) -> dict:
     except Exception:
         pass
 
+    # Apply one evidence gate after LLM, relation-group, and deterministic
+    # passes. In particular, the relation post-pass must not split the 503
+    # numbered frames into a new folder or move path-dependent CAD resources.
+    suppressed = _suppress_unsafe_organizer_proposals(session_id, root_path)
+    if suppressed["move"] or suppressed["rename_folder"]:
+        counts["suppressed_unsafe"] = suppressed["move"] + suppressed["rename_folder"]
+        counts["suppression_reasons"] = suppressed["reasons"]
+        counts["suppression_examples"] = suppressed["examples"]
+        counts["move"] -= suppressed["move"]
+        counts["rename_folder"] -= suppressed["rename_folder"]
+
     return counts
 
 
 # ---------------------------------------------------------------------------
 # Background-job-friendly wrapper
 # ---------------------------------------------------------------------------
+
+def generate_reorg_proposals(session_id: str) -> dict:
+    """Write organization proposals under the database's cross-process lock."""
+    from donedatahoarder.core.process_lock import operation_lock
+
+    with operation_lock("organize files"):
+        return _generate_reorg_proposals_impl(session_id)
 
 def generate_reorg_proposals_with_progress(
     session_id: str,
@@ -506,7 +720,8 @@ def generate_reorg_proposals_with_progress(
         daemon=True,
         name="organize-worker",
     )
-    worker.start()
+    from donedatahoarder.core.jobs import job_manager
+    job_manager.start_tracked_worker(worker)
 
     while True:
         try:

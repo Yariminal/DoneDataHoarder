@@ -23,6 +23,8 @@ Installation:
 See INSTALL.md for platform-specific ffmpeg setup instructions.
 """
 import io
+import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -83,7 +85,7 @@ def _get_duration_seconds(path: Path) -> Optional[float]:
 
 def _extract_frame(path: Path, timestamp: float) -> Optional[bytes]:
     """Extract a single frame at *timestamp* seconds, return JPEG bytes."""
-    if not _HAS_FFMPEG:
+    if not _HAS_FFMPEG or not shutil.which("ffmpeg"):
         return None
     try:
         # Use subprocess directly to allow timeout, as ffmpeg-python .run() has no timeout
@@ -123,19 +125,25 @@ def _get_whisper_model(model_size: str = WHISPER_MODEL):
         _whisper_lock = threading.Lock()
     with _whisper_lock:
         if _whisper_model_instance is None:
+            offline = any(
+                os.environ.get(key, "").lower() in ("1", "true", "yes", "on")
+                for key in ("HF_HUB_OFFLINE", "HUGGINGFACE_HUB_OFFLINE",
+                            "TRANSFORMERS_OFFLINE")
+            )
             _whisper_model_instance = WhisperModel(
                 model_size, device="cpu", compute_type="int8",
+                local_files_only=offline,
             )
         return _whisper_model_instance
 
 
-def _transcribe(path: Path, model_size: str = WHISPER_MODEL) -> str:
-    """Transcribe audio/video with faster-whisper, return text excerpt.
+def _transcribe_with_reason(path: Path, model_size: str = WHISPER_MODEL) -> tuple[str, str | None]:
+    """Transcribe and report when an offline model is unavailable.
 
     Uses CPU to avoid GPU memory conflicts with Ollama.
     """
     if not _HAS_WHISPER:
-        return ""
+        return "", "missing_dependency"
     try:
         import concurrent.futures
         def _do_transcribe():
@@ -153,11 +161,20 @@ def _transcribe(path: Path, model_size: str = WHISPER_MODEL) -> str:
         # Timeout transcription to prevent hangs on large files
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(_do_transcribe)
-            return future.result(timeout=60)
+            return future.result(timeout=60), None
     except concurrent.futures.TimeoutError:
-        return ""
-    except Exception:
-        return ""
+        return "", "unreadable_content"
+    except Exception as exc:
+        # faster-whisper delegates offline cache lookup to huggingface-hub.
+        # A missing local snapshot is a missing model, not bad media bytes.
+        if type(exc).__name__ == "LocalEntryNotFoundError":
+            return "", "missing_dependency"
+        return "", "unreadable_content"
+
+
+def _transcribe(path: Path, model_size: str = WHISPER_MODEL) -> str:
+    """Compatibility helper returning only the locally available transcript."""
+    return _transcribe_with_reason(path, model_size)[0]
 
 
 VIDEO_PROMPT = """\
@@ -223,7 +240,7 @@ class VideoAnalyzer(BaseAnalyzer):
             file_rec.mime_type and file_rec.mime_type.startswith("audio/")
         )
 
-        transcript = _transcribe(path, self._whisper_model)
+        transcript, transcript_reason = _transcribe_with_reason(path, self._whisper_model)
         transcript_section = (
             f"Audio transcript excerpt:\n---\n{transcript}\n---"
             if transcript
@@ -256,6 +273,12 @@ class VideoAnalyzer(BaseAnalyzer):
                 )
             result = AnalysisResult.from_ai_response(data)
             result.transcript = transcript
+            result.evidence_source = "text" if transcript else "filename_only"
+            result.extractor = "whisper_transcript" if transcript else "none"
+            result.content_chars = len(transcript)
+            if not transcript:
+                result.content_available = False
+                result.reason = transcript_reason or "unreadable_content"
 
             # Lower confidence slightly if critical tools are missing
             if not _HAS_WHISPER:
@@ -270,10 +293,11 @@ class VideoAnalyzer(BaseAnalyzer):
         frames: list[bytes] = []
         ffmpeg_warning = ""
 
-        if not _HAS_FFMPEG:
-            # ffmpeg not available — can't extract frames, but still analyze with transcript
+        ffmpeg_ready = bool(_HAS_FFMPEG and shutil.which("ffmpeg") and shutil.which("ffprobe"))
+        if not ffmpeg_ready:
+            # A Python wrapper alone cannot decode media without both executables.
             ffmpeg_warning = (
-                "\n⚠ ffmpeg not installed: video frame extraction unavailable. "
+                "\n⚠ ffmpeg or ffprobe executable unavailable: video frame extraction unavailable. "
                 "Analysis based on transcript/metadata only. "
                 "Install ffmpeg for full video analysis: https://ffmpeg.org/download.html"
             )
@@ -318,9 +342,15 @@ class VideoAnalyzer(BaseAnalyzer):
 
         result = AnalysisResult.from_ai_response(data)
         result.transcript = transcript
+        result.evidence_source = "vision" if frames else "text" if transcript else "filename_only"
+        result.extractor = "ffmpeg_frames" if frames else "whisper_transcript" if transcript else "none"
+        result.content_chars = len(transcript)
+        if not frames and not transcript:
+            result.content_available = False
+            result.reason = "missing_dependency" if not ffmpeg_ready or transcript_reason == "missing_dependency" else "unreadable_content"
 
         # Lower confidence if critical tools are missing
-        if not _HAS_FFMPEG:
+        if not ffmpeg_ready:
             result.confidence = max(0.0, result.confidence - 0.20)
         if not _HAS_WHISPER:
             result.confidence = max(0.0, result.confidence - 0.10)

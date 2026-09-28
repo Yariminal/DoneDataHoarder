@@ -5,6 +5,7 @@ before/after organize tree builders.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -13,27 +14,101 @@ from starlette.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from donedatahoarder.db.models import (
+    BackgroundJob,
+    DuplicateGroup,
+    DuplicateMember,
     File,
     FileStatus,
     Proposal,
     ProposalStatus,
     ProposalType,
+    RunPlan,
     UserSession,
 )
 from donedatahoarder.db.session import get_engine
 
-from .deps import _mark_session_unsaved, _require_session_id, _resolve_model
-from .schemas import ExecuteRequest, PipelineRequest
+from .deps import _mark_session_unsaved, _require_session_id, _resolve_model, review_execute_lock, review_operation
+from .schemas import ExecuteRequest, PipelineRequest, ResumeRunPlanRequest, RunPlanRequest
 
 router = APIRouter()
+
+
+def _require_worker_exit(job_manager) -> None:
+    # force_cancel() clears the active slot before a blocked worker exits.
+    if job_manager.get_active() is None and job_manager.has_live_workers():
+        raise HTTPException(409, "Wait for the cancelled pipeline worker to exit")
 
 
 # ---------------------------------------------------------------------------
 # Execute
 # ---------------------------------------------------------------------------
 
+def _execute_preview(session_id: str) -> dict:
+    from donedatahoarder.executor import plan_execution, select_executable_proposals
+
+    if not session_id or not session_id.strip():
+        raise HTTPException(400, "No active session. Create or load a session first.")
+    engine = get_engine()
+    with Session(engine) as db:
+        user_session = db.get(UserSession, session_id)
+        if user_session is None:
+            raise HTTPException(404, "Session not found")
+        proposals = select_executable_proposals(db, session_id=session_id)
+        planned = plan_execution(db, proposals, Path(user_session.root_path)) if proposals else []
+        proposal_by_id = {proposal.id: proposal for proposal in proposals}
+        items = []
+        for step in planned:
+            proposal = proposal_by_id[step.proposal_id]
+            file = db.get(File, proposal.file_id)
+            item = {
+                "id": proposal.id,
+                "type": proposal.proposal_type.value,
+                "status": proposal.status.value,
+                "source": step.source or (file.path if file else ""),
+                "destination": step.destination or "",
+                "keeper": step.keeper or "",
+                "error": step.error,
+                "confidence": proposal.confidence,
+            }
+            if proposal.proposal_type == ProposalType.MARK_DUPLICATE:
+                groups = (
+                    db.query(DuplicateGroup)
+                    .join(DuplicateMember, DuplicateMember.group_id == DuplicateGroup.id)
+                    .filter(DuplicateMember.file_id == proposal.file_id,
+                            DuplicateGroup.session_id == session_id)
+                    .all()
+                )
+                item["keeper_groups"] = sorted(
+                    (group.id, group.keep_file_id) for group in groups
+                )
+            items.append(item)
+    by_type: dict[str, int] = {}
+    for item in items:
+        by_type[item["type"]] = by_type.get(item["type"], 0) + 1
+    # Bind the user's confirmation to the precise proposal values displayed.
+    fingerprint = json.dumps([session_id, user_session.root_path, items], sort_keys=True, separators=(",", ":"))
+    token = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+    return {"session_id": session_id, "total": len(items),
+            "errors": sum(bool(item["error"]) for item in items),
+            "by_type": by_type, "items": items, "token": token}
+
+
+@router.get("/execute/preview")
+def preview_execution(session_id: str):
+    """Show exactly which reviewed proposals the default commit would select."""
+    with review_operation("preview execution"):
+        return _execute_preview(session_id)
+
+
 @router.post("/execute")
 def execute_proposals(body: ExecuteRequest):
+    # A preview remains valid only while review decisions and proposal values
+    # cannot change. Keep this lock through the filesystem commit and DB writes.
+    with review_operation("commit reviewed proposals"):
+        return _execute_proposals_locked(body)
+
+
+def _execute_proposals_locked(body: ExecuteRequest):
     from donedatahoarder.executor import execute as do_execute, _make_quiet_console
 
     sid = body.session_id
@@ -47,6 +122,7 @@ def execute_proposals(body: ExecuteRequest):
     if body.dry_run:
         from donedatahoarder.core.jobs import job_manager
         try:
+            _require_worker_exit(job_manager)
             job_id = job_manager.start_execute_dry(
                 session_id=sid,
                 min_confidence=body.min_confidence,
@@ -55,10 +131,23 @@ def execute_proposals(body: ExecuteRequest):
         except RuntimeError as exc:
             raise HTTPException(409, str(exc))
 
+    preview = _execute_preview(sid)
+    if not body.preview_token:
+        raise HTTPException(400, "Preview the reviewed changes before committing")
+    if body.preview_token != preview["token"]:
+        raise HTTPException(409, "Reviewed changes have changed. Preview again before committing")
+    if not preview["items"]:
+        raise HTTPException(400, "No approved or edited proposals to commit")
+    if preview["errors"]:
+        raise HTTPException(409, "Preview has failing actions. Resolve or reject them before committing")
+    from donedatahoarder.core.jobs import job_manager
+    if job_manager.get_active() is not None or job_manager.has_live_workers():
+        raise HTTPException(409, "Wait for the pipeline worker to exit before committing")
     counts = do_execute(
         dry_run=body.dry_run,
         min_confidence=body.min_confidence,
         session_id=sid,
+        proposal_ids=[item["id"] for item in preview["items"]],
         _console=_make_quiet_console(),
     )
     _mark_session_unsaved(sid, step="execute")
@@ -109,6 +198,11 @@ def execute_proposals(body: ExecuteRequest):
 
 @router.post("/pipeline/scan")
 def trigger_scan(body: PipelineRequest):
+    with review_operation("scan session"):
+        return _trigger_scan_locked(body)
+
+
+def _trigger_scan_locked(body: PipelineRequest):
     from donedatahoarder.core.scanner import scan as do_scan
     import io
     import contextlib
@@ -154,7 +248,9 @@ def trigger_enrich(body: PipelineRequest = PipelineRequest()):
 
     try:
         sid = _require_session_id(body.session_id)
-        job_id = job_manager.start_enrich(session_id=sid)
+        with review_execute_lock:
+            _require_worker_exit(job_manager)
+            job_id = job_manager.start_enrich(session_id=sid)
         return {"job_id": job_id, "status": "started"}
     except RuntimeError as exc:
         raise HTTPException(409, str(exc))
@@ -171,7 +267,9 @@ def trigger_dedup(body: PipelineRequest = PipelineRequest()):
 
     try:
         sid = _require_session_id(body.session_id)
-        job_id = job_manager.start_dedup(session_id=sid)
+        with review_execute_lock:
+            _require_worker_exit(job_manager)
+            job_id = job_manager.start_dedup(session_id=sid)
         return {"job_id": job_id, "status": "started"}
     except RuntimeError as exc:
         raise HTTPException(409, str(exc))
@@ -209,12 +307,14 @@ def trigger_relate(body: PipelineRequest = PipelineRequest()):
             if us and getattr(us, "relate_scope", None):
                 scope = us.relate_scope
 
-        job_id = job_manager.start_relate(
-            session_id=sid,
-            backend=body.backend,
-            model=model,
-            scope=scope,
-        )
+        with review_execute_lock:
+            _require_worker_exit(job_manager)
+            job_id = job_manager.start_relate(
+                session_id=sid,
+                backend=body.backend,
+                model=model,
+                scope=scope,
+            )
         return {"job_id": job_id, "status": "started", "model": model, "scope": scope}
     except RuntimeError as exc:
         raise HTTPException(409, str(exc))
@@ -281,12 +381,15 @@ def trigger_analyze(body: PipelineRequest):
                 if us and not us.model:
                     us.model = model
                     db.commit()
-        job_id = job_manager.start_analyze(
-            session_id=sid,
-            backend=body.backend,
-            model=model,
-            workers=body.workers,
-        )
+        with review_execute_lock:
+            _require_worker_exit(job_manager)
+            job_id = job_manager.start_analyze(
+                session_id=sid,
+                backend=body.backend,
+                model=model,
+                workers=body.workers,
+                retry_errors=body.retry_errors,
+            )
         return {"job_id": job_id, "status": "started"}
     except RuntimeError as exc:
         raise HTTPException(409, str(exc))
@@ -299,6 +402,127 @@ def trigger_analyze(body: PipelineRequest):
 # ---------------------------------------------------------------------------
 # Job control endpoints (pause, resume, stream, active)
 # ---------------------------------------------------------------------------
+
+def _owned_run_plan(plan_id: str, session_id: str) -> dict:
+    from donedatahoarder.core.jobs import job_manager
+    plan = job_manager.get_run_plan(plan_id)
+    if not plan or plan["session_id"] != _require_session_id(session_id):
+        raise HTTPException(404, "Run plan not found in this session")
+    return plan
+
+
+@router.post("/pipeline/runs")
+def create_run_plan(body: RunPlanRequest):
+    """Store the plan before launch; the server owns every phase checkpoint."""
+    from donedatahoarder.core.jobs import job_manager
+    sid = _require_session_id(body.session_id)
+    with review_operation("create run plan"):
+        with Session(get_engine()) as db:
+            owner = db.get(UserSession, sid)
+            if owner is None:
+                raise HTTPException(404, "Session not found")
+            chosen_root = body.root_path or owner.root_path
+            if not chosen_root or not chosen_root.strip():
+                raise HTTPException(400, "Choose a folder for this session before starting")
+            root = Path(chosen_root).resolve()
+            if not root.is_dir():
+                raise HTTPException(400, "Run folder does not exist")
+            if body.root_path and owner.root_path and root != Path(owner.root_path).resolve():
+                raise HTTPException(409, "Run folder differs from the saved session folder")
+            if not owner.root_path:
+                owner.root_path = str(root)
+                db.commit()
+            options = {
+                "root_path": str(root), "skip_dirs": body.skip_dirs,
+                "backend": body.backend or owner.backend or "ollama",
+                "analyze_model": _resolve_model(body.analyze_model or body.model, sid, "analyze"),
+                "propose_model": _resolve_model(body.propose_model or body.model, sid, "propose"),
+                "workers": max(1, body.workers),
+                "relate_scope": body.relate_scope or owner.relate_scope or "per_directory",
+            }
+        try:
+            plan_id = job_manager.create_run_plan(sid, body.steps, options)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+    # Worker acquisition occurs after the review lock is released.
+    try:
+        job_id = job_manager.advance_run_plan(plan_id)
+    except RuntimeError as exc:
+        raise HTTPException(409, f"Run plan saved; start it from its ready state: {exc}") from exc
+    return {"plan": job_manager.get_run_plan(plan_id), "job_id": job_id}
+
+
+@router.get("/pipeline/runs/latest")
+def latest_run_plan(session_id: str):
+    from donedatahoarder.core.jobs import job_manager
+    sid = _require_session_id(session_id)
+    job_manager.reconcile_startup()
+    with Session(get_engine()) as db:
+        row = (db.query(RunPlan).filter(RunPlan.session_id == sid)
+               .order_by(RunPlan.created_at.desc()).first())
+        if row is None:
+            return {"plan": None}
+        plan_id = row.id
+        last_job = (db.query(BackgroundJob).filter(BackgroundJob.run_plan_id == plan_id)
+                    .order_by(BackgroundJob.started_at.desc()).first())
+        failure = {"phase": last_job.job_type, "error": last_job.error} if last_job and last_job.error else None
+    return {"plan": job_manager.get_run_plan(plan_id), "last_failure": failure}
+
+
+@router.get("/pipeline/runs/{plan_id}")
+def run_plan_status(plan_id: str, session_id: str):
+    return {"plan": _owned_run_plan(plan_id, session_id)}
+
+
+@router.post("/pipeline/runs/{plan_id}/resume")
+def resume_run_plan(plan_id: str, body: ResumeRunPlanRequest):
+    from donedatahoarder.core.jobs import job_manager
+    _owned_run_plan(plan_id, body.session_id)
+    try:
+        job_id = job_manager.resume_run_plan(plan_id, retry_errors=body.retry_errors)
+    except (KeyError, RuntimeError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"plan": job_manager.get_run_plan(plan_id), "job_id": job_id}
+
+
+@router.post("/pipeline/runs/{plan_id}/advance")
+def advance_run_plan(plan_id: str, body: ResumeRunPlanRequest):
+    from donedatahoarder.core.jobs import job_manager
+    plan = _owned_run_plan(plan_id, body.session_id)
+    if plan["state"] != "ready":
+        raise HTTPException(409, "Only a ready run can be started")
+    try:
+        job_id = job_manager.advance_run_plan(plan_id)
+    except (KeyError, RuntimeError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"plan": job_manager.get_run_plan(plan_id), "job_id": job_id}
+
+
+@router.post("/pipeline/runs/{plan_id}/cancel")
+def cancel_run_plan(plan_id: str, body: ResumeRunPlanRequest):
+    from donedatahoarder.core.jobs import job_manager
+    _owned_run_plan(plan_id, body.session_id)
+    job_manager.cancel_run_plan(plan_id)
+    return {"plan": job_manager.get_run_plan(plan_id)}
+
+
+@router.get("/pipeline/analyze/errors")
+def analysis_errors(session_id: str):
+    """Show retryable provider errors separately from unsupported content."""
+    sid = _require_session_id(session_id)
+    with Session(get_engine()) as db:
+        if db.get(UserSession, sid) is None:
+            raise HTTPException(404, "Session not found")
+        failures = (db.query(File).filter(File.session_id == sid, File.status == FileStatus.ERROR)
+                    .all())
+        reasons: dict[str, int] = {}
+        for file in failures:
+            reason = file.analysis_reason or "unknown"
+            reasons[reason] = reasons.get(reason, 0) + 1
+        retryable = sum(count for reason, count in reasons.items() if reason.startswith("provider_"))
+    return {"total": len(failures), "retryable": retryable, "reasons": reasons}
 
 @router.get("/pipeline/jobs/active")
 def get_active_job():
@@ -365,17 +589,12 @@ def resume_job(job_id: str):
 
 @router.post("/pipeline/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):
-    """Cancel a running or paused job.
-
-    Sets the cooperative cancel flag first, then immediately force-finishes
-    the job so the UI reflects the cancellation and new jobs can start.
-    The worker thread (if stuck on an Ollama call) will eventually exit
-    on its own since it's a daemon thread.
-    """
+    """Request cancellation; the worker lease persists until it actually exits."""
     from donedatahoarder.core.jobs import job_manager
     try:
         job_manager.force_cancel(job_id)
-        return {"status": "cancelled", "job_id": job_id}
+        current = job_manager.get_job(job_id)
+        return {"status": current.state.value if current else "cancelling", "job_id": job_id}
     except (KeyError, RuntimeError) as exc:
         raise HTTPException(400, str(exc))
 
@@ -388,11 +607,13 @@ def trigger_propose(body: PipelineRequest = PipelineRequest()):
     try:
         sid = _require_session_id(body.session_id)
         model = _resolve_model(body.model, sid, step="propose")
-        job_id = job_manager.start_propose(
-            session_id=sid,
-            backend=body.backend,
-            model=model,
-        )
+        with review_execute_lock:
+            _require_worker_exit(job_manager)
+            job_id = job_manager.start_propose(
+                session_id=sid,
+                backend=body.backend,
+                model=model,
+            )
         return {"job_id": job_id, "status": "started"}
     except RuntimeError as exc:
         raise HTTPException(409, str(exc))
@@ -622,11 +843,13 @@ def trigger_organize(body: PipelineRequest = PipelineRequest()):
     try:
         sid = _require_session_id(body.session_id)
         model = _resolve_model(body.model, sid, step="propose")
-        job_id = job_manager.start_organize(
-            session_id=sid,
-            backend=body.backend,
-            model=model,
-        )
+        with review_execute_lock:
+            _require_worker_exit(job_manager)
+            job_id = job_manager.start_organize(
+                session_id=sid,
+                backend=body.backend,
+                model=model,
+            )
         return {"job_id": job_id, "status": "started", "model": model}
     except RuntimeError as exc:
         raise HTTPException(409, str(exc))

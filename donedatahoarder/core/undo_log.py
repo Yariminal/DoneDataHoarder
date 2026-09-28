@@ -11,9 +11,12 @@ import hashlib
 import json
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+from donedatahoarder.core.process_lock import operation_lock
 
 
 # ---------------------------------------------------------------------------
@@ -22,6 +25,11 @@ from typing import Any, Optional
 
 def get_datahoarder_dir() -> Path:
     """Get the DoneDataHoarder data directory (~/.datahoarder)."""
+    override = os.environ.get("DDH_DATA_DIR")
+    if override:
+        dh_dir = Path(override).expanduser().resolve()
+        dh_dir.mkdir(parents=True, exist_ok=True)
+        return dh_dir
     if os.name == "nt":
         base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
     else:
@@ -35,6 +43,8 @@ def get_undo_log_path(session_id: Optional[str] = None) -> Path:
     """Get path to the undo log file."""
     dh_dir = get_datahoarder_dir()
     if session_id:
+        if Path(session_id).name != session_id or any(c in session_id for c in ("/", "\\")):
+            raise ValueError("Invalid session_id for undo log")
         # Session-specific log for isolated undo
         return dh_dir / f"undo_{session_id}.log"
     return dh_dir / "undo.log"
@@ -70,24 +80,62 @@ def log_operation(
     """
     original = Path(original_path)
     sha256 = ""
-    if original.exists() and original.is_file():
+    source_type = ("symlink" if original.is_symlink() else
+                   "file" if original.is_file() else
+                   "directory" if original.is_dir() else "missing")
+    directory_identity = None
+    if source_type == "directory":
+        stat = original.stat()
+        directory_identity = [stat.st_dev, stat.st_ino]
+    if operation != "TAGS" and original.exists() and original.is_file():
         sha256 = _compute_sha256(original)
 
     entry = {
+        "operation_id": str(uuid.uuid4()),
+        "phase": "intent",
         "operation": operation,
         "original_path": original_path,
         "new_path": new_path,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "sha256": sha256,
+        "source_type": source_type,
+        "directory_identity": directory_identity,
         "session_id": session_id,
         "extra": extra or {},
     }
 
     log_path = get_undo_log_path(session_id)
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    _append_entry(log_path, entry)
 
     return entry
+
+
+def _append_entry(log_path: Path, entry: dict) -> None:
+    """Flush a journal event before the next filesystem transition."""
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def complete_operation(entry: dict) -> None:
+    """Record that the filesystem transition finished."""
+    _append_entry(get_undo_log_path(entry.get("session_id")), {
+        "operation": "OP_COMPLETE",
+        "operation_id": entry["operation_id"],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "session_id": entry.get("session_id"),
+    })
+
+
+def complete_database_operation(entry: dict) -> None:
+    """Record that the indexed state was committed after the disk change."""
+    _append_entry(get_undo_log_path(entry.get("session_id")), {
+        "operation": "DB_COMPLETE",
+        "operation_id": entry["operation_id"],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "session_id": entry.get("session_id"),
+    })
 
 
 def _safe_path(path_str: str) -> Path:
@@ -118,48 +166,208 @@ def parse_undo_log(session_id: Optional[str] = None) -> list[dict]:
 
 def get_last_session_entries(session_id: Optional[str] = None) -> list[dict]:
     """
-    Get entries from the most recent session.
-
-    If session_id is provided, gets entries for that session.
-    Otherwise, gets entries since the last undo marker or from the last timestamp group.
+    Get outstanding operations for one session. Without a session ID, return
+    the most recent five-minute group in the legacy global log.
     """
-    all_entries = parse_undo_log(session_id)
-
+    events = parse_undo_log(session_id)
+    operations: list[dict] = []
+    by_id: dict[str, dict] = {}
+    undone: set[str] = set()
+    legacy_pending: list[dict] = []
+    for event in events:
+        op = event.get("operation")
+        op_id = event.get("operation_id")
+        if op == "OP_COMPLETE":
+            if op_id in by_id:
+                by_id[op_id]["phase"] = "complete"
+        elif op == "DB_COMPLETE":
+            if op_id in by_id:
+                by_id[op_id]["_db_complete"] = True
+        elif op == "UNDO_COMPLETE":
+            undone.add(op_id)
+        elif op == "UNDO_MARKER":
+            # Legacy markers contain a count only. They cannot identify which
+            # operations succeeded in a partial undo, so exclude that many
+            # preceding legacy entries rather than replaying possible restores.
+            for _ in range(min(int(event.get("undone_count", 0)), len(legacy_pending))):
+                legacy_pending.pop()["_legacy_undone"] = True
+        elif op in {"MOVE", "RENAME", "RENAME_FOLDER", "TRASH", "DELETE", "JUNK_TRASH", "TAGS"}:
+            operation = event.copy()
+            if not operation.get("phase"):
+                operation["phase"] = "complete"  # legacy post-move log
+            operations.append(operation)
+            if op_id:
+                by_id[op_id] = operation
+            else:
+                legacy_pending.append(operation)
     if session_id:
-        return [e for e in all_entries if e.get("session_id") == session_id]
-
-    # Find the last batch of operations (grouped by timestamp within 1 hour)
-    if not all_entries:
+        return [e for e in operations if e.get("session_id") == session_id
+                and _entry_id(e) not in undone and not e.get("_legacy_undone")]
+    if not operations:
         return []
-
-    # Get the most recent timestamp
-    last_ts = datetime.fromisoformat(all_entries[-1]["timestamp"])
-
-    # Collect entries from the same "session" (within 5 minutes of each other)
-    session_entries = []
-    cutoff = last_ts.timestamp() - 300  # 5 minutes before last entry
-
-    for entry in reversed(all_entries):
-        entry_ts = datetime.fromisoformat(entry["timestamp"])
-        if entry_ts.timestamp() >= cutoff:
-            session_entries.insert(0, entry)
-        else:
-            break
-
-    return session_entries
+    last_ts = datetime.fromisoformat(operations[-1]["timestamp"]).timestamp()
+    return [e for e in operations
+            if datetime.fromisoformat(e["timestamp"]).timestamp() >= last_ts - 300
+            and _entry_id(e) not in undone and not e.get("_legacy_undone")]
 
 
 # ---------------------------------------------------------------------------
 # Undo operations
 # ---------------------------------------------------------------------------
 
-def undo_operations(
+def _entry_id(entry: dict) -> str:
+    """Stable identity for new and pre-journal legacy operations."""
+    return entry.get("operation_id") or hashlib.sha256(
+        json.dumps(entry, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _replace_prefix(value: str, old: str, new: str) -> str:
+    if value == old:
+        return new
+    for sep in ("/", "\\"):
+        if value.startswith(old + sep):
+            return new + value[len(old):]
+    return value
+
+
+def _remove_created_empty_dirs(entry: dict) -> None:
+    """Remove only directories the journal says this operation created."""
+    created = (entry.get("extra") or {}).get("created_dirs") or []
+    for raw in reversed(created):
+        directory = Path(raw)
+        try:
+            directory.rmdir()
+        except OSError:
+            # A non-empty directory may contain another operation or a user
+            # file, so it must be left in place.
+            pass
+
+
+def _assert_proposal_state(entry: dict, *, allow_restored: bool = False) -> None:
+    """Refuse to overwrite review edits made after this operation committed."""
+    expected = (entry.get("extra") or {}).get("proposal_expected") or []
+    if not expected:
+        return  # older journals did not record post-operation review state
+    from sqlalchemy.orm import Session
+    from donedatahoarder.db.models import Proposal
+    from donedatahoarder.db.session import get_engine
+
+    extra = entry.get("extra") or {}
+    prior = {snapshot["id"]: snapshot for snapshot in extra.get("proposal_snapshots", [])}
+    prior_status = extra.get("proposal_status")
+    with Session(get_engine()) as db:
+        current = {row["id"]: db.get(Proposal, row["id"]) for row in expected}
+        if any(proposal is None for proposal in current.values()):
+            raise ValueError("A journaled proposal is missing; review undo manually")
+
+        def matches(row: dict, *, restored: bool) -> bool:
+            proposal = current[row["id"]]
+            prior_row = prior.get(row["id"])
+            if restored and prior_row is not None:
+                target = prior_row
+            elif restored and row["id"] == extra.get("proposal_id"):
+                target = {**row, "status": prior_status}
+            else:
+                target = row
+            return (proposal.current_value == target["current_value"]
+                    and proposal.proposed_value == target["proposed_value"]
+                    and proposal.status.value == target["status"])
+
+        if all(matches(row, restored=False) for row in expected):
+            return
+        if allow_restored and all(matches(row, restored=True) for row in expected):
+            return
+    raise ValueError("Proposal changed after execution; undo would overwrite a review edit")
+
+
+def _restore_database(entry: dict) -> None:
+    """Reconcile indexed paths and review state after filesystem restoration."""
+    from sqlalchemy.orm import Session
+    from donedatahoarder.db.models import File, FileStatus, Proposal, ProposalStatus
+    from donedatahoarder.db.session import get_engine
+
+    extra = entry.get("extra") or {}
+    source = entry["original_path"]
+    destination = entry["new_path"]
+    session_id = entry.get("session_id")
+    with Session(get_engine()) as db:
+        if entry["operation"] == "RENAME_FOLDER":
+            files = db.query(File).filter(File.path.like(f"{destination}%"))
+            if session_id:
+                files = files.filter(File.session_id == session_id)
+            for file in files.all():
+                restored = _replace_prefix(file.path, destination, source)
+                if restored != file.path:
+                    file.path = restored
+                    file.filename = Path(restored).name
+            if not extra.get("proposal_snapshots"):
+                proposals = db.query(Proposal).join(File)
+                if session_id:
+                    proposals = proposals.filter(File.session_id == session_id)
+                for proposal in proposals.all():
+                    if proposal.id == extra.get("proposal_id"):
+                        continue
+                    if proposal.current_value:
+                        proposal.current_value = _replace_prefix(proposal.current_value, destination, source)
+                    if proposal.proposed_value:
+                        proposal.proposed_value = _replace_prefix(proposal.proposed_value, destination, source)
+        else:
+            file = db.get(File, extra["file_id"]) if extra.get("file_id") else None
+            if file and file.path == destination:
+                file.path = source
+                file.filename = Path(source).name
+            # Legacy entries lack file_id; use the unique indexed path.
+            elif not file:
+                files = db.query(File).filter(File.path == destination)
+                if session_id:
+                    files = files.filter(File.session_id == session_id)
+                matches = files.all()
+                if len(matches) > 1:
+                    raise ValueError("Ambiguous legacy undo path across sessions")
+                file = matches[0] if matches else None
+                if file:
+                    file.path = source
+                    file.filename = Path(source).name
+            if entry["operation"] == "RENAME" and extra.get("file_id") and not extra.get("proposal_snapshots"):
+                for related in db.query(Proposal).filter(Proposal.file_id == extra["file_id"]).all():
+                    if related.id == extra.get("proposal_id"):
+                        continue
+                    if related.current_value:
+                        related.current_value = _replace_prefix(related.current_value, destination, source)
+                    if related.proposed_value:
+                        # A rename cascade also substituted the new basename
+                        # into the destination of a later MOVE proposal.
+                        proposed = Path(related.proposed_value)
+                        if proposed.name == Path(destination).name:
+                            related.proposed_value = str(proposed.with_name(Path(source).name))
+        if extra.get("file_id"):
+            file = db.get(File, extra["file_id"])
+            if file and extra.get("file_status"):
+                file.status = FileStatus(extra["file_status"])
+        if extra.get("proposal_id"):
+            proposal = db.get(Proposal, extra["proposal_id"])
+            if proposal:
+                proposal.status = ProposalStatus(extra.get("proposal_status") or "approved")
+                proposal.applied_at = None
+        for snapshot in extra.get("proposal_snapshots", []):
+            proposal = db.get(Proposal, snapshot["id"])
+            if proposal:
+                proposal.current_value = snapshot["current_value"]
+                proposal.proposed_value = snapshot["proposed_value"]
+                proposal.status = ProposalStatus(snapshot["status"])
+                proposal.applied_at = (datetime.fromisoformat(snapshot["applied_at"])
+                                       if snapshot.get("applied_at") else None)
+        db.commit()
+
+def _undo_operations_unlocked(
     session_id: Optional[str] = None,
     force: bool = False,
     console = None,
 ) -> dict:
     """
-    Undo the last batch of operations atomically (in reverse order).
+    Reverse outstanding operations one at a time, newest first. Successful
+    restores are recorded individually; failures remain available for retry.
 
     Returns a summary dict with results.
     """
@@ -187,7 +395,7 @@ def undo_operations(
             con.print("[yellow]Undo cancelled.[/yellow]")
             return {"undone": 0, "failed": 0, "skipped": 0, "cancelled": True}
 
-    # Reverse order for atomic rollback
+    # Reverse order so dependent moves return before their earlier renames.
     counts = {"undone": 0, "failed": 0, "skipped": 0}
     undone_entries = []
 
@@ -200,6 +408,49 @@ def undo_operations(
         sha256_expected = entry.get("sha256", "")
 
         try:
+            _assert_proposal_state(
+                entry,
+                allow_restored=(not entry.get("_db_complete") or op == "TAGS"
+                                or (not new.exists() and original.exists())),
+            )
+            if op == "TAGS":
+                _restore_database(entry)
+                _append_entry(get_undo_log_path(session_id), {
+                    "operation": "UNDO_COMPLETE", "operation_id": _entry_id(entry),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "session_id": session_id,
+                })
+                counts["undone"] += 1
+                undone_entries.append(entry)
+                continue
+            if entry.get("operation_id") and not new.exists() and original.exists():
+                # Crash before mutation, or crash after restoring files but
+                # before marking the undo complete. Only a matching file hash
+                # proves that this is the journaled source rather than an
+                # unrelated replacement at the same path.
+                if entry.get("source_type") == "directory":
+                    identity = entry.get("directory_identity")
+                    verified = (original.is_dir() and identity is not None
+                                and [original.stat().st_dev, original.stat().st_ino] == identity)
+                else:
+                    verified = (entry.get("source_type") == "file" and original.is_file()
+                                and bool(sha256_expected)
+                                and _compute_sha256(original) == sha256_expected)
+                if not verified:
+                    con.print(f"  [red]✗[/red] {op}: Cannot verify restored source {original}")
+                    counts["failed"] += 1
+                    continue
+                if entry.get("phase") == "complete":
+                    _restore_database(entry)
+                _remove_created_empty_dirs(entry)
+                _append_entry(get_undo_log_path(session_id), {
+                    "operation": "UNDO_COMPLETE", "operation_id": _entry_id(entry),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "session_id": session_id,
+                })
+                counts["undone"] += 1
+                undone_entries.append(entry)
+                continue
             if op in ("MOVE", "RENAME"):
                 # Reverse: move from new_path back to original_path
                 if not new.exists():
@@ -212,8 +463,10 @@ def undo_operations(
                     current_hash = _compute_sha256(new)
                     if current_hash and current_hash != sha256_expected:
                         con.print(
-                            f"  [yellow]⚠[/yellow] {op}: File hash mismatch for {new.name} (file may have changed)"
+                            f"  [red]✗[/red] {op}: File hash mismatch for {new.name}"
                         )
+                        counts["failed"] += 1
+                        continue
 
                 # Check if destination already exists
                 if original.exists() and original != new:
@@ -230,8 +483,6 @@ def undo_operations(
                 import shutil
                 shutil.move(str(new), str(original))
                 con.print(f"  [green]✓[/green] {op}: {new.name} → {original.parent}/{original.name}")
-                counts["undone"] += 1
-                undone_entries.append(entry)
 
             elif op in ("DELETE", "TRASH", "JUNK_TRASH"):
                 # Reverse: move from trash back to original location.
@@ -257,19 +508,35 @@ def undo_operations(
                     counts["failed"] += 1
                     continue
 
+                if original.exists():
+                    con.print(f"  [red]✗[/red] {op}: Destination already exists {original}")
+                    counts["failed"] += 1
+                    continue
+                if sha256_expected and _compute_sha256(trash_path) != sha256_expected:
+                    con.print(f"  [red]✗[/red] {op}: File hash mismatch for {trash_path.name}")
+                    counts["failed"] += 1
+                    continue
+
                 # Ensure original directory exists
                 original.parent.mkdir(parents=True, exist_ok=True)
 
                 import shutil
                 shutil.move(str(trash_path), str(original))
                 con.print(f"  [green]✓[/green] {op}: Restored {original.name} from trash")
-                counts["undone"] += 1
-                undone_entries.append(entry)
 
             elif op == "RENAME_FOLDER":
                 # Reverse: rename folder back
                 if not new.exists():
                     con.print(f"  [red]✗[/red] {op}: Folder not found {new}")
+                    counts["failed"] += 1
+                    continue
+
+                identity = entry.get("directory_identity")
+                if identity is not None and (
+                    not new.is_dir()
+                    or [new.stat().st_dev, new.stat().st_ino] != identity
+                ):
+                    con.print(f"  [red]✗[/red] {op}: Folder identity changed at {new}")
                     counts["failed"] += 1
                     continue
 
@@ -282,20 +549,25 @@ def undo_operations(
 
                 new.rename(original)
                 con.print(f"  [green]✓[/green] {op}: {new.name} → {original.name}")
-                counts["undone"] += 1
-                undone_entries.append(entry)
 
             else:
                 con.print(f"  [yellow]⚠[/yellow] Unknown operation type: {op}")
                 counts["skipped"] += 1
+                continue
+
+            _restore_database(entry)
+            _remove_created_empty_dirs(entry)
+            _append_entry(get_undo_log_path(session_id), {
+                "operation": "UNDO_COMPLETE", "operation_id": _entry_id(entry),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "session_id": session_id,
+            })
+            counts["undone"] += 1
+            undone_entries.append(entry)
 
         except Exception as exc:
             con.print(f"  [red]✗[/red] {op} failed: {exc}")
             counts["failed"] += 1
-
-    # Mark undone entries in the log
-    if undone_entries:
-        _mark_entries_undone(entries, session_id)
 
     con.print(
         f"\n[bold]Done:[/bold] {counts['undone']} undone, {counts['failed']} failed, {counts['skipped']} skipped"
@@ -309,6 +581,16 @@ def undo_operations(
     }
 
 
+def undo_operations(
+    session_id: Optional[str] = None,
+    force: bool = False,
+    console=None,
+) -> dict:
+    """Undo under the same cross-process writer lock used by execution."""
+    with operation_lock("undo"):
+        return _undo_operations_unlocked(session_id=session_id, force=force, console=console)
+
+
 def _mark_entries_undone(entries: list[dict], session_id: Optional[str] = None) -> None:
     """Mark log entries as undone by appending an undo marker."""
     log_path = get_undo_log_path(session_id)
@@ -320,6 +602,19 @@ def _mark_entries_undone(entries: list[dict], session_id: Optional[str] = None) 
     }
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(marker, ensure_ascii=False) + "\n")
+
+
+def latest_undo_session_id() -> Optional[str]:
+    """Find the session with the most recent outstanding journal operation."""
+    latest: tuple[str, str] | None = None
+    for path in get_datahoarder_dir().glob("undo_*.log"):
+        session_id = path.stem.removeprefix("undo_")
+        entries = get_last_session_entries(session_id)
+        if entries:
+            timestamp = entries[-1].get("timestamp", "")
+            if latest is None or timestamp > latest[0]:
+                latest = (timestamp, session_id)
+    return latest[1] if latest else None
 
 
 def list_undo_sessions() -> list[dict]:
@@ -349,6 +644,16 @@ def list_undo_sessions() -> list[dict]:
 
     if current_session:
         sessions.append(_summarize_session(current_session))
+
+    for path in get_datahoarder_dir().glob("undo_*.log"):
+        session_id = path.stem.removeprefix("undo_")
+        outstanding = get_last_session_entries(session_id)
+        if outstanding:
+            summary = _summarize_session(outstanding)
+            summary["session_id"] = session_id
+            sessions.append(summary)
+
+    sessions.sort(key=lambda item: item["timestamp"])
 
     return sessions
 

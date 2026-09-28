@@ -13,6 +13,8 @@ import json
 from collections import defaultdict
 from datetime import datetime
 from difflib import SequenceMatcher
+from functools import wraps
+from typing import Callable
 
 from rich.progress import (
     BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
@@ -28,6 +30,7 @@ from donedatahoarder.db.session import get_engine
 
 from donedatahoarder.config import load_phash_config
 from donedatahoarder.phash import hash_distance
+from donedatahoarder.core.process_lock import operation_lock
 
 try:
     import imagehash
@@ -50,6 +53,14 @@ TEXT_EXTENSIONS = {
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _writer_locked(function):
+    """Protect direct CLI/API calls as well as background dedup stages."""
+    @wraps(function)
+    def locked(*args, **kwargs):
+        with operation_lock(f"dedup:{function.__name__}"):
+            return function(*args, **kwargs)
+    return locked
 
 def _pick_keeper(files: list[File]) -> int:
     """
@@ -74,8 +85,9 @@ def _upsert_group(
     file_ids: list[int],
     similarity: float = 1.0,
     session_id: str | None = None,
+    compare_to_keeper: Callable[[int, int], tuple[float, float | None]] | None = None,
 ) -> None:
-    """Insert or update a DuplicateGroup and its members."""
+    """Insert a candidate group with direct evidence against its keeper."""
     group = (
         session.query(DuplicateGroup)
         .filter_by(dupe_type=dupe_type, group_hash=group_hash)
@@ -94,25 +106,63 @@ def _upsert_group(
         session.add(group)
         session.flush()
 
-    existing_member_ids = {m.file_id for m in group.members}
-    for fid in file_ids:
-        if fid not in existing_member_ids:
-            session.add(DuplicateMember(
-                group_id=group.id,
-                file_id=fid,
-                similarity_score=similarity,
-            ))
-
-    # Set keeper if not already set
+    # A chosen keeper must be known before scores are attached. The score of
+    # a transitive edge is never evidence about a different keeper.
     if group.keep_file_id is None:
         files = session.query(File).filter(File.id.in_(file_ids)).all()
         group.keep_file_id = _pick_keeper(files)
+
+    existing_members = {m.file_id: m for m in group.members}
+    for fid in file_ids:
+        score, distance = (
+            compare_to_keeper(group.keep_file_id, fid)
+            if compare_to_keeper else (similarity, None)
+        )
+        member = existing_members.get(fid)
+        if member is None:
+            member = DuplicateMember(
+                group_id=group.id,
+                file_id=fid,
+            )
+            session.add(member)
+        member.similarity_score = score
+        member.distance_to_keeper = distance
+
+
+def _score_member_to_keeper(group: DuplicateGroup, keeper: File, member: File) -> tuple[float, float | None]:
+    """Recompute direct evidence when the keeper changes during review."""
+    if keeper.id == member.id:
+        return 1.0, 0.0 if group.dupe_type == DupeType.PERCEPTUAL else None
+    if group.dupe_type == DupeType.EXACT:
+        return (1.0 if keeper.hash_md5 and keeper.hash_md5 == member.hash_md5 else 0.0), None
+    if group.dupe_type == DupeType.PERCEPTUAL:
+        distance = hash_distance(keeper.hash_perceptual, member.hash_perceptual)
+        if distance is None:
+            return 0.0, None
+        bits = max(len(keeper.hash_perceptual or "") * 4, 1)
+        return max(0.0, 1.0 - distance / bits), float(distance)
+    if group.dupe_type == DupeType.SEMANTIC:
+        score = (0.4 * _string_similarity(keeper.ai_description or "", member.ai_description or "")
+                 + 0.6 * _tags_overlap(_parse_tags(keeper.ai_tags), _parse_tags(member.ai_tags)))
+        return score, None
+    if group.dupe_type == DupeType.CONTENT:
+        try:
+            if max(keeper.size_bytes or 0, member.size_bytes or 0) > TEXT_DEDUP_SIZE_CAP:
+                return 0.0, None
+            from pathlib import Path
+            left = Path(keeper.path).read_text(encoding="utf-8", errors="replace")
+            right = Path(member.path).read_text(encoding="utf-8", errors="replace")
+            return SequenceMatcher(None, left, right).ratio(), None
+        except (OSError, UnicodeError):
+            return 0.0, None
+    return 0.0, None
 
 
 # ---------------------------------------------------------------------------
 # Stage 1 — Exact duplicates (MD5)
 # ---------------------------------------------------------------------------
 
+@_writer_locked
 def find_exact_duplicates(session_id: str | None = None) -> dict:
     """Group files by MD5 and record exact duplicate groups."""
     engine = get_engine()
@@ -300,6 +350,7 @@ def _parse_tags(raw: str | None) -> list[str]:
 # Stage 2 — Perceptual duplicates (pHash)
 # ---------------------------------------------------------------------------
 
+@_writer_locked
 def find_perceptual_duplicates(threshold: int | None = None, session_id: str | None = None) -> dict:
     """
     Find near-duplicate images and videos using perceptual hashing.
@@ -376,25 +427,38 @@ def find_perceptual_duplicates(threshold: int | None = None, session_id: str | N
                 uf.union(hash_to_ids[hash_a][0], hash_to_ids[hash_b][0])
             progress.advance(task)
 
-    groups = [
-        sorted(members)
-        for members in uf.components().values()
-        if len(members) > 1
-    ]
-
+    hash_by_id = {fid: phash for fid, phash in rows if phash}
     with Session(engine) as session:
-        for group in groups:
-            group_hash = "-".join(str(x) for x in group)
-            _upsert_group(
-                session,
-                DupeType.PERCEPTUAL,
-                group_hash,
-                group,
-                similarity=0.95,
-                session_id=session_id,
-            )
-            counts["groups"] += 1
-            counts["duplicates"] += len(group) - 1
+        # Components only find candidates. Split every transitive chain into
+        # keeper-centred groups so no member is presented as a near duplicate
+        # of a keeper beyond the actual threshold.
+        for component in uf.components().values():
+            remaining = set(component)
+            while len(remaining) > 1:
+                files = session.query(File).filter(File.id.in_(remaining)).all()
+                keep_id = _pick_keeper(files)
+                keep_hash = hash_by_id[keep_id]
+                group = sorted(
+                    fid for fid in remaining
+                    if (distance := hash_distance(keep_hash, hash_by_id[fid])) is not None
+                    and distance <= threshold
+                )
+                remaining.difference_update(group)
+                if len(group) < 2:
+                    continue
+
+                def compare(keeper: int, member: int) -> tuple[float, float]:
+                    dist = hash_distance(hash_by_id[keeper], hash_by_id[member])
+                    bits = max(len(hash_by_id[keeper]) * 4, 1)
+                    return (max(0.0, 1.0 - dist / bits), float(dist))
+
+                _upsert_group(
+                    session, DupeType.PERCEPTUAL,
+                    "-".join(str(x) for x in group), group,
+                    session_id=session_id, compare_to_keeper=compare,
+                )
+                counts["groups"] += 1
+                counts["duplicates"] += len(group) - 1
         session.commit()
 
     return counts
@@ -421,6 +485,7 @@ def _tags_overlap(tags1: list[str], tags2: list[str]) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+@_writer_locked
 def find_semantic_duplicates(session_id: str | None = None) -> dict:
     """Find semantically similar files using AI descriptions and tags.
 
@@ -503,28 +568,30 @@ def find_semantic_duplicates(session_id: str | None = None) -> dict:
                         uf.union(id_a, id_b)
                         links.append((id_a, id_b, combined))
 
-    sims: dict[int, list[float]] = defaultdict(list)
-    for id_a, _id_b, combined in links:
-        sims[uf.find(id_a)].append(combined)
+    records_by_id = {row[0]: row for row in records}
 
-    grouped: list[tuple[list[int], float]] = []
-    for root, members in uf.components().items():
+    def direct_semantic(keeper: int, member: int) -> tuple[float, None]:
+        _id_a, desc_a, tags_a, _mime_a = records_by_id[keeper]
+        _id_b, desc_b, tags_b, _mime_b = records_by_id[member]
+        return (0.4 * _string_similarity(desc_a, desc_b)
+                + 0.6 * _tags_overlap(tags_a, tags_b), None)
+
+    grouped: list[list[int]] = []
+    for _root, members in uf.components().items():
         if len(members) < 2:
             continue
-        edge_sims = sims.get(root, [])
-        avg = (sum(edge_sims) / len(edge_sims)) if edge_sims else AI_SIMILARITY_THRESHOLD
-        grouped.append((sorted(members), round(avg, 2)))
+        grouped.append(sorted(members))
 
     with Session(engine) as session:
-        for group, avg_sim in grouped:
+        for group in grouped:
             group_hash = "-".join(str(x) for x in group)
             _upsert_group(
                 session,
                 DupeType.SEMANTIC,
                 group_hash,
                 group,
-                similarity=avg_sim,
                 session_id=session_id,
+                compare_to_keeper=direct_semantic,
             )
             counts["groups"] += 1
             counts["duplicates"] += len(group) - 1
@@ -537,6 +604,7 @@ def find_semantic_duplicates(session_id: str | None = None) -> dict:
 # Stage 4 — Near-identical text files (byte-level fuzzy match on small text)
 # ---------------------------------------------------------------------------
 
+@_writer_locked
 def find_text_near_duplicates(
     session_id: str | None = None,
     threshold: float = TEXT_NEAR_THRESHOLD,
@@ -648,16 +716,19 @@ def find_text_near_duplicates(
                     avg_sim = sum(sims) / len(sims) if sims else threshold
                     groups.append((group, round(avg_sim, 3)))
 
+    def direct_content(keeper: int, member: int) -> tuple[float, None]:
+        return (SequenceMatcher(None, contents[keeper][0], contents[member][0]).ratio(), None)
+
     with Session(engine) as session:
-        for group, avg_sim in groups:
+        for group, _avg_sim in groups:
             group_hash = "-".join(str(x) for x in sorted(group))
             _upsert_group(
                 session,
                 DupeType.CONTENT,
                 group_hash,
                 group,
-                similarity=avg_sim,
                 session_id=session_id,
+                compare_to_keeper=direct_content,
             )
             counts["groups"] += 1
             counts["duplicates"] += len(group) - 1
@@ -670,6 +741,7 @@ def find_text_near_duplicates(
 # Stage 5 — Convert duplicate groups into actionable MARK_DUPLICATE proposals
 # ---------------------------------------------------------------------------
 
+@_writer_locked
 def generate_dedup_proposals(session_id: str | None = None) -> dict:
     """
     Walk every DuplicateGroup for the session and emit a MARK_DUPLICATE proposal
@@ -688,15 +760,15 @@ def generate_dedup_proposals(session_id: str | None = None) -> dict:
       - reasoning      : human-readable justification including dupe type
       - confidence     : 1.0 for EXACT, similarity_score for the rest
 
-    Skips files that already have a MARK_DUPLICATE proposal in any state.
-    Re-elects a keeper if the group somehow has none.
+    Keeps one proposal per victim, preferring exact evidence, and never treats
+    a near-match score as permission to discard a file.
     """
     engine = get_engine()
     counts = {"groups": 0, "created": 0, "skipped": 0, "no_keeper": 0}
 
     type_label = {
         DupeType.EXACT:      "exact byte-for-byte duplicate",
-        DupeType.PERCEPTUAL: "perceptual near-duplicate (visually identical)",
+        DupeType.PERCEPTUAL: "perceptual similarity candidate",
         DupeType.SEMANTIC:   "semantic near-duplicate (similar AI tags/description)",
         DupeType.CONTENT:    "near-identical text content",
     }
@@ -706,6 +778,9 @@ def generate_dedup_proposals(session_id: str | None = None) -> dict:
         if session_id:
             q = q.filter(DuplicateGroup.session_id == session_id)
         groups = q.all()
+        priority = {DupeType.EXACT: 0, DupeType.PERCEPTUAL: 1,
+                    DupeType.CONTENT: 2, DupeType.SEMANTIC: 3}
+        groups.sort(key=lambda group: (priority[group.dupe_type], group.id))
 
         if not groups:
             return counts
@@ -754,17 +829,14 @@ def generate_dedup_proposals(session_id: str | None = None) -> dict:
                     continue
 
                 similarity = m.similarity_score or 0.0
-                # EXACT is by definition 1.0; for the fuzzier stages use the
-                # actual similarity score but never below 0.5 (so the proposal
-                # doesn't get filtered out by a low-confidence UI gate).
-                if group.dupe_type == DupeType.EXACT:
-                    confidence = 1.0
-                else:
-                    confidence = max(similarity, 0.5)
+                # Candidate similarity is evidence, not a calibrated
+                # probability. Only exact matches receive auto-approval
+                # confidence; all other classes require individual review.
+                confidence = 1.0 if group.dupe_type == DupeType.EXACT else None
 
                 reasoning = (
-                    f"{label} (similarity={similarity:.2f}). "
-                    f"Will be moved to .ddh_trash. Keeper: {keep_path}"
+                    f"{label} (direct keeper similarity={similarity:.3f}). "
+                    f"Candidate for individual review; keeper: {keep_path}"
                 )
 
                 session.add(Proposal(
@@ -775,6 +847,7 @@ def generate_dedup_proposals(session_id: str | None = None) -> dict:
                     reasoning=reasoning,
                     confidence=confidence,
                     status=ProposalStatus.PENDING,
+                    duplicate_group_id=group.id,
                 ))
                 existing_marked.add(victim.id)
                 counts["created"] += 1
@@ -782,6 +855,77 @@ def generate_dedup_proposals(session_id: str | None = None) -> dict:
         session.commit()
 
     return counts
+
+
+def refresh_group_proposals(session: Session, group_id: int) -> dict[str, int]:
+    """Refresh direct evidence and reset decisions after a keeper change.
+
+    The caller owns the transaction. APPLIED history must first be undone;
+    otherwise changing the keeper would rewrite the reason for past disposal.
+    """
+    group = session.get(DuplicateGroup, group_id)
+    if group is None or group.keep_file_id is None:
+        raise ValueError("Duplicate group has no selected keeper")
+    members = {m.file_id: m for m in group.members}
+    if group.keep_file_id not in members:
+        raise ValueError("Selected keeper is not a group member")
+    keeper = session.get(File, group.keep_file_id)
+    if keeper is None or (group.session_id and keeper.session_id != group.session_id):
+        raise ValueError("Selected keeper is not in the duplicate session")
+    proposals = session.query(Proposal).filter(
+        Proposal.duplicate_group_id == group.id,
+        Proposal.proposal_type == ProposalType.MARK_DUPLICATE,
+    ).all()
+    if any(p.status == ProposalStatus.APPLIED for p in proposals):
+        raise ValueError("Undo applied duplicate proposals before changing keeper")
+    by_file = {p.file_id: p for p in proposals}
+    changed = created = 0
+    for member_id, member in members.items():
+        victim = session.get(File, member_id)
+        if victim is None:
+            continue
+        score, distance = _score_member_to_keeper(group, keeper, victim)
+        member.similarity_score = score
+        member.distance_to_keeper = distance
+        proposal = by_file.get(member_id)
+        if member_id == keeper.id:
+            if proposal is not None:
+                # This file is now preserved. Retire its stale decision.
+                proposal.status = ProposalStatus.REJECTED
+                proposal.review_kind = None
+                proposal.user_notes = "Keeper changed; this file is now kept"
+                changed += 1
+            continue
+        if proposal is None:
+            # Do not silently replace a decision from another evidence group.
+            existing = session.query(Proposal).filter(
+                Proposal.file_id == member_id,
+                Proposal.proposal_type == ProposalType.MARK_DUPLICATE,
+            ).first()
+            if existing is not None:
+                continue
+            proposal = Proposal(
+                file_id=member_id, proposal_type=ProposalType.MARK_DUPLICATE,
+                duplicate_group_id=group.id, current_value=victim.path,
+                status=ProposalStatus.PENDING,
+            )
+            session.add(proposal)
+            created += 1
+        proposal.current_value = victim.path
+        proposal.proposed_value = keeper.path
+        proposal.confidence = (
+            1.0 if group.dupe_type == DupeType.EXACT and score == 1.0 else None
+        )
+        proposal.reasoning = (
+            f"{group.dupe_type.value} candidate; direct keeper similarity={score:.3f}. "
+            f"Keeper: {keeper.path}"
+        )
+        proposal.status = ProposalStatus.PENDING
+        proposal.review_kind = None
+        proposal.applied_at = None
+        proposal.user_notes = "Keeper changed; review this candidate again"
+        changed += 1
+    return {"changed": changed, "created": created}
 
 
 # ---------------------------------------------------------------------------
@@ -826,7 +970,7 @@ def dedup_with_progress(
     yield {"phase": "starting", "current": 0, "total": TOTAL}
 
     # Suppress Rich Progress output (each find_* uses its own progress bar)
-    with contextlib.redirect_stdout(io.StringIO()):
+    with operation_lock("dedup"), contextlib.redirect_stdout(io.StringIO()):
         for idx, phase in enumerate(PHASES, start=1):
             if _check_pause_cancel():
                 yield {"cancelled": True, "phase": phase, "current": idx - 1, "total": TOTAL, **results}

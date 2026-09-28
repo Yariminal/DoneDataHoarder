@@ -162,6 +162,16 @@ class File(Base):
     ai_transcript: Mapped[Optional[str]] = mapped_column(Text)  # video/audio transcript
     ai_confidence: Mapped[Optional[float]] = mapped_column(Float)
     ai_model: Mapped[Optional[str]] = mapped_column(String)     # which model was used
+    # Analysis provenance is nullable so existing indexes can be upgraded in place.
+    # ai_confidence is the model's self-report, not a calibrated probability.
+    analysis_outcome: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    analysis_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    analysis_evidence_source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    analysis_model_tag: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    analysis_model_digest: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    analysis_prompt_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    analysis_extractor_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    analysis_content_chars: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     # --- status ---
     status: Mapped[FileStatus] = mapped_column(
@@ -215,6 +225,10 @@ class Proposal(Base):
         Enum(ProposalStatus), default=ProposalStatus.PENDING, index=True
     )
     user_notes: Mapped[Optional[str]] = mapped_column(Text)
+    duplicate_group_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("duplicate_groups.id"), nullable=True
+    )
+    review_kind: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=utcnow)
     applied_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
@@ -261,6 +275,7 @@ class DuplicateMember(Base):
     group_id: Mapped[int] = mapped_column(Integer, ForeignKey("duplicate_groups.id"), nullable=False)
     file_id: Mapped[int] = mapped_column(Integer, ForeignKey("files.id"), nullable=False)
     similarity_score: Mapped[Optional[float]] = mapped_column(Float)  # 1.0 = identical
+    distance_to_keeper: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     group: Mapped["DuplicateGroup"] = relationship("DuplicateGroup", back_populates="members")
 
@@ -369,3 +384,40 @@ class CompletedFolder(Base):
     )
     completed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     root_path: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class BackgroundJob(Base):
+    """Durable record for a server worker, including its live owner lease."""
+    __tablename__ = "background_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    job_type: Mapped[str] = mapped_column(String, nullable=False)
+    state: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    progress_json: Mapped[str] = mapped_column(Text, default="{}")
+    error: Mapped[Optional[str]] = mapped_column(Text)
+    owner_pid: Mapped[Optional[int]] = mapped_column(Integer)
+    owner_token: Mapped[Optional[str]] = mapped_column(String(36))
+    owner_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    run_plan_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+
+class RunPlan(Base):
+    """An unattended plan whose completed phases are never replayed blindly."""
+    __tablename__ = "run_plans"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    state: Mapped[str] = mapped_column(String, default="ready", index=True)
+    steps_json: Mapped[str] = mapped_column(Text, default="[]")
+    options_json: Mapped[str] = mapped_column(Text, default="{}")
+    completed_steps_json: Mapped[str] = mapped_column(Text, default="[]")
+    checkpoint_json: Mapped[str] = mapped_column(Text, default="{}")
+    current_index: Mapped[int] = mapped_column(Integer, default=0)
+    active_job_id: Mapped[Optional[str]] = mapped_column(String(36))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)

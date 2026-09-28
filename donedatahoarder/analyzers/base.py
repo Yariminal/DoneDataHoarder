@@ -16,6 +16,8 @@ You are a file analysis assistant helping to organize a personal archive.
 Your job is to analyze files and return structured metadata to help rename and categorize them.
 Be concise, factual, and consistent. Always respond in valid JSON.
 """
+PROMPT_VERSION = "analysis-v2-2026-09-27"
+EXTRACTOR_VERSION = "extractors-v2-2026-09-27"
 
 # Tags the LLM commonly emits that carry no information for organisation.
 # Lower-cased, with spaces normalised to underscores.
@@ -103,6 +105,11 @@ class AnalysisResult:
         detected_date: Optional[datetime] = None,
         raw: dict | None = None,
         content_available: bool = True,  # set False when only filename/folder seen
+        evidence_source: str = "none",
+        outcome: str | None = None,
+        reason: str | None = None,
+        content_chars: int | None = None,
+        extractor: str = "none",
     ):
         self.description = description
         self.tags = tags or []
@@ -112,6 +119,11 @@ class AnalysisResult:
         self.detected_date = detected_date
         self.raw = raw or {}
         self.content_available = content_available
+        self.evidence_source = evidence_source
+        self.outcome = outcome
+        self.reason = reason
+        self.content_chars = content_chars
+        self.extractor = extractor
 
     def to_dict(self) -> dict:
         return {
@@ -177,7 +189,10 @@ class BaseAnalyzer(ABC):
         """Analyze a file and return structured results."""
         ...
 
-    def save_result(self, file_rec: File, result: AnalysisResult, model_name: str) -> None:
+    def save_result(
+        self, file_rec: File, result: AnalysisResult, model_name: str,
+        model_digest: str | None = None,
+    ) -> None:
         """Persist analysis results back to the database."""
         engine = get_engine()
         with Session(engine) as session:
@@ -191,7 +206,7 @@ class BaseAnalyzer(ABC):
             # descriptions backed by actual content.
             description = result.description or ""
             confidence = result.confidence
-            if not result.content_available and description:
+            if not result.content_available and result.outcome != "skipped" and description:
                 if not description.startswith(AnalysisResult.UNVERIFIED_PREFIX):
                     description = AnalysisResult.UNVERIFIED_PREFIX + description
                 confidence = min(confidence, AnalysisResult.UNVERIFIED_CONFIDENCE_CAP)
@@ -204,13 +219,28 @@ class BaseAnalyzer(ABC):
             cleaned_tags = _clean_tags(result.tags, f.filename, folder_name)
             f.ai_tags = json.dumps(cleaned_tags)
             f.ai_confidence = confidence
-            f.ai_model = model_name
+            did_infer = result.outcome != "skipped"
+            f.ai_model = model_name if did_infer else None
+            f.analysis_model_tag = model_name if did_infer else None
+            f.analysis_model_digest = model_digest if did_infer else None
+            f.analysis_prompt_version = PROMPT_VERSION if did_infer else None
+            f.analysis_extractor_version = f"{result.extractor}/{EXTRACTOR_VERSION}"
+            f.analysis_evidence_source = result.evidence_source
+            f.analysis_outcome = result.outcome or (
+                "content_verified" if result.content_available
+                and result.evidence_source in ("text", "vision") else
+                "metadata_only" if result.evidence_source == "metadata" else
+                "context_only"
+            )
+            f.analysis_reason = result.reason
+            f.analysis_content_chars = result.content_chars
             f.ai_transcript = result.transcript or None
             # AI-detected dates are hints only — never overwrite real EXIF dates,
             # and only use as date_best if no real filesystem date exists either.
             if result.detected_date and not f.date_exif and not f.date_best:
                 f.date_best = result.detected_date
                 # Do NOT set date_exif — that column is reserved for real EXIF metadata
-            f.status = FileStatus.ANALYZED
+            f.status = FileStatus.SKIPPED if result.outcome == "skipped" else FileStatus.ANALYZED
+            f.error_message = None
             f.analyzed_at = utcnow()
             session.commit()

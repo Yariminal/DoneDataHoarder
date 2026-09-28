@@ -81,6 +81,11 @@ def list_files(
                 "ai_description": f.ai_description,
                 "ai_tags": tags,
                 "ai_confidence": f.ai_confidence,
+                "analysis_outcome": getattr(f, "analysis_outcome", None),
+                "analysis_reason": getattr(f, "analysis_reason", None),
+                "analysis_evidence_source": getattr(f, "analysis_evidence_source", None),
+                "analysis_model_tag": getattr(f, "analysis_model_tag", None),
+                "error_message": f.error_message,
             })
 
     return {"items": items, "total": total, "page": page, "per_page": per_page}
@@ -131,6 +136,15 @@ def get_file(file_id: int):
             "ai_tags": tags,
             "ai_confidence": f.ai_confidence,
             "ai_model": f.ai_model,
+            "analysis_outcome": getattr(f, "analysis_outcome", None),
+            "analysis_reason": getattr(f, "analysis_reason", None),
+            "analysis_evidence_source": getattr(f, "analysis_evidence_source", None),
+            "analysis_model_tag": getattr(f, "analysis_model_tag", None),
+            "analysis_model_digest": getattr(f, "analysis_model_digest", None),
+            "analysis_prompt_version": getattr(f, "analysis_prompt_version", None),
+            "analysis_extractor_version": getattr(f, "analysis_extractor_version", None),
+            "analysis_content_chars": getattr(f, "analysis_content_chars", None),
+            "error_message": f.error_message,
             "ai_transcript": f.ai_transcript,
             "proposals": proposals,
         }

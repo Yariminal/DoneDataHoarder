@@ -3,12 +3,31 @@ Shared helpers used across the API routers.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+from threading import RLock
+
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from donedatahoarder.db.models import SessionStatus, UserSession
 from donedatahoarder.db.session import get_engine
+from donedatahoarder.core.process_lock import OperationBusyError, operation_lock
 from donedatahoarder.timeutils import utcnow
+
+
+# Process-local serialization of web review writes, pipeline starts, and commit.
+review_execute_lock = RLock()
+
+
+@contextmanager
+def review_operation(phase: str):
+    """Keep review, keeper and commit decisions atomic across web/CLI peers."""
+    with review_execute_lock:
+        try:
+            with operation_lock(phase):
+                yield
+        except OperationBusyError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
 
 def _require_session_id(body_session_id: str = "") -> str:

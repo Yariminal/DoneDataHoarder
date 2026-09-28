@@ -139,6 +139,9 @@ class ThreeDModelAnalyzer(BaseAnalyzer):
             )
 
         result = AnalysisResult.from_ai_response(data)
+        result.evidence_source = "metadata" if header else "filename_only"
+        result.extractor = "3d_header"
+        result.content_chars = len(header)
 
         # Ensure 3d-model tag is always present
         if "3d-model" not in result.tags:
@@ -158,5 +161,6 @@ class ThreeDModelAnalyzer(BaseAnalyzer):
         if not header:
             result.confidence = min(result.confidence, 0.45)
             result.content_available = False
+            result.reason = "unreadable_content"
 
         return result

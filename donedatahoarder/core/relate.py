@@ -19,7 +19,6 @@ propagation and folder clustering.
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 from collections import defaultdict
@@ -28,6 +27,7 @@ from typing import Callable, Iterable, Optional
 
 from sqlalchemy.orm import Session
 
+from donedatahoarder.ai.json_utils import extract_json
 from donedatahoarder.db.models import (
     File, FileStatus, RelationGroup, RelationMember, RelationRole,
 )
@@ -46,12 +46,19 @@ BACKSTOP_CONFIDENCE = 0.3
 # truncates the JSON mid-array). 100 keeps the worst-case response size
 # safely inside a typical 4k-token completion budget.
 MAX_FILES_PER_CALL = 100
+RELATE_MAX_OUTPUT_TOKENS = 4096
 
 # Leading numeric prefix: "10.8", "24.8", "3.9.1", etc. Stops at the first
 # non-digit/non-dot character. Optional trailing "#N" version tag is part
 # of the stem's identity but NOT of the shared prefix (so 24.8 and 24.8#2
 # cluster together).
 _PREFIX_RE = re.compile(r"^(\d+(?:\.\d+)*)")
+_FRAME_RE = re.compile(r"^(\d{4,})\.(jpe?g|png|webp|tiff?)$", re.IGNORECASE)
+_OPAQUE_STEM_RE = re.compile(
+    r"^(?:\d+(?:[._-]\d+)*|[0-9a-f]{16,}|(?:img|dsc|image|photo|file|scan)[_-]?\d*)$",
+    re.IGNORECASE,
+)
+_CONTENT_IDENTITY_RE = re.compile(r"\b(?:identical|same)\s+(?:image\s+|file\s+)?content\b", re.IGNORECASE)
 
 _ROLE_BY_STRING = {r.value: r for r in RelationRole}
 
@@ -139,6 +146,60 @@ def _numeric_prefix(stem: str) -> Optional[str]:
     """Return the leading numeric prefix of a stem, or None if no digits lead."""
     m = _PREFIX_RE.match(stem)
     return m.group(1) if m else None
+
+
+def _numbered_frame_groups(files: list[File]) -> tuple[list[dict], set[int]]:
+    """Keep a long, same-folder image sequence intact across LLM chunks.
+
+    A number is insufficient evidence across folders or formats. The minimum
+    length and matching zero-padding/extension distinguish a frame series from
+    two unrelated numbered files. We preserve the source filenames and order.
+    """
+    buckets: dict[tuple[str, str, int], list[tuple[int, File]]] = defaultdict(list)
+    for file in files:
+        match = _FRAME_RE.fullmatch(file.filename)
+        if match:
+            buckets[(str(Path(file.path).parent), match.group(2).lower(), len(match.group(1)))].append(
+                (int(match.group(1)), file)
+            )
+    groups: list[dict] = []
+    placed: set[int] = set()
+    for (_, extension, width), entries in buckets.items():
+        if len(entries) < 8 or len({number for number, _ in entries}) != len(entries):
+            continue
+        entries.sort(key=lambda entry: entry[0])
+        first, last = entries[0][0], entries[-1][0]
+        # Sparse, unrelated numbered assets should not become a sequence.
+        if last - first + 1 > len(entries) * 4:
+            continue
+        groups.append({
+            "label": f"frame_sequence_{first:0{width}d}_{last:0{width}d}",
+            "reason": "Numbered image sequence in one folder with matching extension and zero-padding; preserve frame order and filenames.",
+            "members": [{"filename": file.filename, "role": "sibling"} for _, file in entries],
+            "_confidence": 0.8,
+        })
+        placed.update(file.id for _, file in entries)
+    return groups, placed
+
+
+def _group_supported_by_input(members: list[dict], known_files: dict[str, File], reason: str) -> bool:
+    """Reject relation claims unsupported by the supplied file evidence."""
+    files = [known_files[member["filename"]] for member in members]
+    hashes = {getattr(file, "hash_sha256", None) for file in files}
+    exact = None not in hashes and len(hashes) == 1
+    if _CONTENT_IDENTITY_RE.search(reason) and not exact:
+        return False
+    if all(_OPAQUE_STEM_RE.fullmatch(Path(file.filename).stem) for file in files):
+        # Matching companion stems in one folder (e.g. 10.8.dwg/.bak) are
+        # structural evidence, but unrelated 1.jpg/1.png are not.
+        parents = {str(Path(file.path).parent) for file in files if getattr(file, "path", None)}
+        stems = {Path(file.filename).stem.casefold() for file in files}
+        suffixes = {Path(file.filename).suffix.lower() for file in files}
+        companion = bool(parents) and len(parents) == 1 and len(stems) == 1 and bool(
+            suffixes & {".dwg", ".bak", ".3dm", ".3dmbak", ".psd", ".ai"}
+        )
+        return exact or companion
+    return True
 
 
 def _group_prefix(group: dict) -> Optional[str]:
@@ -254,20 +315,20 @@ def _prefix_cluster_backstop(files: list[File]) -> list[dict]:
     for everything (we don't try to guess source/export from filenames alone
     in the backstop).
     """
-    buckets: dict[str, list[File]] = defaultdict(list)
+    buckets: dict[tuple[str, str], list[File]] = defaultdict(list)
     for f in files:
         stem = Path(f.filename).stem
-        pfx = _numeric_prefix(stem)
-        if pfx:
-            buckets[pfx].append(f)
+        if _numeric_prefix(stem):
+            buckets[(str(Path(f.path).parent), stem.casefold())].append(f)
 
     out: list[dict] = []
-    for pfx, members in buckets.items():
-        if len(members) < 2:
+    for (_, stem), members in buckets.items():
+        suffixes = {Path(member.filename).suffix.lower() for member in members}
+        if len(members) < 2 or not suffixes & {".dwg", ".bak", ".3dm", ".3dmbak"}:
             continue
         out.append({
-            "label": _slugify(f"prefix_{pfx}"),
-            "reason": f"Files sharing numeric prefix '{pfx}' (regex backstop).",
+            "label": _slugify(f"companion_{stem}"),
+            "reason": f"Same-folder source/backup companions with the exact stem '{stem}' (structural backstop).",
             "members": [
                 {"filename": m.filename, "role": "sibling"} for m in members
             ],
@@ -311,6 +372,19 @@ def _model_timeout(model_name: Optional[str]) -> int:
     return 120
 
 
+def _ollama_relate_options(client, model: Optional[str]) -> dict:
+    """Bound relation output without changing other AI requests or providers."""
+    from donedatahoarder.ai.ollama_client import OllamaClient
+
+    if not isinstance(client, OllamaClient):
+        return {}
+    options = {"num_predict": RELATE_MAX_OUTPUT_TOKENS}
+    effective_model = (model or client.text_model or "").lower()
+    if effective_model.split(":", 1)[0] == "gemma4":
+        options["think"] = False
+    return options
+
+
 def _call_llm_for_group(
     client,
     dir_label: str,
@@ -342,7 +416,8 @@ def _call_llm_for_group(
             "system": RELATE_SYSTEM_PROMPT,
             "temperature": 0.0,
             "seed": 42,
-            "timeout": _model_timeout(model),
+            "timeout": _model_timeout(model or getattr(client, "text_model", None)),
+            **_ollama_relate_options(client, model),
         }
         if model:
             kwargs["model"] = model
@@ -411,6 +486,9 @@ def _call_llm_for_group(
 
         label = _slugify(str(g.get("label") or "group"))
         reason = (g.get("reason") or "").strip()[:500]
+        if not _group_supported_by_input(uniq_members, known_filenames, reason):
+            logger.info("Relate rejected unsupported group %s in %s", label, dir_label)
+            continue
         cleaned.append({
             "label": label,
             "reason": reason,
@@ -545,9 +623,19 @@ If no meaningful groups found, return [].
 """
 
     try:
-        response_text = client.generate(prompt)
-        parsed = json.loads(response_text)
-    except Exception:
+        kwargs = {
+            "timeout": _model_timeout(model or getattr(client, "text_model", None)),
+            **_ollama_relate_options(client, model),
+        }
+        if model:
+            kwargs["model"] = model
+        response_text = client.generate(prompt, **kwargs)
+        # Some Ollama responses wrap the array in a Markdown fence and even
+        # emit literal control characters inside invented filenames. Keep the
+        # characters intact; the exact-filename check below rejects them.
+        parsed = extract_json(response_text, allow_control_chars=True)
+    except Exception as exc:
+        logger.warning("Relate cross-script LLM call failed (model=%s): %s", model, exc)
         return []
 
     if not parsed or not isinstance(parsed, list):
@@ -580,6 +668,15 @@ If no meaningful groups found, return [].
 
         if len(members) >= 2:
             label = _slugify(item.get("canonical_token", "cross_script_group"))
+            known_files = {f.filename: f for f in files}
+            if not _group_supported_by_input(members, known_files, ""):
+                continue
+            # Cross-script is a translation aid, not permission to merge
+            # identically numbered assets from unrelated project folders.
+            parents = {str(Path(known_files[m["filename"]].path).parent)
+                       for m in members if getattr(known_files[m["filename"]], "path", None)}
+            if len(parents) > 1:
+                continue
             groups.append({
                 "label": label,
                 "reason": f"Cross-script cluster: {item.get('canonical_token')}",
@@ -698,7 +795,7 @@ def _link_singletons_to_folder_groups(
 # Entry point
 # ---------------------------------------------------------------------------
 
-def relate(
+def _relate_impl(
     session_id: str,
     scope: str = "per_directory",
     client=None,
@@ -771,18 +868,31 @@ def relate(
         for f in files:
             dir_buckets[str(Path(f.path).parent)].append(f)
 
+        # Recognize a full numbered frame sequence before the 100-file LLM
+        # chunks. This gives one stable identity to the entire directory.
+        sequence_file_ids: set[int] = set()
+        for directory, directory_files in dir_buckets.items():
+            sequence_groups, placed_ids = _numbered_frame_groups(directory_files)
+            if sequence_groups:
+                fn_to_id = {file.filename: file.id for file in directory_files}
+                saved = _save_groups(session, sequence_groups, session_id,
+                                     "per_directory", directory, fn_to_id)
+                summary["groups"] += saved
+                summary["members"] += sum(len(group["members"]) for group in sequence_groups)
+                sequence_file_ids.update(placed_ids)
+
         # Determine the call pattern based on scope
         if scope == "cross_directory":
-            call_units = [("<whole tree>", files, None)]
+            remaining = [file for file in files if file.id not in sequence_file_ids]
+            call_units = [("<whole tree>", remaining, None)] if len(remaining) >= 2 else []
         else:
             call_units = [
-                (d, fs, d) for d, fs in dir_buckets.items() if len(fs) >= 2
+                (d, [file for file in fs if file.id not in sequence_file_ids], d)
+                for d, fs in dir_buckets.items()
+                if len([file for file in fs if file.id not in sequence_file_ids]) >= 2
             ]
 
         summary["directories"] = len(call_units)
-        if not call_units:
-            return summary
-
         for i, (dir_label, dir_files, dir_path) in enumerate(call_units):
             # Map filename (basename) → file_id for this unit.
             # For per_directory scope, filenames are unique within the dir.
@@ -803,9 +913,8 @@ def relate(
                         _call_llm_for_group(client, dir_label, chunk, model=model)
                     )
 
-            # Post-pass: merge groups that share a leading numeric prefix
-            # (LLM tends to over-segment date-stamped CAD project clusters).
-            llm_groups = _merge_groups_by_prefix(llm_groups)
+            # A numeric prefix alone is not evidence that two LLM chunks or
+            # CAD and image files share one project. Keep their groups apart.
 
             # Deduplicate labels across all groups from this unit
             _deduplicate_labels(llm_groups)
@@ -889,6 +998,19 @@ def relate(
 # ---------------------------------------------------------------------------
 # Background-job-friendly wrapper
 # ---------------------------------------------------------------------------
+
+def relate(
+    session_id: str,
+    scope: str = "per_directory",
+    client=None,
+    model: Optional[str] = None,
+    progress_cb: Optional[Callable[[dict], None]] = None,
+) -> dict:
+    """Run the relation writer under the database's cross-process lock."""
+    from donedatahoarder.core.process_lock import operation_lock
+
+    with operation_lock("relate files"):
+        return _relate_impl(session_id, scope, client, model, progress_cb)
 
 class _RelateCancelled(Exception):
     """Raised inside relate()'s progress_cb to interrupt iteration on cancel."""
@@ -984,7 +1106,8 @@ def relate_with_progress(
             daemon=True,
             name="relate-worker",
         )
-        worker.start()
+        from donedatahoarder.core.jobs import job_manager
+        job_manager.start_tracked_worker(worker)
 
         while True:
             try:

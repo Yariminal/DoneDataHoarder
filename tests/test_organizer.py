@@ -2,8 +2,142 @@
 Tests for organizer module — Hebrew transliteration and folder renaming.
 """
 import pytest
+from types import SimpleNamespace
 
 from donedatahoarder.proposals.organizer import _transliterate_hebrew
+from donedatahoarder.proposals.organizer.core import (
+    _folder_rename_keeps_identity, _organizer_move_allowed,
+    _suppress_unsafe_organizer_proposals,
+)
+
+
+def test_move_requires_project_and_subject_evidence(tmp_path):
+    class Unprotected:
+        def assess(self, _path):
+            return SimpleNamespace(protected=False)
+
+    source = tmp_path / "PROJECTX 2021" / "Presentation-01.png"
+    file = SimpleNamespace(
+        id=1, path=str(source), ai_description="Phone mockup showing swarming bees",
+        ai_tags='["presentation", "bees"]', analysis_outcome="content_verified",
+        analysis_evidence_source="vision",
+    )
+    assert not _organizer_move_allowed(
+        file, tmp_path / "PROJECTX 2021" / "projectx-2021-agreement-documents" / source.name,
+        tmp_path, Unprotected(), set(),
+    )
+    assert _organizer_move_allowed(
+        file, tmp_path / "PROJECTX 2021" / "presentation_images" / source.name,
+        tmp_path, Unprotected(), set(),
+    )
+    assert not _organizer_move_allowed(
+        file, tmp_path / "PROJECTX 2021" / "presentation_agreements" / source.name,
+        tmp_path, Unprotected(), set(),
+    )
+    assert not _organizer_move_allowed(
+        file, tmp_path / "Other Project" / "presentation_images" / source.name,
+        tmp_path, Unprotected(), set(),
+    )
+    assert not _organizer_move_allowed(
+        file, tmp_path / "PROJECTX 2021" / "presentation_images" / source.name,
+        tmp_path, Unprotected(), {1},
+    )
+
+
+def test_folder_rename_preserves_numbered_milestone_identity(tmp_path):
+    project = tmp_path / "PROJECTX"
+    first = project / "1 Milestone"
+    second = project / "2 Milestone"
+    assert not _folder_rename_keeps_identity(first, project / "Images")
+    assert not _folder_rename_keeps_identity(second, project / "Images")
+    assert _folder_rename_keeps_identity(first, project / "1_Milestone_Images")
+    assert not _folder_rename_keeps_identity(project / "AB", project / "Images")
+    assert not _folder_rename_keeps_identity(project / "A1", project / "Images1")
+
+
+def test_final_folder_gate_rejects_colliding_generic_milestone_names(tmp_path):
+    from sqlalchemy.orm import Session
+    from donedatahoarder.db.session import init_db
+    from donedatahoarder.db.models import File, Proposal, ProposalStatus, ProposalType, UserSession
+
+    project = tmp_path / "PROJECTX"
+    project.mkdir()
+    engine = init_db(tmp_path / "organize.db")
+    with Session(engine) as db:
+        owner = UserSession(root_path=str(tmp_path))
+        db.add(owner)
+        db.flush()
+        for number in (1, 2):
+            folder = project / f"{number} Milestone"
+            folder.mkdir()
+            source = folder / "frame.png"
+            source.write_bytes(b"synthetic")
+            file = File(session_id=owner.id, path=str(source), filename=source.name)
+            db.add(file)
+            db.flush()
+            db.add(Proposal(file_id=file.id, proposal_type=ProposalType.RENAME_FOLDER,
+                            current_value=str(folder), proposed_value=str(project / "Images"),
+                            status=ProposalStatus.PENDING))
+        db.commit()
+        sid = owner.id
+    summary = _suppress_unsafe_organizer_proposals(sid, str(tmp_path))
+    assert summary["rename_folder"] == 2
+    with Session(engine) as db:
+        assert db.query(Proposal).count() == 0
+
+
+def test_grouping_moves_reject_repeated_folder_and_orphan_but_keep_real_group(tmp_path):
+    from sqlalchemy.orm import Session
+    from donedatahoarder.db.session import init_db
+    from donedatahoarder.db.models import File, Proposal, ProposalStatus, ProposalType, UserSession
+
+    engine = init_db(tmp_path / "organize-groups.db")
+    with Session(engine) as db:
+        owner = UserSession(root_path=str(tmp_path))
+        db.add(owner)
+        db.flush()
+
+        def add_move(parent, filename, destination_folder, reasoning, verified=True):
+            folder = tmp_path / parent
+            folder.mkdir(exist_ok=True)
+            source = folder / filename
+            source.write_bytes(b"synthetic")
+            file = File(session_id=owner.id, path=str(source), filename=filename,
+                        analysis_outcome="content_verified" if verified else "context_only",
+                        analysis_evidence_source="text" if verified else "filename_only",
+                        ai_description="Invoice record" if verified else None)
+            db.add(file)
+            db.flush()
+            db.add(Proposal(file_id=file.id, proposal_type=ProposalType.MOVE,
+                            current_value=str(source),
+                            proposed_value=str(folder / destination_folder / filename),
+                            reasoning=reasoning, status=ProposalStatus.PENDING))
+
+        cluster = "Cluster move — member of RelationGroup 'invoices' (confidence 0.90)"
+        for i in range(3):
+            add_move("TEAM", f"team-{i}.txt", "team", cluster)
+        add_move("PROJECTA", "one.txt", "invoices", cluster)
+        add_move("PROJECTA", "two.txt", "invoices", cluster, verified=False)
+        add_move("PROJECTB", "one.txt", "invoices", cluster)
+        add_move("PROJECTB", "two.txt", "invoices", cluster)
+        add_move("PROJECTC", "solo.txt", "invoices", "Direct file move")
+        db.commit()
+        sid = owner.id
+
+    summary = _suppress_unsafe_organizer_proposals(sid, str(tmp_path))
+    assert summary["move"] == 5
+    assert summary["reasons"]["Grouping would repeat the existing folder name"] == 3
+    assert summary["reasons"]["Grouping would leave a one-file folder after safety filters"] == 1
+    with Session(engine) as db:
+        remaining = {
+            (file.filename, file.path)
+            for _, file in db.query(Proposal, File).join(File, Proposal.file_id == File.id)
+        }
+    assert len(remaining) == 3
+    assert {str(tmp_path / "PROJECTB" / name) for name in ("one.txt", "two.txt")} <= {
+        path for _, path in remaining
+    }
+    assert str(tmp_path / "PROJECTC" / "solo.txt") in {path for _, path in remaining}
 
 
 class TestHebrewTransliteration:

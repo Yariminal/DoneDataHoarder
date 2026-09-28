@@ -201,7 +201,10 @@ document.addEventListener('alpine:init', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      if (!res.ok) {
+        const error = await res.json().catch(() => ({}));
+        throw new Error(error.detail || `${res.status} ${res.statusText}`);
+      }
       return res.json();
     },
     async patch(url, body = {}) {
@@ -638,7 +641,7 @@ document.addEventListener('alpine:init', () => {
 
     async approve(id) {
       try {
-        await api.post(`/proposals/${id}/approve`);
+        await api.post(`/proposals/${id}/approve`, { session_id: Alpine.store('session').current_session_id });
         this.proposals = this.proposals.map(p => p.id === id ? { ...p, status: 'approved' } : p);
         Alpine.store('app').toast('Approved', 'success');
       } catch (e) {
@@ -648,7 +651,7 @@ document.addEventListener('alpine:init', () => {
 
     async reject(id) {
       try {
-        await api.post(`/proposals/${id}/reject`);
+        await api.post(`/proposals/${id}/reject`, { session_id: Alpine.store('session').current_session_id });
         this.proposals = this.proposals.map(p => p.id === id ? { ...p, status: 'rejected' } : p);
         Alpine.store('app').toast('Rejected', 'success');
       } catch (e) {
@@ -660,15 +663,19 @@ document.addEventListener('alpine:init', () => {
     editValue: '',
 
     startEdit(p) {
+      if (p.proposal_type === 'mark_duplicate') {
+        Alpine.store('app').toast('Choose the keeper in Duplicate Review', 'info');
+        return;
+      }
       this.editingId = p.id;
       this.editValue = p.proposed_value || '';
     },
 
     async saveEdit(id) {
       try {
-        await api.post(`/proposals/${id}/edit`, { proposed_value: this.editValue });
+        const updated = await api.post(`/proposals/${id}/edit`, { session_id: Alpine.store('session').current_session_id, proposed_value: this.editValue });
         this.proposals = this.proposals.map(p =>
-          p.id === id ? { ...p, proposed_value: this.editValue, status: 'modified' } : p
+          p.id === id ? { ...p, proposed_value: this.editValue, proposed_path: updated.proposed_value, status: 'modified' } : p
         );
         this.editingId = null;
         Alpine.store('app').toast('Updated', 'success');
@@ -681,11 +688,25 @@ document.addEventListener('alpine:init', () => {
 
     async bulkApprove() {
       try {
+        const sessionId = Alpine.store('session').current_session_id;
+        if (!sessionId) throw new Error('Select a session first');
+        const threshold = this.bulkConfidence / 100;
+        const type = this.typeFilter || '';
+        const match = await api.get(`/proposals?session_id=${encodeURIComponent(sessionId)}&status=pending&min_confidence=${threshold}&proposal_type=${encodeURIComponent(type)}&per_page=1`);
+        if (!match.total) {
+          Alpine.store('app').toast('No pending proposals match this threshold', 'info');
+          return;
+        }
+        if (!await window.appConfirm(`Review bulk approval for up to ${match.total} pending proposal(s) with a model-reported score of at least ${this.bulkConfidence}%. Protected resources, similarity-only duplicates, and renames without verified content will be skipped.`, { title: 'Approve matching proposals', confirmLabel: 'Approve' })) return;
         const data = await api.post('/proposals/bulk-approve', {
-          min_confidence: this.bulkConfidence / 100,
-          proposal_type: this.typeFilter || null,
+          session_id: sessionId,
+          min_confidence: threshold,
+          proposal_type: type || null,
         });
-        Alpine.store('app').toast(`Approved ${data.approved} proposals`, 'success');
+        Alpine.store('app').toast(
+          `Approved ${data.approved}; skipped ${data.skipped_protected || 0} protected, ${data.skipped_near_duplicate || 0} near-duplicates, ${data.skipped_unverified_rename || 0} unverified renames`,
+          data.approved ? 'success' : 'info'
+        );
         await this.load();
       } catch (e) {
         Alpine.store('app').toast('Bulk approve failed', 'error');
@@ -701,6 +722,26 @@ document.addEventListener('alpine:init', () => {
       if (c >= 0.8) return 'var(--success)';
       if (c >= 0.5) return 'var(--warning)';
       return 'var(--danger)';
+    },
+    hasImage(fileId, mime) {
+      return !!fileId && !!mime && mime.startsWith('image/');
+    },
+    duplicateEvidenceText(evidence) {
+      if (!evidence) return 'Keeper evidence is unavailable; review this candidate individually.';
+      if (evidence.exact_bytes === true) return 'Stored SHA-256 hashes match the keeper; execution rechecks the live bytes.';
+      if (evidence.exact_bytes === false) return 'Stored SHA-256 hashes differ from the keeper. Do not discard this candidate.';
+      if (evidence.type === 'exact') {
+        return evidence.matching_indexed_md5 === true
+          ? 'Indexed MD5 hashes match; stored SHA-256 is unavailable. Execution checks live SHA-256 before trash.'
+          : 'Indexed MD5 match is unavailable; execution checks live SHA-256 before trash.';
+      }
+      if (evidence.type === 'perceptual' && evidence.distance_to_keeper != null) {
+        return `Direct pHash distance to keeper: ${evidence.distance_to_keeper}/${evidence.perceptual_bits || '?'} bits. Similar appearance is not proof of a disposable copy.`;
+      }
+      if (evidence.similarity_score != null) {
+        return `Direct ${evidence.type} similarity to keeper: ${evidence.similarity_score.toFixed(2)}. This is not a safety probability.`;
+      }
+      return 'Direct keeper comparison is unavailable; inspect both files before deciding.';
     },
   }));
 
@@ -737,17 +778,15 @@ document.addEventListener('alpine:init', () => {
 
     async setKeeper(groupId, fileId) {
       try {
-        await api.post(`/duplicates/${groupId}/keeper`, { keep_file_id: fileId });
-        this.groups = this.groups.map(g => {
-          if (g.id === groupId) {
-            g.keep_file_id = fileId;
-            g.files = g.files.map(f => ({ ...f, is_keeper: f.id === fileId }));
-          }
-          return g;
-        });
-        Alpine.store('app').toast('Keeper set', 'success');
+        const result = await api.post(`/duplicates/${groupId}/keeper`, { session_id: Alpine.store('session').current_session_id, keep_file_id: fileId });
+        await this.load();
+        window._dataVersion++;
+        Alpine.store('app').toast(
+          result.review_reset ? `Keeper changed; ${result.review_reset} candidate decisions need fresh review` : 'Keeper set',
+          'success'
+        );
       } catch (e) {
-        Alpine.store('app').toast('Failed to set keeper', 'error');
+        Alpine.store('app').toast(`Failed to set keeper: ${e.message}`, 'error');
       }
     },
 
@@ -764,6 +803,22 @@ document.addEventListener('alpine:init', () => {
     async nextPage() { if (this.page < this.totalPages()) { this.page++; await this.load(); } },
 
     isImage(f) { return f.mime_type && f.mime_type.startsWith('image/'); },
+    keeper(g) { return g.files.find(f => f.id === g.keep_file_id) || null; },
+    candidates(g) { return g.files.filter(f => f.id !== g.keep_file_id); },
+    evidenceText(g, f) {
+      if (f.exact_bytes_to_keeper === true) return 'Stored SHA-256 hashes match; live bytes are checked again before trash.';
+      if (f.exact_bytes_to_keeper === false) return 'Stored SHA-256 hashes differ; do not discard this candidate.';
+      if (g.dupe_type === 'exact') {
+        return f.matching_indexed_md5 === true
+          ? 'Indexed MD5 hashes match; stored SHA-256 is unavailable. Live SHA-256 is checked before trash.'
+          : 'Indexed MD5 match is unavailable; live SHA-256 is checked before trash.';
+      }
+      if (g.dupe_type === 'perceptual' && f.distance_to_keeper != null) {
+        return `Direct pHash distance: ${f.distance_to_keeper}/${f.perceptual_bits || '?'} bits from keeper. Inspect visual differences.`;
+      }
+      if (f.similarity_score != null) return `Direct ${g.dupe_type} similarity: ${f.similarity_score.toFixed(2)}; not a disposal probability.`;
+      return 'No direct measured comparison to the selected keeper.';
+    },
   }));
 
   /* ----------------------------------------------------------
@@ -1104,6 +1159,7 @@ document.addEventListener('alpine:init', () => {
   Alpine.data('pipeline', () => ({
     running: null,
     result: null,
+    commitPreview: null,
     // Progress tracking for background jobs (one per type)
     analyzeProgress: null,
     enrichProgress: null,
@@ -1125,7 +1181,13 @@ document.addEventListener('alpine:init', () => {
     unattendedStartTime: null,
     unattendedCompletedSteps: [],
     unattendedFailedStep: null,
-    _unattendedStepResolve: null,
+    runPlanId: null,
+    runPlanSessionId: null,
+    runPlanState: null,
+    runPlanError: null,
+    analysisErrors: null,
+    _runPlanPoll: null,
+    _runPlanRequest: 0,
     // Wake Lock state — prevents the system from sleeping during unattended runs
     _wakeLock: null,
     _wakeLockSupported: typeof navigator !== 'undefined' && 'wakeLock' in navigator,
@@ -1135,6 +1197,107 @@ document.addEventListener('alpine:init', () => {
     async init() {
       // Check for an active background job (reconnect after page refresh)
       await this.checkActiveJob();
+      await this.checkRunPlan();
+      await this.loadAnalysisErrors();
+      this._runPlanPoll = setInterval(() => this.checkRunPlan(), 2500);
+    },
+
+    async checkRunPlan() {
+      const sid = Alpine.store('session').current_session_id;
+      const requestId = ++this._runPlanRequest;
+      if (sid !== this.runPlanSessionId) {
+        this.runPlanSessionId = sid;
+        this.runPlanId = null;
+        this.runPlanState = null;
+        this.runPlanError = null;
+        this.unattendedMode = false;
+        this.unattendedQueue = [];
+        this.unattendedCurrentStep = null;
+        this.unattendedCompletedSteps = [];
+        this.unattendedFailedStep = null;
+        this.analysisErrors = null;
+      }
+      if (!sid) return;
+      try {
+        const response = await api.get(`/pipeline/runs/latest?session_id=${encodeURIComponent(sid)}`);
+        if (requestId !== this._runPlanRequest || sid !== Alpine.store('session').current_session_id || sid !== this.runPlanSessionId) return;
+        const plan = response.plan;
+        if (!plan) {
+          this.runPlanId = null;
+          this.runPlanState = null;
+          this.runPlanError = null;
+          this.unattendedMode = false;
+          this.unattendedQueue = [];
+          this.unattendedCurrentStep = null;
+          this.unattendedCompletedSteps = [];
+          this.unattendedFailedStep = null;
+          return;
+        }
+        const previous = this.runPlanState;
+        this.runPlanId = plan.plan_id;
+        this.runPlanState = plan.state;
+        this.runPlanError = response.last_failure?.error || null;
+        this.unattendedMode = ['running', 'paused', 'cancelling'].includes(plan.state);
+        this.unattendedCurrentStep = plan.steps[plan.current_index] || null;
+        this.unattendedCompletedSteps = plan.completed_steps || [];
+        this.unattendedQueue = plan.steps.slice(plan.current_index + (this.unattendedMode ? 1 : 0));
+        this.unattendedFailedStep = ['failed', 'interrupted', 'cancelled'].includes(plan.state)
+          ? this.unattendedCurrentStep : null;
+        this.unattendedStartTime = plan.created_at ? Date.parse(plan.created_at) : null;
+        if (plan.active_job_id && plan.active_job_id !== this.activeJobId) {
+          await this.checkActiveJob();
+        }
+        if (previous && previous !== plan.state && plan.state === 'completed') {
+          Alpine.store('app').toast('Unattended run complete. Review proposals before applying changes.', 'success');
+        }
+        if (['failed', 'interrupted'].includes(plan.state) && previous !== plan.state) {
+          await this.loadAnalysisErrors();
+        }
+      } catch (e) {
+        this.runPlanError = e.message;
+      }
+    },
+
+    async loadAnalysisErrors() {
+      const sid = Alpine.store('session').current_session_id;
+      if (!sid) return;
+      try {
+        const errors = await api.get(`/pipeline/analyze/errors?session_id=${encodeURIComponent(sid)}`);
+        if (sid === Alpine.store('session').current_session_id) this.analysisErrors = errors;
+      } catch (_) { /* the run status remains visible */ }
+    },
+
+    async retryAnalysisErrors() {
+      const settings = this.getSettings();
+      if (!settings.session_id) return;
+      try {
+        const response = await api.post('/pipeline/analyze', {
+          session_id: settings.session_id, backend: settings.backend,
+          model: settings.analyzeModel, workers: settings.workers, retry_errors: true,
+        });
+        this.activeJobId = response.job_id;
+        this.activeJobType = 'analyze';
+        this.jobState = 'running';
+        this.running = 'analyze';
+        this._connectJobStream(response.job_id, 'analyze');
+      } catch (e) {
+        Alpine.store('app').toast(`Retry failed: ${e.message}`, 'error');
+      }
+    },
+
+    async resumeUnattended() {
+      if (!this.runPlanId) return;
+      const sid = Alpine.store('session').current_session_id;
+      try {
+        const action = this.runPlanState === 'ready' ? 'advance' : 'resume';
+        const response = await api.post(`/pipeline/runs/${this.runPlanId}/${action}`, {
+          session_id: sid, retry_errors: !!this.analysisErrors?.retryable,
+        });
+        this.runPlanState = response.plan.state;
+        await this.checkRunPlan();
+      } catch (e) {
+        Alpine.store('app').toast(`Cannot resume run: ${e.message}`, 'error');
+      }
     },
 
     async checkActiveJob() {
@@ -1264,6 +1427,23 @@ document.addEventListener('alpine:init', () => {
       'enrich', 'dedup', 'relate', 'analyze', 'propose', 'organize', 'execute-dry',
     ]),
 
+    async loadCommitPreview() {
+      const sid = Alpine.store('session').current_session_id;
+      if (!sid) {
+        Alpine.store('app').toast('Select a session first', 'error');
+        return;
+      }
+      try {
+        this.commitPreview = await api.get(`/execute/preview?session_id=${encodeURIComponent(sid)}`);
+        if (this.commitPreview.errors) {
+          Alpine.store('app').toast(`${this.commitPreview.errors} reviewed action(s) cannot run; inspect the preview`, 'error');
+        }
+      } catch (e) {
+        this.commitPreview = null;
+        Alpine.store('app').toast(`Could not preview changes: ${e.message}`, 'error');
+      }
+    },
+
     async runStep(step) {
       // Prevent starting a new step while a job is active
       if (this.activeJobId && (this.jobState === 'running' || this.jobState === 'paused')) {
@@ -1336,22 +1516,35 @@ document.addEventListener('alpine:init', () => {
             data = await this._startBackgroundJob(step, settings);
             return;
           case 'execute-commit':
-            // Commit STAYS SYNCHRONOUS so the user-visible "Apply changes? y/N"
-            // confirmation flow is preserved. Only execute-dry runs in background.
+            // Require a visible, session-scoped preview before the confirmation.
+            if (!this.commitPreview || this.commitPreview.session_id !== settings.session_id) {
+              Alpine.store('app').toast('Preview reviewed changes before committing', 'error');
+              break;
+            }
+            if (!this.commitPreview.total) {
+              Alpine.store('app').toast('No approved or edited proposals to apply', 'info');
+              break;
+            }
+            if (this.commitPreview.errors) {
+              Alpine.store('app').toast('Resolve the failing preview actions before committing', 'error');
+              break;
+            }
             if (!await window.appConfirm(
-              'Apply all approved changes to disk? This cannot be undone.',
+              `Apply ${this.commitPreview.total} reviewed change(s) to disk?\n\nThe preview below lists the selected files. If the proposals have changed, you will need to preview again.`,
               { title: 'Apply changes', confirmLabel: 'Apply changes', danger: true }
             )) {
               this.running = null;
               Alpine.store('app').loading = false;
               return;
             }
-            data = await api.post('/execute', { session_id: settings.session_id, dry_run: false });
+            data = await api.post('/execute', { session_id: settings.session_id, dry_run: false, preview_token: this.commitPreview.token });
+            this.commitPreview = null;
             Alpine.store('app').toast('Changes applied to disk', 'success');
             break;
         }
         this.result = data;
       } catch (e) {
+        if (step === 'execute-commit') this.commitPreview = null;
         Alpine.store('app').toast(`${step} failed: ${e.message}`, 'error');
         this.result = { error: e.message };
       } finally {
@@ -1528,13 +1721,9 @@ document.addEventListener('alpine:init', () => {
       this.progressStartTime = null;
 
       await this._refreshAfterStep();
+      if (type === 'analyze') await this.loadAnalysisErrors();
 
-      // If running in unattended mode, signal step completion
-      if (this._unattendedStepResolve) {
-        const resolver = this._unattendedStepResolve;
-        this._unattendedStepResolve = null;
-        resolver(state === 'completed');
-      }
+      await this.checkRunPlan();
     },
 
     async _refreshAfterStep() {
@@ -1612,136 +1801,57 @@ document.addEventListener('alpine:init', () => {
     },
 
     async runUnattended() {
-      // If already running, treat click as cancel request
       if (this.unattendedMode) {
         const cancelRun = await window.appConfirm(
-          'Cancel the unattended run?\n\nThe current step will be cancelled (if possible).',
+          'Cancel the unattended run? The current worker will stop at its next safe checkpoint.',
           { title: 'Cancel run', confirmLabel: 'Cancel run', danger: true }
         );
         if (!cancelRun) return;
-        this.unattendedMode = false;
-        this.unattendedQueue = [];
-        this.unattendedCurrentStep = null;
-        // Cancel current background job if active
-        if (this.activeJobId) {
-          try {
-            await api.post(`/pipeline/jobs/${this.activeJobId}/cancel`);
-          } catch (e) { /* ignore */ }
+        try {
+          await api.post(`/pipeline/runs/${this.runPlanId}/cancel`, {
+            session_id: Alpine.store('session').current_session_id,
+          });
+          await this.checkRunPlan();
+          Alpine.store('app').toast('Cancelling the current worker...', 'info');
+        } catch (e) {
+          Alpine.store('app').toast(`Cannot cancel run: ${e.message}`, 'error');
         }
-        // Resolve any pending step promise as failure
-        if (this._unattendedStepResolve) {
-          const resolver = this._unattendedStepResolve;
-          this._unattendedStepResolve = null;
-          resolver(false);
-        }
-        Alpine.store('app').toast('Unattended run cancelled', 'info');
         return;
       }
 
-      // Validate prerequisites before starting
       const settings = this.getSettings();
-      if (!settings.rootPath) {
-        Alpine.store('app').toast('Select a folder in Setup tab first', 'error');
+      if (!settings.session_id || !settings.rootPath) {
+        Alpine.store('app').toast('Create a session and select its folder in Setup first', 'error');
         return;
       }
-      if (!settings.analyzeModel) {
-        Alpine.store('app').toast('Select an analyze model in Setup tab first', 'error');
+      if (!settings.analyzeModel || !settings.proposeModel) {
+        Alpine.store('app').toast('Choose analysis and proposal models in Setup first', 'error');
         return;
       }
-      if (!settings.proposeModel) {
-        Alpine.store('app').toast('Select a propose model in Setup tab first', 'error');
-        return;
-      }
-      // Prevent overlap with existing running step
       if (this.running || this.activeJobId) {
         Alpine.store('app').toast('Wait for the current step to finish first', 'error');
         return;
       }
-
       const confirmMsg =
         'Start unattended run?\n\n' +
-        'Will run: scan → enrich → dedup → relate → analyze → propose → organize → dry run\n\n' +
-        'NO changes will be committed to disk. You can review proposals\n' +
-        'and click "Commit" manually when you return.\n\n' +
-        'Estimated time for 500 files: 30-90 minutes';
+        'Will run: scan → enrich → analyze → dedup → relate → propose → organize → dry run\n\n' +
+        'The server saves each completed step. No file changes will be committed.\n' +
+        'Review proposals before applying any changes.';
       if (!await window.appConfirm(confirmMsg, { title: 'Unattended run', confirmLabel: 'Start' })) return;
-
-      // Initialize state
-      this.unattendedMode = true;
-      this.unattendedStartTime = Date.now();
-      this.unattendedCompletedSteps = [];
-      this.unattendedFailedStep = null;
-      this.unattendedQueue = [
-        'scan', 'enrich', 'dedup', 'relate', 'analyze',
-        'propose', 'organize', 'execute-dry'
-      ];
-
-      Alpine.store('app').toast('Unattended run started — feel free to step away', 'info');
-
-      // Run each step sequentially
-      while (this.unattendedMode && this.unattendedQueue.length > 0) {
-        const step = this.unattendedQueue.shift();
-        this.unattendedCurrentStep = step;
-
-        const success = await this._runUnattendedStep(step);
-
-        // Check if user cancelled mid-run
-        if (!this.unattendedMode) break;
-
-        if (!success) {
-          this.unattendedFailedStep = step;
-          this.unattendedMode = false;
-          this.unattendedCurrentStep = null;
-          Alpine.store('app').toast(`Unattended run stopped at "${step}"`, 'error');
-          return;
-        }
-
-        this.unattendedCompletedSteps.push(step);
+      try {
+        const response = await api.post('/pipeline/runs', {
+          session_id: settings.session_id, root_path: settings.rootPath,
+          backend: settings.backend, analyze_model: settings.analyzeModel,
+          propose_model: settings.proposeModel, workers: settings.workers,
+          relate_scope: Alpine.store('session').relate_scope || 'per_directory',
+          skip_dirs: Alpine.store('session').skip_dirs || [],
+        });
+        this.runPlanId = response.plan.plan_id;
+        await this.checkRunPlan();
+        Alpine.store('app').toast('Run saved and started. Progress survives a page reload.', 'success');
+      } catch (e) {
+        Alpine.store('app').toast(`Cannot start unattended run: ${e.message}`, 'error');
       }
-
-      // Completed successfully
-      const wasCancelled = !this.unattendedMode && this.unattendedFailedStep === null && this.unattendedQueue.length > 0;
-      this.unattendedMode = false;
-      this.unattendedCurrentStep = null;
-      const elapsedMs = Date.now() - this.unattendedStartTime;
-      const elapsedStr = this.formatElapsed(elapsedMs);
-
-      if (!wasCancelled && this.unattendedFailedStep === null) {
-        Alpine.store('app').toast(
-          `Unattended run complete! (${elapsedStr})\nReview proposals in Proposals tab, then click Commit.`,
-          'success'
-        );
-      }
-    },
-
-    async _runUnattendedStep(step) {
-      // Returns Promise<boolean> — true if step succeeded, false otherwise.
-      // Handles both synchronous steps and background jobs.
-      //
-      // After the v0.6 resilience refactor, ALL pipeline steps except 'scan'
-      // and 'execute-commit' run as background jobs. The unattended path uses
-      // 'execute-dry' (which is a background job), so the only sync step we
-      // hit here is 'scan'. Everything else resolves via _onJobComplete →
-      // _unattendedStepResolve.
-      return new Promise(async (resolve) => {
-        this._unattendedStepResolve = resolve;
-
-        try {
-          await this.runStep(step);
-
-          // Sync step (scan, execute-commit): runStep awaits completion.
-          // Resolve here based on result.error.
-          if (!this._BACKGROUND_STEPS.has(step)) {
-            const failed = this.result && this.result.error;
-            this._unattendedStepResolve = null;
-            resolve(!failed);
-          }
-          // For background steps, _onJobComplete will resolve our promise.
-        } catch (e) {
-          this._unattendedStepResolve = null;
-          resolve(false);
-        }
-      });
     },
   }));
 

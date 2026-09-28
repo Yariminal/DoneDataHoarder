@@ -14,8 +14,8 @@ DoneDataHoarder is a **local-first, AI-powered file organizer** that:
 - **Deduplication** — Finds exact and near-duplicate files using perceptual hashing
 - **Automatic Organization** — Groups related files (CAD models + exports, photos + backups, etc.)
 - **Cross-Script Support** — Safely handles Hebrew, Arabic, Chinese, and other non-Latin scripts
-- **Web Review UI** — Browser-based gallery to inspect and approve changes before they touch disk
-- **Safe by Default** — All operations are dry-run by default; you explicitly approve and commit changes
+- **Web Review UI** — Inspect proposed changes and their reasons before approving them
+- **Safe by Default** — Execution is a dry run by default; disk changes require reviewed proposals and an explicit commit
 
 ---
 
@@ -80,8 +80,11 @@ ddh serve
 
 ### Apply Approved Changes
 ```bash
-ddh execute --commit
+ddh execute --session YOUR_SESSION_ID --commit
 ```
+In the web UI, use **Review** to approve or edit proposals, then **Pipeline → Preview changes** to inspect the selected paths and counts before **Commit**. The web API requires a fresh preview token for a commit. The CLI requires the session ID and asks for confirmation.
+
+The web **Unattended Run** uses scan → enrich → analyze → dedup → relate → propose → organize → dry-run preview. It saves each step and checkpoint on the server, resumes an interrupted run only when you choose **Resume from checkpoint**, and never commits file changes automatically. Analysis provider failures appear separately with an explicit **Retry provider errors** action.
 
 ---
 
@@ -97,14 +100,16 @@ ddh execute --commit
 | `relate` | Group conceptually related files (CAD + exports, docs + versions, etc.) |
 | `propose` | Generate rename / tag / move proposals |
 | `review` | Interactive inspection of proposals before applying |
-| `execute` | Apply proposals (dry-run by default, use `--commit` to persist) |
-| `undo` | Reverse recent operations (restores from trash) |
+| `execute` | Preview reviewed proposals; use `--session <id> --commit` to apply them |
+| `undo` | Attempt to reverse logged operations, including restoring files from trash |
 | `stats` | View database statistics and session history |
-| `pipeline` | Run scan → enrich → dedup → analyze → relate → propose in one go |
+| `pipeline` | CLI sequence: scan → enrich → exact/perceptual dedup → analyze → propose → dry-run preview; it does not run relate or organize |
 | `serve` | Launch web UI for reviewing and approving proposals |
 | `models` | List available Ollama models |
 | `bench` | Benchmark AI performance on sample files |
 | `config` | Manage naming rules and preferences |
+
+To retry files that failed AI inference while keeping successful analysis, run `ddh analyze --session <id> --retry-errors --model gemma4:26b --workers 1`. This also processes newly enriched files; other scanner or metadata errors are excluded. Omit `--session` to analyze qualifying files across the selected database.
 
 ---
 
@@ -122,7 +127,7 @@ ddh execute --commit
 | Variable | Description |
 |----------|-------------|
 | `OLLAMA_HOST` | Ollama server URL (default: `http://localhost:11434`) |
-| `DDH_OLLAMA_TIMEOUT` | Per-request timeout in seconds (default: `300` = 5 min) |
+| `DATAHOARDER_OLLAMA_TIMEOUT` | Per-request timeout in seconds (default: `300` = 5 min) |
 | `GEMINI_API_KEY` | Gemini API key for cloud fallback |
 
 ### Logging & Debugging
@@ -213,14 +218,14 @@ Group files by semantic relationship:
 Generate proposals for each file:
 - **RENAME**: Meaningful filename based on AI analysis + relationships
 - **MOVE**: Reorganize into project folders
-- **TAG**: Add semantic tags
+- **TAG**: Save semantic tags in the DoneDataHoarder database (file metadata is not rewritten)
 - **MARK_DUPLICATE**: Flag as duplicate
 
 ### 7. **Review**
 Browse proposals in the web UI, adjust confidence thresholds, and approve before applying.
 
 ### 8. **Execute**
-Apply approved proposals:
+Apply approved or edited proposals:
 - Renames (with collision detection and backoff)
 - Moves (creating folders as needed)
 - Trash/delete duplicates
@@ -230,10 +235,10 @@ Apply approved proposals:
 
 ## 🛡️ Safety & Reliability
 
-- **Dry-run by default** — Nothing changes on disk until you explicitly use `--commit`
+- **Dry-run by default** — Execution does not change files until you explicitly use `--commit`
 - **SQLite WAL mode** — Prevents database-locked errors on long operations
 - **Configurable confidence thresholds** — Only apply changes you trust
-- **Reversible operations** — `undo` command restores from `.ddh_trash`
+- **Undo log** — `ddh undo --db YOUR_DB --session YOUR_SESSION_ID` attempts to reverse all outstanding logged operations for that session, including restoring trashed files. `ddh undo --last` selects the most recent session with outstanding operations; it does not limit recovery to one execute run. Recovery can fail if paths have since changed.
 - **Session tracking** — Every operation logged with timestamps and diffs
 - **No external scanning** — All analysis happens locally or with your Gemini API key
 
@@ -263,7 +268,7 @@ Downloads/
   בדיקה (1).docx
 ```
 
-**After running `ddh pipeline Downloads/ && ddh execute --commit`:**
+**After running the pipeline, reviewing proposals, and committing the selected session:**
 ```
 Downloads/
   2024-01-15_family_bbq.jpg           (was IMG_1234.jpg)
@@ -299,11 +304,12 @@ ddh config set naming.date_format "%Y-%m-%d"
 ddh config set naming.prefer_original_stem true
 ```
 
-### Adjust Confidence Thresholds
+### Apply Pending Proposals by Confidence (Explicit Opt-In)
 ```bash
-ddh propose --min-confidence 0.7  # Only high-confidence proposals
-ddh execute --confidence 0.6      # Apply medium-confidence changes
+ddh execute --session YOUR_SESSION_ID --include-pending --min-confidence 0.7
+ddh execute --session YOUR_SESSION_ID --include-pending --min-confidence 0.7 --commit
 ```
+Without `--include-pending`, execution selects only approved or edited proposals. The web Commit action always uses that reviewed-only selection.
 
 ### Selective Processing
 ```bash
@@ -351,8 +357,8 @@ sudo apt-get install ffmpeg
 ### "Timeout errors during analysis"
 Your hardware is slower. Increase timeout:
 ```bash
-export DDH_OLLAMA_TIMEOUT=600  # 10 minutes
-ddh analyze /path/to/files
+export DATAHOARDER_OLLAMA_TIMEOUT=600  # 10 minutes
+ddh analyze --retry-errors
 ```
 
 ### "Memory errors with large files"
@@ -391,7 +397,7 @@ Contributions welcome! To get started:
 ```bash
 git clone https://github.com/Yariminal/DoneDataHoarder.git
 cd DoneDataHoarder
-pip install -e ".[dev,all]"
+pip install -e ".[dev,web]"
 pytest tests/
 ```
 

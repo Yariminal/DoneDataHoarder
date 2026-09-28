@@ -281,9 +281,11 @@ def analyze(
     backend: Annotated[str, typer.Option("--backend", help="AI backend: ollama|gemini|auto", envvar="DDH_BACKEND")] = "ollama",
     ollama_host: Annotated[str, typer.Option("--ollama-host", help="Ollama server URL.", envvar="OLLAMA_HOST")] = "http://localhost:11434",
     model: Annotated[str, typer.Option("--model", help="Model name (must support vision).", envvar="DDH_MODEL")] = "gemma3:12b",
+    session_id: Annotated[Optional[str], typer.Option("--session", help="Analyze only this session.")] = None,
     workers: Annotated[int, typer.Option("--workers", "-w", help="Parallel workers.")] = 1,
     limit: Annotated[Optional[int], typer.Option("--limit", help="Max files to analyze.")] = None,
     min_size: Annotated[int, typer.Option("--min-size", help="Skip files smaller than N KB.")] = 1,
+    retry_errors: Annotated[bool, typer.Option("--retry-errors", help="Retry files that failed AI inference in a prior analysis run.")] = False,
 ):
     """[bold magenta]Analyze[/bold magenta] enriched files with AI (vision + text)."""
     _init_db(db)
@@ -296,7 +298,8 @@ def analyze(
         raise typer.Exit(1)
 
     from donedatahoarder.analyzers.pipeline import analyze as do_analyze
-    counts = do_analyze(workers=workers, limit=limit, min_size_kb=min_size)
+    counts = do_analyze(workers=workers, limit=limit, min_size_kb=min_size,
+                        session_id=session_id, retry_errors=retry_errors)
 
     console.print(
         f"\n[bold green]Analysis complete[/bold green] — "
@@ -485,6 +488,7 @@ def propose(
 @app.command()
 def review(
     db: Annotated[str, typer.Option("--db", help="SQLite database path.", envvar="DDH_DB")] = "donedatahoarder.db",
+    session_id: Annotated[Optional[str], typer.Option("--session", "-s", help="Limit review to this session.")] = None,
     min_confidence: Annotated[float, typer.Option("--min-confidence", "-c")] = 0.0,
     dupes: Annotated[bool, typer.Option("--dupes", help="Show duplicate groups instead of rename proposals.")] = False,
     interactive: Annotated[bool, typer.Option("--interactive", "-i", help="Approve/reject one by one.")] = False,
@@ -501,14 +505,17 @@ def review(
 
     # Auto-approve mode: bulk-approve and skip interactive preview
     if auto_apply:
-        count = _bulk_approve(min_confidence=min_confidence)
+        if not session_id:
+            console.print("[red]Specify --session before bulk approval.[/red]")
+            raise typer.Exit(2)
+        count = _bulk_approve(min_confidence=min_confidence, session_id=session_id)
         if count:
             console.print(
                 f"\n[bold green]Approved {count} proposals[/bold green] "
                 f"(confidence >= {min_confidence})."
             )
             console.print(
-                f"Run [bold]datahoarder execute --commit --min-confidence {min_confidence}[/bold] "
+                f"Run [bold]datahoarder execute --session {session_id} --commit[/bold] "
                 f"to apply them to disk."
             )
         else:
@@ -518,14 +525,15 @@ def review(
         return
 
     from donedatahoarder.executor import preview
-    preview(min_confidence=min_confidence, limit=limit, offset=offset)
+    preview(min_confidence=min_confidence, limit=limit, offset=offset,
+            session_id=session_id)
 
     if interactive:
-        _interactive_review(limit=limit, offset=offset)
+        _interactive_review(limit=limit, offset=offset, session_id=session_id)
     else:
         console.print(
-            "\nRun [bold]datahoarder execute[/bold] to apply all high-confidence proposals, "
-            "or [bold]datahoarder execute --commit[/bold] to apply for real."
+            "\nRun [bold]datahoarder execute --session <id>[/bold] to preview reviewed proposals, "
+            "or add [bold]--commit[/bold] to apply them."
         )
 
 
@@ -562,10 +570,12 @@ def _review_dupes(
 def _interactive_review(
     limit: Optional[int] = None,
     offset: Optional[int] = None,
+    session_id: str | None = None,
 ) -> None:
     """One-by-one proposal review loop."""
     from donedatahoarder.db.session import get_engine
-    from donedatahoarder.db.models import Proposal, ProposalStatus
+    from donedatahoarder.db.models import File, Proposal, ProposalStatus
+    from donedatahoarder.core.process_lock import operation_lock
     from sqlalchemy.orm import Session
 
     engine = get_engine()
@@ -576,6 +586,8 @@ def _interactive_review(
             .filter(Proposal.status == ProposalStatus.PENDING)
             .order_by(Proposal.confidence.desc())
         )
+        if session_id:
+            query = query.join(File).filter(File.session_id == session_id)
         total = query.count()
         if offset:
             query = query.offset(offset)
@@ -587,10 +599,14 @@ def _interactive_review(
     console.print("Keys: [green]y[/green]=approve  [red]n[/red]=reject  [yellow]s[/yellow]=skip  [bold]q[/bold]=quit\n")
 
     for i, prop in enumerate(proposals, 1):
+        confidence_label = (
+            f"conf={prop.confidence:.0%}" if prop.confidence is not None
+            else "individual review required"
+        )
         console.print(
             f"[dim]{i}/{len(proposals)}[/dim]  "
             f"[cyan]{prop.proposal_type.value}[/cyan]  "
-            f"conf={prop.confidence:.0%}  "
+            f"{confidence_label}  "
             f"[red]{Path(prop.current_value or '').name}[/red] -&gt; "
             f"[green]{Path(prop.proposed_value or '').name}[/green]"
         )
@@ -598,34 +614,66 @@ def _interactive_review(
             console.print(f"  [dim]{prop.reasoning[:100]}[/dim]")
 
         choice = typer.prompt("  Action", default="s")
-        with Session(engine) as session:
-            p = session.get(Proposal, prop.id)
-            if choice.lower() == "y":
-                p.status = ProposalStatus.APPROVED
-                console.print("  [green]Approved[/green]")
-            elif choice.lower() == "n":
-                p.status = ProposalStatus.REJECTED
-                console.print("  [red]Rejected[/red]")
-            elif choice.lower() == "q":
+        with operation_lock("interactive_review"):
+            with Session(engine) as session:
+                p = session.get(Proposal, prop.id)
+                if (p is None or p.status != ProposalStatus.PENDING
+                        or p.current_value != prop.current_value
+                        or p.proposed_value != prop.proposed_value):
+                    console.print("  [yellow]Proposal changed; review it again.[/yellow]")
+                    continue
+                if choice.lower() == "y":
+                    p.status = ProposalStatus.APPROVED
+                    p.review_kind = "individual"
+                    console.print("  [green]Approved[/green]")
+                elif choice.lower() == "n":
+                    p.status = ProposalStatus.REJECTED
+                    p.review_kind = "individual"
+                    console.print("  [red]Rejected[/red]")
+                elif choice.lower() == "q":
+                    break
                 session.commit()
-                break
-            session.commit()
 
 
-def _bulk_approve(min_confidence: float = 0.0) -> int:
-    """Bulk-approve all pending proposals above the confidence threshold."""
+def _bulk_approve(min_confidence: float = 0.0, session_id: str | None = None) -> int:
+    """Bulk-approve safe candidates; near matches need individual review."""
     from donedatahoarder.db.session import get_engine
-    from donedatahoarder.db.models import Proposal, ProposalStatus
+    from donedatahoarder.db.models import (
+        DupeType, DuplicateGroup, File, Proposal, ProposalStatus, ProposalType,
+        UserSession,
+    )
+    from donedatahoarder.core.dependency_protection import ProtectionIndex
+    from donedatahoarder.core.process_lock import operation_lock
+    from donedatahoarder.executor import _validate_operation_paths
     from sqlalchemy.orm import Session
 
     engine = get_engine()
-    with Session(engine) as session:
+    with operation_lock("bulk_review"), Session(engine) as session:
         query = (
             session.query(Proposal)
             .filter(Proposal.status == ProposalStatus.PENDING)
             .filter(Proposal.confidence >= min_confidence)
         )
-        count = query.update({"status": ProposalStatus.APPROVED})
+        if session_id:
+            query = query.join(File).filter(File.session_id == session_id)
+        user_session = session.get(UserSession, session_id) if session_id else None
+        root = Path(user_session.root_path) if user_session and user_session.root_path else None
+        protection = ProtectionIndex(root) if root else None
+        count = 0
+        for proposal in query.all():
+            if proposal.proposal_type == ProposalType.MARK_DUPLICATE:
+                group = (session.get(DuplicateGroup, proposal.duplicate_group_id)
+                         if proposal.duplicate_group_id else None)
+                if group is None or group.dupe_type != DupeType.EXACT:
+                    continue
+            try:
+                _validate_operation_paths(proposal, root, session.get(File, proposal.file_id),
+                                          protection)
+            except (ValueError, OSError):
+                continue
+            proposal.status = ProposalStatus.APPROVED
+            proposal.review_kind = "bulk"
+            count += 1
         session.commit()
     return count
 
@@ -638,19 +686,25 @@ def _bulk_approve(min_confidence: float = 0.0) -> int:
 def execute(
     db: Annotated[str, typer.Option("--db", help="SQLite database path.", envvar="DDH_DB")] = "donedatahoarder.db",
     commit: Annotated[bool, typer.Option("--commit", help="Apply changes for real (default is dry-run).")] = False,
-    min_confidence: Annotated[float, typer.Option("--min-confidence", "-c", help="Only apply proposals above this confidence.")] = 0.5,
+    session_id: Annotated[Optional[str], typer.Option("--session", "-s", help="Session whose reviewed proposals will be applied.")] = None,
+    include_pending: Annotated[bool, typer.Option("--include-pending", help="Also apply pending proposals above --min-confidence.")] = False,
+    min_confidence: Annotated[float, typer.Option("--min-confidence", "-c", help="Threshold used only with --include-pending.")] = 0.5,
 ):
     """
     [bold red]Execute[/bold red] proposals on disk.
 
     Defaults to dry-run. Pass [bold]--commit[/bold] to make real changes.
 
-    All changes are logged to ~/.datahoarder/undo.log for recovery.
-    Use [bold]datahoarder undo --last[/bold] to reverse recent operations.
+    Filesystem changes are journaled for recovery.
+    Use [bold]datahoarder undo --session <id>[/bold] to reverse them.
     """
     _init_db(db)
 
     from donedatahoarder.executor import execute as do_execute
+
+    if not session_id:
+        console.print("[red]Specify --session to select the reviewed work to execute.[/red]")
+        raise typer.Exit(2)
 
     if commit:
         console.print(Panel("[bold red]LIVE RUN — changes will be applied to disk[/bold red]", style="red"))
@@ -661,20 +715,11 @@ def execute(
     else:
         console.print(Panel("[bold yellow]DRY RUN — no files will be changed[/bold yellow]", style="yellow"))
 
-    # Resolve latest session for empty-dir cleanup
-    from donedatahoarder.db.models import UserSession
-    from donedatahoarder.db.session import get_engine
-    from sqlalchemy.orm import Session
-    latest_session = None
-    with Session(get_engine()) as s:
-        latest = s.query(UserSession).order_by(UserSession.updated_at.desc()).first()
-        if latest:
-            latest_session = latest.id
-
     do_execute(
         dry_run=not commit,
         min_confidence=min_confidence,
-        session_id=latest_session,
+        session_id=session_id,
+        include_pending=include_pending,
     )
 
 
@@ -684,13 +729,18 @@ def execute(
 
 @app.command()
 def undo(
-    last: Annotated[bool, typer.Option("--last", help="Undo the most recent batch of operations.")] = True,
+    db: Annotated[str, typer.Option("--db", help="SQLite database path.", envvar="DDH_DB")] = "donedatahoarder.db",
+    last: Annotated[bool, typer.Option("--last", help="Undo outstanding operations in the most recent session with pending recovery work.")] = True,
     session_id: Annotated[Optional[str], typer.Option("--session", "-s", help="Undo operations from a specific session.")] = None,
     force: Annotated[bool, typer.Option("--force", "-f", help="Skip confirmation prompt.")] = False,
     list_sessions: Annotated[bool, typer.Option("--list", "-l", help="List available undo sessions.")] = False,
 ):
-    """[bold red]Undo[/bold red] the last executed operations (requires --force to apply without confirmation)."""
-    from donedatahoarder.core.undo_log import undo_operations, list_undo_sessions
+    """[bold red]Undo[/bold red] outstanding journaled operations."""
+    from donedatahoarder.core.undo_log import (
+        undo_operations, list_undo_sessions, latest_undo_session_id,
+        get_last_session_entries,
+    )
+    _init_db(db)
 
     if list_sessions:
         sessions = list_undo_sessions()
@@ -717,8 +767,11 @@ def undo(
         console.print("Use --list to see available sessions.")
         raise typer.Exit(1)
 
-    if not force:
-        console.print(Panel("[bold yellow]DRY RUN — use --force to actually undo[/bold yellow]", style="yellow"))
+    if not session_id and last:
+        session_id = latest_undo_session_id()
+    if not session_id and not get_last_session_entries():
+        console.print("[yellow]No outstanding session operations to undo.[/yellow]")
+        return
 
     undo_operations(
         session_id=session_id,
@@ -799,23 +852,52 @@ def pipeline(
     """
     _init_db(db)
     root = root.resolve()
+    if not root.is_dir():
+        console.print(f"[red]Directory does not exist: {root}[/red]")
+        raise typer.Exit(1)
+
+    # A pipeline run owns one collection.  Passing its ID to every stage keeps
+    # files and proposals in other collections out of this run's review.
+    from donedatahoarder.db.models import SessionStatus, UserSession
+    from donedatahoarder.db.session import get_engine
+    from sqlalchemy.orm import Session
+
+    with Session(get_engine()) as session:
+        collection = UserSession(
+            name=root.name,
+            root_path=str(root),
+            backend=backend,
+            model=model,
+            analyze_model=model,
+            propose_model=model,
+            workers=workers,
+            status=SessionStatus.ACTIVE,
+        )
+        session.add(collection)
+        session.commit()
+        session_id = collection.id
+
     console.print(Panel(f"[bold]Full pipeline on:[/bold] {root}", style="bold cyan"))
+    console.print(f"Collection session: [cyan]{session_id}[/cyan]")
 
     # scan
     from donedatahoarder.core.scanner import scan as do_scan
     console.print("\n[bold cyan]Step 1/5: Scanning…[/bold cyan]")
-    do_scan(root)
+    do_scan(root, workers=workers, session_id=session_id)
 
     # enrich
     from donedatahoarder.core.enricher import enrich as do_enrich
     console.print("\n[bold green]Step 2/5: Enriching…[/bold green]")
-    do_enrich()
+    do_enrich(workers=workers, session_id=session_id)
 
     # dedup
-    from donedatahoarder.core.dedup import find_exact_duplicates, find_perceptual_duplicates
+    from donedatahoarder.core.dedup import (
+        find_exact_duplicates, find_perceptual_duplicates, generate_dedup_proposals,
+    )
     console.print("\n[bold yellow]Step 3/5: Deduplicating…[/bold yellow]")
-    find_exact_duplicates()
-    find_perceptual_duplicates()
+    find_exact_duplicates(session_id=session_id)
+    find_perceptual_duplicates(session_id=session_id)
+    generate_dedup_proposals(session_id=session_id)
 
     # analyze
     if not skip_analyze:
@@ -823,7 +905,7 @@ def pipeline(
         try:
             _init_ai(backend, ollama_host, model)
             from donedatahoarder.analyzers.pipeline import analyze as do_analyze
-            do_analyze(workers=workers)
+            do_analyze(workers=workers, session_id=session_id)
         except RuntimeError as exc:
             console.print(f"[yellow]AI analysis skipped: {exc}[/yellow]")
     else:
@@ -832,20 +914,24 @@ def pipeline(
     # propose
     console.print("\n[bold blue]Step 5/5: Generating proposals…[/bold blue]")
     from donedatahoarder.proposals.namer import generate_proposals
-    generate_proposals()
+    generate_proposals(session_id=session_id)
+
+    if dry_run:
+        console.print("\n[bold yellow]Previewing reviewed proposals…[/bold yellow]")
+        from donedatahoarder.executor import execute as do_execute
+        do_execute(dry_run=True, session_id=session_id)
 
     # summary
     console.print("\n")
-    stats(db=db)
+    console.print(f"Review session [cyan]{session_id}[/cyan] before executing changes.")
 
     console.print(
         Panel(
             "[bold green]Pipeline complete![/bold green]\n\n"
             "Next steps:\n"
-            "  • [cyan]datahoarder review[/cyan]               — inspect rename proposals\n"
-            "  • [cyan]datahoarder review --dupes[/cyan]        — inspect duplicate groups\n"
-            "  • [cyan]datahoarder review --interactive[/cyan]  — approve one by one\n"
-            "  • [cyan]datahoarder execute --commit[/cyan]      — apply approved changes\n",
+            f"  • [cyan]datahoarder review --session {session_id}[/cyan] — inspect proposals\n"
+            f"  • [cyan]datahoarder execute --session {session_id}[/cyan] — preview approvals\n"
+            f"  • [cyan]datahoarder execute --session {session_id} --commit[/cyan] — apply approvals\n",
             style="green",
         )
     )

@@ -21,6 +21,7 @@ from rich.progress import (
     BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
     TaskProgressColumn, TextColumn, TimeElapsedColumn,
 )
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from donedatahoarder.analyzers.archive import ArchiveAnalyzer
@@ -37,6 +38,47 @@ from donedatahoarder.logging import get_logger
 logger = get_logger(__name__)
 
 QUERY_BATCH = 50
+AI_INFERENCE_FAILED_PREFIX = "AI inference failed:"
+
+
+def _wait_ready(
+    pause_event: threading.Event | None,
+    cancel_check: Callable[[], bool] | None,
+) -> bool:
+    """Return False if cancellation arrived while a pipeline was paused."""
+    while pause_event is not None and not pause_event.wait(timeout=0.25):
+        if cancel_check and cancel_check():
+            return False
+    return not (cancel_check and cancel_check())
+
+
+def _provider_reason(message: str) -> str:
+    detail = message.lower()
+    if "timed out" in detail or "timeout" in detail:
+        return "provider_timeout"
+    if "output token limit" in detail or "done_reason=length" in detail:
+        return "provider_output_limit"
+    if "json" in detail or "invalid response" in detail:
+        return "provider_invalid_response"
+    if "http" in detail or "status code" in detail or "connection" in detail:
+        return "provider_http_error"
+    return "provider_failure"
+
+
+def _eligible_for_analysis(retry_errors: bool):
+    eligible = File.status == FileStatus.ENRICHED
+    if retry_errors:
+        eligible = or_(
+            eligible,
+            and_(
+                File.status == FileStatus.ERROR,
+                or_(
+                    File.analysis_reason.startswith("provider_"),
+                    File.error_message.startswith(AI_INFERENCE_FAILED_PREFIX),
+                ),
+            ),
+        )
+    return eligible
 
 
 def _get_analyzer(
@@ -77,12 +119,18 @@ def _process_one_file(
         ext = file_rec.extension or ""
         if ext in skip_ext:
             file_rec.status = FileStatus.SKIPPED
+            file_rec.analysis_outcome = "skipped"
+            file_rec.analysis_reason = "excluded_extension"
+            file_rec.analysis_evidence_source = "none"
             session.commit()
             return file_id, "skipped", None
 
         analyzer = _get_analyzer(analyzers, file_rec.mime_type, ext)
         if not analyzer:
             file_rec.status = FileStatus.SKIPPED
+            file_rec.analysis_outcome = "skipped"
+            file_rec.analysis_reason = "unsupported_type"
+            file_rec.analysis_evidence_source = "none"
             mime = file_rec.mime_type or ""
             if mime.startswith("video/") or ext in (
                 ".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v",
@@ -100,18 +148,28 @@ def _process_one_file(
         ctx = build_context(file_rec)
         try:
             result: AnalysisResult = analyzer.analyze(file_rec, ctx)
-            analyzer.save_result(
-                file_rec, result, model_name=str(type(client).__name__),
+            if result.description.startswith(AI_INFERENCE_FAILED_PREFIX):
+                # Existing analyzers use this sentinel for provider failures.
+                raise RuntimeError(result.description)
+            uses_vision = result.evidence_source == "vision"
+            model_name = (
+                getattr(client, "vision_model" if uses_vision else "text_model", None)
+                or getattr(client, "model_name", None)
+                or type(client).__name__
             )
+            model_digest = None
+            if result.outcome != "skipped" and hasattr(client, "model_digest"):
+                model_digest = client.model_digest(model_name)
+            analyzer.save_result(file_rec, result, model_name, model_digest)
             logger.info(
                 "AI analysis complete",
                 extra={
                     "file_id": file_id,
                     "file_name": file_rec.filename,
-                    "model": str(type(client).__name__),
+                    "model": model_name,
                 },
             )
-            return file_id, "analyzed", None
+            return file_id, "skipped" if result.outcome == "skipped" else "analyzed", None
         except Exception as exc:
             tb = traceback.format_exc()
             logger.warning(
@@ -124,6 +182,10 @@ def _process_one_file(
             )
             file_rec.status = FileStatus.ERROR
             file_rec.error_message = f"{exc}\n{tb}"[:1000]
+            file_rec.analysis_outcome = "failed"
+            file_rec.analysis_reason = _provider_reason(str(exc)) if (
+                str(exc).startswith(AI_INFERENCE_FAILED_PREFIX)
+            ) else "analyzer_error"
             session.commit()
             return file_id, "error", str(exc)
 
@@ -134,6 +196,7 @@ def analyze(
     min_size_kb: int = 0,
     skip_extensions: Optional[set[str]] = None,
     session_id: str | None = None,
+    retry_errors: bool = False,
 ) -> dict:
     """
     Run AI analysis on all ENRICHED files (CLI version with Rich progress).
@@ -162,6 +225,7 @@ def analyze(
             min_size_kb=min_size_kb,
             skip_extensions=skip_extensions,
             session_id=session_id,
+            retry_errors=retry_errors,
         ):
             counts["analyzed"] = event.get("analyzed", counts["analyzed"])
             counts["skipped"] = event.get("skipped", counts["skipped"])
@@ -184,12 +248,13 @@ def analyze(
     return counts
 
 
-def analyze_with_progress(
+def _analyze_with_progress_unlocked(
     workers: int = 1,
     limit: Optional[int] = None,
     min_size_kb: int = 0,
     skip_extensions: Optional[set[str]] = None,
     session_id: str | None = None,
+    retry_errors: bool = False,
     pause_event: threading.Event | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ):
@@ -222,12 +287,14 @@ def analyze_with_progress(
     effective_workers = max(1, workers)
 
     with Session(engine) as session:
-        query = session.query(File).filter(File.status == FileStatus.ENRICHED)
+        query = session.query(File).filter(_eligible_for_analysis(retry_errors))
         if session_id:
             query = query.filter(File.session_id == session_id)
         if min_size_kb:
             query = query.filter(File.size_bytes >= min_size_kb * 1024)
-        if limit:
+        if limit is not None:
+            if limit < 0:
+                raise ValueError("limit must be non-negative")
             query = query.limit(limit)
         total = query.count()
 
@@ -235,9 +302,17 @@ def analyze_with_progress(
         yield {"done": True, **counts}
         return
 
+    # Resolve tag digests once before workers fan out. This is a snapshot of
+    # installed Ollama metadata, not a per-response attestation.
+    if hasattr(client, "model_digest"):
+        for tag in {getattr(client, "text_model", None),
+                    getattr(client, "vision_model", None)} - {None}:
+            client.model_digest(tag)
+
     yield {"current": 0, "total": total, **counts}
 
     processed = 0
+    last_seen_id = 0
 
     while True:
         if cancel_check and cancel_check():
@@ -245,14 +320,20 @@ def analyze_with_progress(
             return
 
         with Session(engine) as db:
-            awp_q = db.query(File.id).filter(File.status == FileStatus.ENRICHED)
+            awp_q = db.query(File.id).filter(
+                _eligible_for_analysis(retry_errors), File.id > last_seen_id,
+            )
             if session_id:
                 awp_q = awp_q.filter(File.session_id == session_id)
             if min_size_kb:
                 awp_q = awp_q.filter(File.size_bytes >= min_size_kb * 1024)
-            batch = awp_q.limit(QUERY_BATCH).all()
+            remaining = total - processed
+            queue_bound = min(QUERY_BATCH, max(1, effective_workers * 2), remaining)
+            batch = awp_q.order_by(File.id).limit(queue_bound).all()
         if not batch:
             break
+        # Failed retries remain ERROR; advance so each ID is tried once per run.
+        last_seen_id = batch[-1][0]
 
         if effective_workers <= 1:
             # ----- Sequential path -----
@@ -260,8 +341,9 @@ def analyze_with_progress(
                 if cancel_check and cancel_check():
                     yield {"cancelled": True, **counts}
                     return
-                if pause_event:
-                    pause_event.wait()
+                if not _wait_ready(pause_event, cancel_check):
+                    yield {"cancelled": True, **counts}
+                    return
 
                 fid, status, error = _process_one_file(
                     file_id, engine, analyzer_list, client, skip_ext,
@@ -276,8 +358,9 @@ def analyze_with_progress(
         else:
             # ----- Parallel path -----
             # Check pause before submitting the batch
-            if pause_event:
-                pause_event.wait()
+            if not _wait_ready(pause_event, cancel_check):
+                yield {"cancelled": True, **counts}
+                return
 
             with ThreadPoolExecutor(max_workers=effective_workers) as pool:
                 futures = {
@@ -309,3 +392,24 @@ def analyze_with_progress(
             break
 
     yield {"done": True, **counts}
+
+
+def analyze_with_progress(
+    workers: int = 1,
+    limit: Optional[int] = None,
+    min_size_kb: int = 0,
+    skip_extensions: Optional[set[str]] = None,
+    session_id: str | None = None,
+    retry_errors: bool = False,
+    pause_event: threading.Event | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+):
+    from donedatahoarder.core.process_lock import operation_lock
+
+    with operation_lock("analyze"):
+        yield from _analyze_with_progress_unlocked(
+            workers=workers, limit=limit, min_size_kb=min_size_kb,
+            skip_extensions=skip_extensions, session_id=session_id,
+            retry_errors=retry_errors, pause_event=pause_event,
+            cancel_check=cancel_check,
+        )

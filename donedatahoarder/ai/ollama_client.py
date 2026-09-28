@@ -22,6 +22,35 @@ from donedatahoarder.ai.circuit_breaker import CircuitBreaker
 from donedatahoarder.ai.json_utils import generate_json_with_retry
 
 DEFAULT_HOST = "http://localhost:11434"
+GEMMA4_MAX_OUTPUT_TOKENS = 4096
+
+
+def _apply_generation_options(payload: dict, kwargs: dict, model: str) -> None:
+    """Bound Gemma 4 by default; forward only requested controls otherwise."""
+    is_gemma4 = model.lower().split(":", 1)[0] == "gemma4"
+    num_predict = kwargs.get("num_predict")
+    if num_predict is None and is_gemma4:
+        num_predict = GEMMA4_MAX_OUTPUT_TOKENS
+    if num_predict is not None:
+        if isinstance(num_predict, bool) or not isinstance(num_predict, int) or num_predict <= 0:
+            raise ValueError("num_predict must be a positive integer")
+        payload["options"]["num_predict"] = num_predict
+    think = kwargs.get("think")
+    if think is None and is_gemma4:
+        think = False
+    if think is not None:
+        if not isinstance(think, bool):
+            raise ValueError("think must be a boolean")
+        payload["think"] = think
+
+
+def _response_text(data: dict, model: str) -> str:
+    if data.get("done_reason") == "length":
+        raise ValueError(
+            f"Ollama {model} stopped at its output token limit; "
+            "the response may be incomplete"
+        )
+    return data.get("response", "").strip()
 
 # Ollama processes LLM requests serially. This lock prevents multiple threads
 # from sending concurrent requests — they'd just queue inside Ollama and the
@@ -69,6 +98,7 @@ class OllamaClient(BaseAIClient):
             failure_threshold=failure_threshold,
             recovery_timeout_seconds=recovery_timeout,
         )
+        self._model_digest_cache: dict[str, str | None] = {}
         # NOTE: We create a fresh httpx client per request (via _request)
         # instead of sharing one across threads. A shared httpx.Client
         # causes connection pool deadlocks when multiple threads hit
@@ -104,6 +134,23 @@ class OllamaClient(BaseAIClient):
 
     def close(self) -> None:
         pass  # No persistent client to close
+
+    def model_digest(self, model: str) -> str | None:
+        """Snapshot the installed tag digest once per model for provenance."""
+        if model not in self._model_digest_cache:
+            digest = None
+            try:
+                with httpx.Client(timeout=5) as client:
+                    response = client.get(f"{self.host}/api/tags")
+                    response.raise_for_status()
+                    for entry in response.json().get("models", []):
+                        if entry.get("name") == model or entry.get("model") == model:
+                            digest = entry.get("digest")
+                            break
+            except Exception:
+                pass
+            self._model_digest_cache[model] = digest
+        return self._model_digest_cache[model]
 
     # ------------------------------------------------------------------
     # Text generation
@@ -150,6 +197,7 @@ class OllamaClient(BaseAIClient):
             "stream": False,
             "options": options,
         }
+        _apply_generation_options(payload, kwargs, model)
         if system:
             payload["system"] = system
 
@@ -173,7 +221,7 @@ class OllamaClient(BaseAIClient):
             with httpx.Client(timeout=timeout) as client:
                 resp = client.post(f"{self.host}/api/generate", json=payload)
                 resp.raise_for_status()
-                result = resp.json().get("response", "").strip()
+                result = _response_text(resp.json(), model)
                 self.circuit_breaker.record_success()
                 return result
 
@@ -246,6 +294,7 @@ class OllamaClient(BaseAIClient):
             "stream": False,
             "options": options,
         }
+        _apply_generation_options(payload, kwargs, model)
         if system:
             payload["system"] = system
 
@@ -267,7 +316,7 @@ class OllamaClient(BaseAIClient):
             with httpx.Client(timeout=timeout) as client:
                 resp = client.post(f"{self.host}/api/generate", json=payload)
                 resp.raise_for_status()
-                result = resp.json().get("response", "").strip()
+                result = _response_text(resp.json(), model)
                 self.circuit_breaker.record_success()
                 return result
 

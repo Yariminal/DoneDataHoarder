@@ -291,7 +291,11 @@
                 <td class="text-sm" x-text="formatSize(f.size_bytes)"></td>
                 <td class="text-sm text-dim truncate" x-text="f.mime_type || f.extension || '-'" style="max-width:160px"></td>
                 <td><span class="badge" :class="'badge-' + f.status" x-text="f.status"></span></td>
-                <td class="text-sm truncate" x-text="f.ai_description || '-'" style="max-width:280px"></td>
+                <td class="text-sm" style="max-width:280px;overflow-wrap:anywhere;">
+                  <div x-text="f.ai_description || '-'" class="truncate"></div>
+                  <div class="text-dim" x-show="f.analysis_outcome && f.analysis_outcome !== 'content_verified'" x-text="`${f.analysis_outcome}: ${f.analysis_reason || f.analysis_evidence_source || 'content not verified'}`"></div>
+                  <div style="color:var(--danger)" x-show="f.error_message" x-text="f.error_message"></div>
+                </td>
                 <td><button class="btn btn-ghost btn-sm" @click="viewFile(f.id)">View</button></td>
               </tr>
             </template>
@@ -325,8 +329,13 @@
               <dt>Status</dt><dd><span class="badge" :class="'badge-' + selectedFile.status" x-text="selectedFile.status"></span></dd>
               <dt>Date (best)</dt><dd x-text="selectedFile.date_best || '-'"></dd>
               <dt>Date EXIF</dt><dd x-text="selectedFile.date_exif || '-'"></dd>
-              <dt>AI Model</dt><dd x-text="selectedFile.ai_model || '-'"></dd>
-              <dt>Confidence</dt><dd x-text="selectedFile.ai_confidence ? (selectedFile.ai_confidence * 100).toFixed(0) + '%' : '-'"></dd>
+              <dt>Model</dt><dd x-text="selectedFile.analysis_model_tag || selectedFile.ai_model || '-'"></dd>
+              <dt>Model digest</dt><dd class="text-mono text-sm" x-text="selectedFile.analysis_model_digest || '-'"></dd>
+              <dt>Evidence</dt><dd x-text="`${selectedFile.analysis_outcome || 'Unknown'} · ${selectedFile.analysis_evidence_source || 'unknown source'}`"></dd>
+              <dt>Extractor</dt><dd x-text="selectedFile.analysis_extractor_version || '-'"></dd>
+              <dt>Prompt</dt><dd x-text="selectedFile.analysis_prompt_version || '-'"></dd>
+              <dt>Failure or limitation</dt><dd x-text="selectedFile.analysis_reason || selectedFile.error_message || '-'" style="overflow-wrap:anywhere;"></dd>
+              <dt>AI self-score</dt><dd x-text="selectedFile.ai_confidence != null ? (selectedFile.ai_confidence * 100).toFixed(0) + '% (not safety probability)' : '-'"></dd>
               <dt>Description</dt><dd x-text="selectedFile.ai_description || '-'"></dd>
               <dt>Tags</dt><dd x-text="selectedFile.ai_tags ? selectedFile.ai_tags.join(', ') : '-'"></dd>
             </dl>
@@ -375,6 +384,8 @@
         <select class="input" x-model="typeFilter" @change="page=1; load()">
           <option value="">All types</option>
           <option value="rename">Rename</option>
+          <option value="rename_folder">Rename folder</option>
+          <option value="move">Move</option>
           <option value="add_tags">Tags</option>
           <option value="mark_duplicate">Duplicates</option>
         </select>
@@ -395,7 +406,7 @@
           <label class="text-sm text-dim">Min confidence:</label>
           <input type="number" class="input input-sm" x-model.number="bulkConfidence"
                  min="0" max="100" style="width:60px;"> <span class="text-sm text-dim">%</span>
-          <button class="btn btn-success btn-sm" @click="bulkApprove()">Approve All</button>
+          <button class="btn btn-success btn-sm" @click="bulkApprove()">Approve matching</button>
         </div>
       </div>
 
@@ -408,7 +419,7 @@
               <th>Current</th>
               <th></th>
               <th>Proposed</th>
-              <th>Confidence</th>
+              <th title="Model self-score; not a safety probability">AI score</th>
               <th>Status</th>
               <th style="width:180px">Actions</th>
             </tr>
@@ -421,7 +432,36 @@
                 <td class="proposal-arrow">-&gt;</td>
                 <td>
                   <template x-if="editingId !== p.id">
-                    <span class="proposed-name truncate" x-text="p.proposed_value" :title="p.proposed_value"></span>
+                    <div>
+                      <span class="proposed-name truncate" x-text="p.proposed_value" :title="p.proposed_path || p.proposed_value"></span>
+                      <details class="text-sm text-dim mt-1" style="max-width:420px; overflow-wrap:anywhere;">
+                        <summary style="cursor:pointer;">Why and full paths</summary>
+                        <div><strong>Source:</strong> <span x-text="p.current_path || p.file_path"></span></div>
+                        <div><strong>Proposed:</strong> <span x-text="p.proposed_path || p.proposed_value"></span></div>
+                        <div x-show="p.reasoning"><strong>Reason:</strong> <span x-text="p.reasoning"></span></div>
+                        <div><strong>Analysis:</strong> <span x-text="(p.analysis_outcome || 'unknown (legacy; reanalysis needed)') + ' · ' + (p.analysis_evidence_source || 'unknown source') + (p.analysis_model_tag ? ' · ' + p.analysis_model_tag : '')"></span></div>
+                        <div x-show="p.analysis_reason"><strong>Limitation:</strong> <span x-text="p.analysis_reason"></span></div>
+                        <div x-show="p.protected" style="color:var(--danger)"><strong>Protected:</strong> <span x-text="p.protection_reason"></span></div>
+                        <template x-if="p.proposal_type === 'mark_duplicate'">
+                          <div class="mt-1">
+                            <div x-text="duplicateEvidenceText(p.duplicate_evidence)"></div>
+                            <div x-show="p.duplicate_evidence?.type !== 'exact'" style="color:var(--warning)">Similarity candidate only. Both files require individual inspection; bulk trash approval is disabled.</div>
+                            <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:7px;">
+                              <div style="min-width:0;"><strong>Candidate</strong>
+                                <template x-if="hasImage(p.file_id, p.mime_type)"><img :src="'/api/files/' + p.file_id + '/thumbnail?size=180'" loading="lazy" alt="Candidate image" style="display:block;max-width:100%;max-height:180px;margin:5px 0;"></template>
+                                <div style="overflow-wrap:anywhere" x-text="p.file_path"></div>
+                                <div x-text="p.ai_description || 'No content description'"></div>
+                              </div>
+                              <div style="min-width:0;"><strong>Selected keeper</strong>
+                                <template x-if="p.duplicate_evidence && p.duplicate_evidence.keeper_id && hasImage(p.duplicate_evidence.keeper_id, p.mime_type)"><img :src="'/api/files/' + p.duplicate_evidence.keeper_id + '/thumbnail?size=180'" loading="lazy" alt="Keeper image" style="display:block;max-width:100%;max-height:180px;margin:5px 0;"></template>
+                                <div style="overflow-wrap:anywhere" x-text="p.duplicate_evidence?.keeper_path || 'Unknown keeper'"></div>
+                                <div x-text="p.duplicate_evidence?.keeper_description || 'No content description'"></div>
+                              </div>
+                            </div>
+                          </div>
+                        </template>
+                      </details>
+                    </div>
                   </template>
                   <template x-if="editingId === p.id">
                     <div class="flex items-center" style="gap:6px">
@@ -433,7 +473,7 @@
                   </template>
                 </td>
                 <td>
-                  <span :style="'color:' + confColor(p.confidence)"
+                  <span :style="'color:' + confColor(p.confidence)" title="Model-reported self-score; not a probability that this change is safe"
                         x-text="p.confidence ? (p.confidence * 100).toFixed(0) + '%' : '?'"></span>
                 </td>
                 <td><span class="badge" :class="'badge-' + p.status" x-text="p.status"></span></td>
@@ -489,29 +529,31 @@
             <div>
               <span class="badge" :class="'badge-' + g.dupe_type" x-text="g.dupe_type"></span>
               <strong x-text="g.count + ' files'"></strong>
-              <span class="text-dim text-sm" x-text="'Wasted: ' + formatBytes(g.wasted_bytes)"></span>
+                  <span class="text-dim text-sm" x-show="g.dupe_type === 'exact'" x-text="'Exact-hash candidate bytes: ' + formatBytes(g.wasted_bytes)"></span>
+              <span class="text-dim text-sm" x-text="g.evidence_label"></span>
+                  <span class="text-sm" x-show="g.dupe_type !== 'exact'" style="color:var(--warning)">Similarity candidates; inspect both files. Not evidence of safe disposal.</span>
             </div>
           </div>
           <div class="dupe-files">
-            <template x-for="f in g.files" :key="f.id">
-              <div class="dupe-file" :class="{ keeper: f.is_keeper }">
-                <template x-if="isImage(f)">
-                  <img :src="'/api/files/' + f.id + '/thumbnail?size=44'" class="thumb" loading="lazy" alt="">
-                </template>
-                <template x-if="!isImage(f)">
-                  <div class="thumb" style="display:flex;align-items:center;justify-content:center;font-size:.7rem;color:var(--text-dim)">FILE</div>
-                </template>
-                <div style="flex:1;min-width:0;">
-                  <div class="truncate text-mono text-sm" :title="f.path" x-text="f.filename"></div>
-                  <div class="text-dim text-sm truncate" style="max-width:500px" x-text="f.path"></div>
+            <template x-for="f in candidates(g)" :key="f.id">
+              <div class="dupe-file" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start;">
+                <div style="min-width:0;overflow-wrap:anywhere;">
+                  <strong>Candidate</strong>
+                  <template x-if="isImage(f)"><img :src="'/api/files/' + f.id + '/thumbnail?size=160'" loading="lazy" alt="Candidate image" style="display:block;max-width:100%;max-height:160px;margin:5px 0;"></template>
+                  <div class="text-mono text-sm" x-text="f.path"></div>
+                  <div class="text-sm" x-text="f.ai_description || 'No content description'"></div>
+                  <div class="text-sm text-dim" x-text="formatBytes(f.size_bytes)"></div>
+                  <div class="text-sm" x-show="f.protected" style="color:var(--danger)" x-text="'Protected: ' + f.protection_reason"></div>
                 </div>
-                <span class="text-sm" x-text="formatBytes(f.size_bytes)"></span>
-                <template x-if="f.is_keeper">
-                  <span class="keeper-star" title="Keeper">&#9733; Keep</span>
-                </template>
-                <template x-if="!f.is_keeper">
-                  <button class="btn btn-outline btn-sm" @click="setKeeper(g.id, f.id)">Set as keeper</button>
-                </template>
+                <div style="min-width:0;overflow-wrap:anywhere;">
+                  <strong>Selected keeper</strong>
+                  <template x-if="keeper(g) && isImage(keeper(g))"><img :src="'/api/files/' + g.keep_file_id + '/thumbnail?size=160'" loading="lazy" alt="Keeper image" style="display:block;max-width:100%;max-height:160px;margin:5px 0;"></template>
+                  <div class="text-mono text-sm" x-text="keeper(g)?.path || 'No keeper selected'"></div>
+                  <div class="text-sm" x-text="keeper(g)?.ai_description || 'No content description'"></div>
+                  <div class="text-sm text-dim" x-text="keeper(g) ? formatBytes(keeper(g).size_bytes) : ''"></div>
+                  <div class="text-sm text-dim" x-text="evidenceText(g, f)"></div>
+                  <button class="btn btn-outline btn-sm mt-1" @click="setKeeper(g.id, f.id)">Keep candidate instead</button>
+                </div>
               </div>
             </template>
           </div>
@@ -569,7 +611,7 @@
           <div style="flex:1; min-width:200px;">
             <div class="card-label" style="color:var(--primary);">🌙 Unattended Run</div>
             <div class="text-sm text-dim mt-1">
-              Runs scan → enrich → dedup → relate → analyze → propose → organize → dry run automatically.
+              Runs scan → enrich → analyze → dedup → relate → propose → organize → dry run automatically.
               <strong>No commit</strong> — review proposals when you return.
             </div>
             <!-- Progress display when running -->
@@ -589,19 +631,27 @@
                 <div class="text-dim mt-1" x-text="'Remaining: ' + unattendedQueue.length + ' step(s)'"></div>
               </div>
             </template>
-            <!-- Show last failure -->
+            <template x-if="runPlanState === 'completed'">
+              <div class="mt-1 text-sm" style="color:var(--success);">Run completed. Review proposals before applying changes.</div>
+            </template>
+            <!-- Show persisted failure after reload or worker restart -->
             <template x-if="!unattendedMode && unattendedFailedStep">
               <div class="mt-1 text-sm" style="color:var(--danger);">
-                ⚠ Last unattended run stopped at: <strong x-text="unattendedFailedStep"></strong>
+                ⚠ Run <strong x-text="runPlanState"></strong> at <strong x-text="unattendedFailedStep"></strong>.
+                <span x-show="analysisErrors?.retryable" x-text="analysisErrors.retryable + ' provider errors can be retried.'"></span>
+                <span x-show="runPlanError" x-text="runPlanError"></span>
               </div>
             </template>
+            <button class="btn btn-outline btn-sm mt-1" x-show="['ready', 'failed', 'interrupted', 'cancelled'].includes(runPlanState)"
+                    @click="resumeUnattended()"
+                    x-text="runPlanState === 'ready' ? 'Start saved run' : 'Resume from checkpoint'"></button>
           </div>
           <div>
             <button
               class="btn btn-primary"
               :class="{ 'btn-danger': unattendedMode }"
               @click="runUnattended()"
-              :disabled="(running || activeJobId) && !unattendedMode">
+              :disabled="(running || activeJobId || runPlanState === 'ready') && !unattendedMode">
               <span x-text="unattendedMode ? '⏹ Cancel' : '▶ Start Unattended Run'"></span>
             </button>
           </div>
@@ -755,6 +805,9 @@
                     x-show="activeJobType === 'analyze' && jobState === 'paused'">Resume</button>
             <button class="btn btn-danger btn-sm" @click="cancelJob()"
                     x-show="activeJobType === 'analyze' && (jobState === 'running' || jobState === 'paused')">Cancel</button>
+            <button class="btn btn-outline btn-sm" x-show="analysisErrors?.retryable && !running && !unattendedMode"
+                    @click="retryAnalysisErrors()"
+                    x-text="'Retry ' + analysisErrors.retryable + ' provider error(s)'"></button>
           </div>
         </div>
         <div class="pipeline-step">
@@ -815,7 +868,7 @@
           <div class="step-num" :class="{ 'step-done': isStepDone('execute') }" x-text="isStepDone('execute') ? '✓' : '8'"></div>
           <div class="step-info">
             <div class="step-name">Execute</div>
-            <div class="step-desc">Apply approved proposals to disk. Dry Run is a background job (resilient to disconnects); Commit stays synchronous (requires confirmation).</div>
+            <div class="step-desc">Preview the approved or edited proposals, then apply them to disk. Dry Run checks outcomes without changing files.</div>
             <template x-if="executeProgress && (executeProgress.phase === 'running' || executeProgress.phase === 'starting')">
               <div class="mt-1 text-sm" style="color:var(--primary); font-weight:600;">
                 <span x-show="jobState === 'paused'" style="color:var(--warning);">Paused</span>
@@ -824,9 +877,10 @@
             </template>
           </div>
           <div class="btn-group">
+            <button class="btn btn-outline btn-sm" :disabled="running" @click="loadCommitPreview()">Preview changes</button>
             <button class="btn btn-outline btn-sm" :disabled="running" @click="runStep('execute-dry')"
                     x-show="!(activeJobType === 'execute' && (jobState === 'running' || jobState === 'paused'))">Dry Run</button>
-            <button class="btn btn-danger btn-sm" :disabled="running" @click="runStep('execute-commit')"
+            <button class="btn btn-danger btn-sm" :disabled="running || !commitPreview || !commitPreview.total || commitPreview.errors || commitPreview.session_id !== $store.session.current_session_id" @click="runStep('execute-commit')"
                     x-show="!(activeJobType === 'execute' && (jobState === 'running' || jobState === 'paused'))">Commit</button>
             <button class="btn btn-outline btn-sm" @click="pauseJob()"
                     x-show="activeJobType === 'execute' && jobState === 'running'">Pause</button>
@@ -837,10 +891,43 @@
           </div>
         </div>
       </div>
+      <template x-if="commitPreview && commitPreview.session_id === $store.session.current_session_id">
+        <div class="card mt-2" style="max-width:900px;">
+          <div class="card-label">Reviewed changes selected for this session: <span x-text="commitPreview.total"></span></div>
+          <p class="text-sm text-dim mt-1">These are the ordered paths the executor plans to use after folder, rename, and move cascades. Failing actions must be resolved before commit.</p>
+          <div class="text-sm mt-1" x-text="Object.entries(commitPreview.by_type).map(([type, count]) => `${type}: ${count}`).join(' · ') || 'Nothing approved yet'"></div>
+          <div class="text-sm mt-1" x-show="commitPreview.errors" style="color:var(--danger)" x-text="`${commitPreview.errors} action(s) have preflight errors`"></div>
+          <div style="max-height:280px; overflow:auto; margin-top:10px;">
+            <template x-for="item in commitPreview.items" :key="item.id">
+              <div class="text-sm" style="padding:7px 0; border-top:1px solid var(--border); overflow-wrap:anywhere;">
+                <strong x-text="item.type === 'add_tags' ? 'Save tags in library' : item.type.replaceAll('_', ' ')"></strong>
+                <div class="text-mono" x-text="item.source"></div>
+                <div class="text-mono text-dim" x-show="item.destination" x-text="'→ ' + item.destination"></div>
+                <div class="text-dim" x-show="item.keeper" x-text="'Selected keeper: ' + item.keeper"></div>
+                <div x-show="item.error" style="color:var(--danger)" x-text="'Cannot run: ' + item.error"></div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
 
       <!-- Result display -->
       <template x-if="result">
         <div class="mt-2" style="max-width:900px">
+          <div class="card mb-2" x-show="result.suppressed_unsafe">
+            <div class="card-label" x-text="`${result.suppressed_unsafe} unsafe organization suggestions withheld`"></div>
+            <div class="text-sm text-dim mt-1" x-text="Object.entries(result.suppression_reasons || {}).map(([reason, count]) => `${count} — ${reason}`).join(' · ')"></div>
+            <details class="text-sm mt-1" x-show="(result.suppression_examples || []).length">
+              <summary style="cursor:pointer;">Affected paths</summary>
+              <template x-for="example in result.suppression_examples || []" :key="example.source + example.destination">
+                <div style="overflow-wrap:anywhere;padding:5px 0;border-top:1px solid var(--border);">
+                  <div class="text-mono" x-text="example.source"></div>
+                  <div class="text-mono text-dim" x-text="'→ ' + example.destination"></div>
+                  <div x-text="example.reason"></div>
+                </div>
+              </template>
+            </details>
+          </div>
           <!-- Tree visualization for organize results -->
           <template x-if="result.before_tree || result.after_tree">
             <div style="display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:16px;">

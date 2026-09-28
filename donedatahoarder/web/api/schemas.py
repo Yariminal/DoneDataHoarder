@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class StatsResponse(BaseModel):
@@ -58,25 +58,53 @@ class DuplicateGroupResponse(BaseModel):
 
 
 class BulkApproveRequest(BaseModel):
-    min_confidence: float = 0.8
+    session_id: str = Field(min_length=1)
+    min_confidence: float = Field(default=0.8, ge=0, le=1)
     proposal_type: Optional[str] = None
 
 
+class BulkRejectRequest(BaseModel):
+    session_id: str = Field(min_length=1)
+
+
+class ReviewProposalRequest(BaseModel):
+    session_id: str = Field(min_length=1)
+
+
 class EditProposalRequest(BaseModel):
+    session_id: str = Field(min_length=1)
     proposed_value: str
 
 
 class SetKeeperRequest(BaseModel):
+    session_id: str = Field(min_length=1)
     keep_file_id: int
 
 
 class PipelineRequest(BaseModel):
     root_path: str = ""
     backend: str = "ollama"
-    model: str = "gemma3:12b"
+    model: str = ""
     workers: int = 1
     session_id: str = ""
     skip_dirs: list[str] = []
+    retry_errors: bool = False
+
+
+class RunPlanRequest(PipelineRequest):
+    """Persisted unattended pipeline; commit is deliberately excluded."""
+    steps: list[str] = [
+        "scan", "enrich", "analyze", "dedup", "relate", "propose",
+        "organize", "execute_dry",
+    ]
+    analyze_model: str = ""
+    propose_model: str = ""
+    relate_scope: str = "per_directory"
+
+
+class ResumeRunPlanRequest(BaseModel):
+    session_id: str = Field(min_length=1)
+    retry_errors: bool = False
 
 
 class CreateSessionRequest(BaseModel):
@@ -99,3 +127,4 @@ class ExecuteRequest(BaseModel):
     session_id: str = ""
     dry_run: bool = True
     min_confidence: float = 0.7
+    preview_token: Optional[str] = None
