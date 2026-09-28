@@ -26,7 +26,7 @@ def test_move_requires_project_and_subject_evidence(tmp_path):
         file, tmp_path / "PROJECTX 2021" / "projectx-2021-agreement-documents" / source.name,
         tmp_path, Unprotected(), set(),
     )
-    assert _organizer_move_allowed(
+    assert not _organizer_move_allowed(
         file, tmp_path / "PROJECTX 2021" / "presentation_images" / source.name,
         tmp_path, Unprotected(), set(),
     )
@@ -41,6 +41,15 @@ def test_move_requires_project_and_subject_evidence(tmp_path):
     assert not _organizer_move_allowed(
         file, tmp_path / "PROJECTX 2021" / "presentation_images" / source.name,
         tmp_path, Unprotected(), {1},
+    )
+    loose = SimpleNamespace(**{**vars(file), "path": str(tmp_path / "Downloads" / source.name)})
+    assert _organizer_move_allowed(
+        loose, tmp_path / "Downloads" / "presentation_images" / source.name,
+        tmp_path, Unprotected(), set(),
+    )
+    assert not _organizer_move_allowed(
+        loose, tmp_path / "Downloads" / "presentation_images" / "new-name.png",
+        tmp_path, Unprotected(), set(),
     )
 
 
@@ -86,7 +95,7 @@ def test_final_folder_gate_rejects_colliding_generic_milestone_names(tmp_path):
         assert db.query(Proposal).count() == 0
 
 
-def test_grouping_moves_reject_repeated_folder_and_orphan_but_keep_real_group(tmp_path):
+def test_grouping_moves_preserve_named_folders_but_keep_loose_group(tmp_path):
     from sqlalchemy.orm import Session
     from donedatahoarder.db.session import init_db
     from donedatahoarder.db.models import File, Proposal, ProposalStatus, ProposalType, UserSession
@@ -121,23 +130,72 @@ def test_grouping_moves_reject_repeated_folder_and_orphan_but_keep_real_group(tm
         add_move("PROJECTB", "one.txt", "invoices", cluster)
         add_move("PROJECTB", "two.txt", "invoices", cluster)
         add_move("PROJECTC", "solo.txt", "invoices", "Direct file move")
+        add_move("Inbox", "invoice-a.txt", "invoices", cluster)
+        add_move("Inbox", "invoice-b.txt", "invoices", cluster, verified=False)
+        add_move("Downloads", "contract-a.txt", "contracts", cluster)
+        add_move("Downloads", "misc-b.txt", "contracts", cluster, verified=False)
         db.commit()
         sid = owner.id
 
     summary = _suppress_unsafe_organizer_proposals(sid, str(tmp_path))
-    assert summary["move"] == 5
+    assert summary["move"] == 10
     assert summary["reasons"]["Grouping would repeat the existing folder name"] == 3
+    assert summary["reasons"]["Named source folder is not a loose collection"] == 5
     assert summary["reasons"]["Grouping would leave a one-file folder after safety filters"] == 1
+    assert summary["reasons"]["Destination project or subject lacks source evidence"] == 1
     with Session(engine) as db:
         remaining = {
             (file.filename, file.path)
             for _, file in db.query(Proposal, File).join(File, Proposal.file_id == File.id)
         }
-    assert len(remaining) == 3
-    assert {str(tmp_path / "PROJECTB" / name) for name in ("one.txt", "two.txt")} <= {
+    assert len(remaining) == 2
+    assert {str(tmp_path / "Inbox" / name) for name in ("invoice-a.txt", "invoice-b.txt")} <= {
         path for _, path in remaining
     }
-    assert str(tmp_path / "PROJECTC" / "solo.txt") in {path for _, path in remaining}
+
+
+def test_relation_group_move_keeps_current_name_and_skips_collision(tmp_path):
+    from sqlalchemy.orm import Session
+    from donedatahoarder.db.session import init_db
+    from donedatahoarder.db.models import (
+        File, Proposal, ProposalStatus, ProposalType, RelationGroup,
+        RelationMember, UserSession,
+    )
+    from donedatahoarder.proposals.organizer.backstops import _emit_relation_group_moves
+
+    target = tmp_path / "related"
+    target.mkdir()
+    (target / "second.txt").write_text("existing", encoding="utf-8")
+    engine = init_db(tmp_path / "relation-moves.db")
+    with Session(engine) as db:
+        owner = UserSession(root_path=str(tmp_path))
+        db.add(owner)
+        db.flush()
+        files = []
+        for name in ("first.txt", "second.txt"):
+            source = tmp_path / name
+            source.write_text(name, encoding="utf-8")
+            file_rec = File(session_id=owner.id, path=str(source), filename=name)
+            db.add(file_rec)
+            db.flush()
+            files.append(file_rec)
+        db.add(Proposal(
+            file_id=files[0].id, proposal_type=ProposalType.RENAME,
+            current_value=files[0].path,
+            proposed_value=str(tmp_path / "suggested.txt"),
+            status=ProposalStatus.PENDING,
+        ))
+        group = RelationGroup(session_id=owner.id, label="related", confidence=0.9)
+        group.members = [RelationMember(file_id=file_rec.id) for file_rec in files]
+        db.add(group)
+        db.commit()
+        session_id = owner.id
+
+    assert _emit_relation_group_moves(session_id, str(tmp_path)) == 1
+    with Session(engine) as db:
+        moves = db.query(Proposal).filter(Proposal.proposal_type == ProposalType.MOVE).all()
+        assert len(moves) == 1
+        assert moves[0].proposed_value == str(target / "first.txt")
 
 
 class TestHebrewTransliteration:

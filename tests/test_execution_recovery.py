@@ -99,6 +99,47 @@ def test_rename_move_undo_and_redo(workspace):
     assert execute(dry_run=False, session_id=sid)["applied"] == 2
 
 
+@pytest.mark.parametrize("rename_status", [
+    ProposalStatus.PENDING, ProposalStatus.REJECTED, ProposalStatus.APPROVED,
+])
+def test_selected_move_cannot_apply_unselected_rename(workspace, rename_status):
+    root, sid = workspace
+    source = root / "original.txt"
+    source.write_bytes(b"original content")
+    destination = root / "sorted" / "suggested.txt"
+    with Session(get_engine()) as db:
+        file_rec = File(session_id=sid, path=str(source), filename=source.name,
+                        status=FileStatus.PROPOSED)
+        db.add(file_rec)
+        db.flush()
+        db.add(Proposal(
+            file_id=file_rec.id, proposal_type=ProposalType.RENAME,
+            current_value=str(source), proposed_value=str(root / "suggested.txt"),
+            status=rename_status,
+        ))
+        move = Proposal(
+            file_id=file_rec.id, proposal_type=ProposalType.MOVE,
+            current_value=str(source), proposed_value=str(destination),
+            status=ProposalStatus.APPROVED,
+        )
+        db.add(move)
+        db.commit()
+        move_id = move.id
+        file_id = file_rec.id
+
+    assert execute(dry_run=True, session_id=sid, proposal_ids=[move_id]) == {
+        "applied": 0, "failed": 1, "skipped": 0,
+    }
+    assert execute(dry_run=False, session_id=sid, proposal_ids=[move_id]) == {
+        "applied": 0, "failed": 1, "skipped": 0,
+    }
+    assert source.read_bytes() == b"original content"
+    assert not destination.exists()
+    with Session(get_engine()) as db:
+        assert db.get(File, file_id).path == str(source)
+        assert db.get(Proposal, move_id).status == ProposalStatus.APPROVED
+
+
 def test_selective_move_cascades_pending_rename_and_keeper_then_undo(workspace):
     root, sid = workspace
     source = root / "keeper.txt"

@@ -327,9 +327,8 @@ def _emit_relation_group_moves(session_id: str, root_path: str) -> int:
       appended.
     - Files that already have a MOVE or RENAME_FOLDER proposal are skipped
       so we don't double-propose.
-    - The destination filename is the CURRENT filename (or the one the Namer
-      proposed, if there's a pending RENAME). This keeps Namer and Organizer
-      proposals composable at execute time.
+    - MOVE keeps the current filename. A separately selected RENAME can be
+      composed with it at execute time.
 
     Returns the number of MOVE proposals created.
     """
@@ -377,23 +376,6 @@ def _emit_relation_group_moves(session_id: str, root_path: str) -> int:
             )
         }
 
-        # Pending RENAME proposals by file_id so the MOVE target uses the
-        # renamed filename (preserves Namer's work when both apply at execute).
-        rename_by_file: dict[int, str] = {}
-        for p in (
-            db.query(Proposal)
-            .filter(
-                Proposal.file_id.in_(member_ids),
-                Proposal.proposal_type == ProposalType.RENAME,
-                Proposal.status.in_([
-                    ProposalStatus.PENDING,
-                    ProposalStatus.APPLIED,
-                ]),
-            )
-        ):
-            if p.proposed_value:
-                rename_by_file[p.file_id] = Path(p.proposed_value).name
-
         # Reserved dest paths across all groups — avoids two clusters in the
         # same parent from trying to move a file into colliding subfolders.
         reserved_dests: set[Path] = set()
@@ -433,21 +415,11 @@ def _emit_relation_group_moves(session_id: str, root_path: str) -> int:
                     # Group spans multiple dirs on disk (e.g. folder-rename
                     # already reshuffled some members) — leave alone.
                     continue
-                # Destination filename: prefer pending RENAME's value if any,
-                # otherwise the current basename.
-                dst_filename = rename_by_file.get(member.id, src_path.name)
-                dst_path = target_dir / dst_filename
-                # Resolve dest-level collisions (two members mapped to same
-                # filename after rename) by appending `_2`, `_3`, …
-                if dst_path in reserved_dests:
-                    stem, suffix = dst_path.stem, dst_path.suffix
-                    k = 2
-                    while True:
-                        cand = target_dir / f"{stem}_{k}{suffix}"
-                        if cand not in reserved_dests:
-                            dst_path = cand
-                            break
-                        k += 1
+                dst_path = target_dir / src_path.name
+                # A collision needs review; MOVE must not silently rename a
+                # member by adding a suffix.
+                if dst_path in reserved_dests or dst_path.exists():
+                    continue
                 reserved_dests.add(dst_path)
 
                 if str(src_path) == str(dst_path):

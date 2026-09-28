@@ -150,9 +150,11 @@ def _organizer_move_allowed(file_rec: File, destination: Path, root: Path,
         return False
     if not dest_relative.parts or not source_relative.parts:
         return False
+    if destination.name != source.name:
+        return False
+    if not _loose_source(file_rec, root, {}, project_roots or set()):
+        return False
     if len(source_relative.parts) > 1:
-        if project_roots and _inside_project(source, project_roots):
-            return False
         if (dest_relative.parts[0].casefold() == source_relative.parts[0].casefold()
                 and len(dest_relative.parts) > len(source_relative.parts)):
             source_context = _words(str(source_relative.parent)) | _words(source.stem)
@@ -165,8 +167,6 @@ def _organizer_move_allowed(file_rec: File, destination: Path, root: Path,
             observed = source_context | _words(file_rec.ai_description or "") | _words(file_rec.ai_tags or "")
             return verified and new_subjects <= observed
     if dest_relative.parts[0].casefold() != "independent_files":
-        return False
-    if not _loose_source(file_rec, root, {}, project_roots or set()):
         return False
     if len(dest_relative.parts) < 3 or len(dest_relative.parts) > 5:
         return False
@@ -380,10 +380,11 @@ def _suppress_unsafe_organizer_proposals(session_id: str, root_path: str) -> dic
                 reason = (
                     "Numbered frame sequence must keep its folder and order" if file_rec.id in sequence_ids
                     else f"Protected resource: {protection.reason}" if protection.protected
+                    else "MOVE must preserve the current filename"
+                    if destination.name != source.name
                     else "Grouping would repeat the existing folder name" if redundant_nesting
                     else "Named source folder is not a loose collection"
-                    if destination.is_relative_to(root / "Independent_Files")
-                    and not _loose_source(file_rec, root, {}, project_roots)
+                    if not _loose_source(file_rec, root, {}, project_roots)
                     else "Destination project or subject lacks source evidence"
                 )
             else:
