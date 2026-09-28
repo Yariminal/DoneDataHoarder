@@ -116,47 +116,41 @@ def _strip_markdown_fences(text: str) -> str:
 
 def _extract_json_object_or_array(text: str) -> Optional[str]:
     """
-    Extract the first well-formed JSON object or array from raw text.
-    Returns the substring or None if nothing found.
+    Extract the first complete outer JSON object or array from raw text.
+
+    Never treat a nested container as an independent response when its outer
+    container is malformed or truncated.
     """
-    # Try to find an object
     obj_start = text.find("{")
     arr_start = text.find("[")
-
-    candidates = []
-    if obj_start != -1:
-        candidates.append((obj_start, "obj"))
-    if arr_start != -1:
-        candidates.append((arr_start, "arr"))
-
-    if not candidates:
+    starts = [start for start in (obj_start, arr_start) if start != -1]
+    if not starts:
         return None
-
-    # Prefer whichever starts first
-    candidates.sort(key=lambda x: x[0])
-
-    for start, kind in candidates:
-        # Brute-force find matching end brace/bracket
-        stack = 0
-        in_string = False
-        escape_next = False
-        for i, ch in enumerate(text[start:], start=start):
-            if escape_next:
-                escape_next = False
-                continue
-            if ch == "\\" and in_string:
+    start = min(starts)
+    stack: list[str] = []
+    in_string = False
+    escape_next = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape_next:
+            escape_next = False
+            continue
+        if in_string:
+            if ch == "\\":
                 escape_next = True
-                continue
-            if ch == '"' and not escape_next:
-                in_string = not in_string
-                continue
-            if not in_string:
-                if ch in ("{", "["):
-                    stack += 1
-                elif ch in ("}", "]"):
-                    stack -= 1
-                    if stack == 0:
-                        return text[start : i + 1]
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in ("{", "["):
+            stack.append(ch)
+        elif ch in ("}", "]"):
+            if not stack or (stack[-1], ch) not in (("{", "}"), ("[", "]")):
+                return None
+            stack.pop()
+            if not stack:
+                return text[start : i + 1]
     return None
 
 

@@ -8,6 +8,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from donedatahoarder.ai.json_utils import (
+    LooseDict,
     extract_json,
     generate_json_with_retry,
     validate_json,
@@ -98,6 +99,20 @@ class TestExtractJson:
     def test_multiple_objects_takes_first(self):
         raw = '{"a":1} {"b":2}'
         assert extract_json(raw) == {"a": 1}
+
+    def test_quoted_braces_and_brackets_do_not_end_outer_object(self):
+        expected = {"text": 'a } ] and an escaped " quote', "tags": ["one"]}
+        assert extract_json("Here is the result: " + json.dumps(expected)) == expected
+
+    @pytest.mark.parametrize("raw", [
+        '{"description", "subject", "tags": ["one", "two"], "confidence":',
+        '[{"description": "subject"}, {"tags": ["one"]}',
+        '{"description": ["one", "two"}',
+        '[{"description": "subject"]}',
+    ])
+    def test_incomplete_or_mismatched_outer_container_never_yields_nested_value(self, raw):
+        with pytest.raises(ValueError):
+            extract_json(raw)
 
     def test_missing_object_key_colons_are_repaired_without_changing_values(self):
         raw = (
@@ -290,6 +305,18 @@ class TestGenerateJsonWithRetry:
                 generate_json_with_retry(fake_generate, "original request", DummySchema)
         assert len(calls) == 3
         assert "mechanical object-key separator repair" not in caplog.text
+
+    def test_truncated_outer_object_cannot_be_accepted_as_loose_nested_array(self, monkeypatch):
+        monkeypatch.setattr("donedatahoarder.ai.json_utils.time.sleep", lambda _: None)
+        calls = []
+
+        def fake_generate(**kwargs):
+            calls.append(kwargs)
+            return '{"description", "subject", "tags": ["one", "two"], "confidence":'
+
+        with pytest.raises(RuntimeError, match="after 3 attempts"):
+            generate_json_with_retry(fake_generate, "original request", LooseDict)
+        assert len(calls) == 3
 
     def test_type_validation_retry_reports_field_without_accepting_bad_value(self, monkeypatch):
         monkeypatch.setattr("donedatahoarder.ai.json_utils.time.sleep", lambda _: None)
