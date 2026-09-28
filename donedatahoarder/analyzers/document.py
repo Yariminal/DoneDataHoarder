@@ -59,7 +59,7 @@ DOC_EXTENSIONS = {
     ".txt", ".md", ".rtf",
     ".json", ".xml", ".yaml", ".yml",
     ".html", ".htm",
-    ".ai",   # Adobe Illustrator (PDF-based — text extraction often works)
+    ".ai",   # Adobe Illustrator; only PDF-backed files can be decoded here
     ".mtl",  # Wavefront material library — plain text
 }
 DOC_MIMES = {
@@ -340,13 +340,24 @@ def _extract_text(path: Path) -> str:
     return ""
 
 
+def _is_pdf_backed_illustrator(path: Path) -> bool:
+    """Recognize only Illustrator files with a PDF header, using a bounded read."""
+    try:
+        with path.open("rb") as stream:
+            return stream.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
 def extract_document(path: Path, mime_type: Optional[str] = None) -> ExtractionResult:
     """Extract a bounded excerpt with an explicit no-content reason."""
     ext = path.suffix.lower()
     mime = mime_type or ""
     if ext in _LEGACY_UNSUPPORTED:
         return ExtractionResult(reason="unsupported_type")
-    if ext == ".pdf" or "pdf" in mime:
+    if ext == ".ai" and not _is_pdf_backed_illustrator(path):
+        return ExtractionResult(reason="unsupported_type")
+    if ext in {".pdf", ".ai"} or "pdf" in mime:
         try:
             import pdfplumber  # noqa: F401
         except ImportError:
@@ -404,16 +415,27 @@ rather than summarising each page separately.
 Context about the file:
 {context}
 
-Return a JSON object with these fields:
+Return a JSON object in this shape, replacing the example values:
 {{
-  "description": "1-2 sentences describing what the document is about, synthesised across the attached page(s)",
-  "suggested_name": "meaningful filename stem. Rules: (1) Describe the document's actual content, do NOT repeat the containing folder name. (2) Preserve specific proper nouns (organisation, client, event name, project name) only if visible and uniquely identifying. (3) Translate to English if not already. (4) No extension, no date prefix, use_underscores, max 60 chars",
-  "tags": ["tag1", "tag2", ...]  // 4-8 specific, lowercase, underscore_separated tags describing concrete visible elements (subject, document subtype, visible colour scheme, visible motifs/patterns, disciplines like "architecture" or "structural_engineering" if evident). Skip generic words like "document", "pdf", "page".,
-  "document_type": "one of: invoice, receipt, contract, report, letter, cv_resume, photo, presentation, spreadsheet, notes, form, certificate, manual, menu, flyer, brochure, poster, cover, other",
-  "detected_date": "YYYY-MM-DD only if a specific date is clearly visible on any rendered page — NOT inferred from the filename or folder. Return null if no explicit date is visible.",
-  "language": "ISO 639-1 language code of any visible text (e.g. en, he, fr). If the page is purely graphical with no text, return null.",
-  "confidence": 0.0-1.0
+  "description": "A concise description of the visible document pages.",
+  "suggested_name": "visible_document_subject",
+  "tags": ["specific_subject", "visible_attribute"],
+  "document_type": "brochure",
+  "detected_date": null,
+  "language": null,
+  "confidence": 0.8
 }}
+
+Describe the attached pages together in 1-2 sentences. Name their actual
+content without repeating the folder name; preserve uniquely identifying
+visible proper nouns, translate to English, omit extension and date prefix,
+use_underscores, max 60 chars. Use 4-8 specific lowercase underscore_separated
+tags for concrete visible elements; skip generic words and uncertain tags.
+document_type must be one of invoice, receipt, contract, report, letter,
+cv_resume, photo, presentation, spreadsheet, notes, form, certificate, manual,
+menu, flyer, brochure, poster, cover, other. Use YYYY-MM-DD for detected_date
+only when clearly visible on a page, otherwise null. language is an ISO 639-1
+code for visible text, or null for purely graphical pages. confidence is 0 to 1.
 
 For suggested_name: reflect what the document ACTUALLY shows. Examples:
 - "event_menu_cactus_pattern" for a menu card with cactus illustrations
@@ -433,16 +455,27 @@ Extracted text (first {max_chars} characters):
 {text}
 ---
 
-Based on the filename, folder context, and document content, return a JSON object:
+Based on the filename, folder context, and document content, return a JSON
+object in this shape, replacing the example values:
 {{
-  "description": "1-2 sentences describing what this document is about",
-  "suggested_name": "meaningful filename stem. Rules: (1) Describe the document's actual content/purpose — do NOT repeat the containing folder name. (2) Preserve specific proper nouns (client names, organizations) only if they uniquely identify this document. (3) Translate to English if not already. (4) No extension, no date prefix, use_underscores, max 60 chars",
-  "tags": ["tag1", "tag2", ...]  // 4-8 specific, lowercase tags. RULES: (a) each tag must add information NOT already implied by the filename or folder name; (b) NO generic words like "document", "file", "text", "content"; (c) prefer concrete entities (organisation, client, project, topic, document subtype) over abstract categories; (d) no duplicates or near-duplicates; (e) use_underscores; (f) skip the tag rather than guessing if unsure,
-  "document_type": "one of: invoice, receipt, contract, report, letter, cv_resume, photo, presentation, spreadsheet, notes, form, certificate, manual, other",
-  "detected_date": "YYYY-MM-DD only if a specific date is explicitly written in the document text (e.g. '14 March 2021', 'Date: 2021-03-14') — NOT inferred from the folder name or filename. Return null if no explicit date is found.",
-  "language": "ISO 639-1 language code (e.g. en, he, fr)",
-  "confidence": 0.0-1.0
+  "description": "A concise description of the document content.",
+  "suggested_name": "document_subject_purpose",
+  "tags": ["specific_subject", "document_subtype"],
+  "document_type": "report",
+  "detected_date": null,
+  "language": "en",
+  "confidence": 0.8
 }}
+
+Describe the content in 1-2 sentences. Name its actual purpose without
+repeating the folder name; preserve uniquely identifying proper nouns,
+translate to English, omit extension and date prefix, use_underscores, max
+60 chars. Use 4-8 specific lowercase tags that add information beyond the
+filename or folder; prefer concrete entities and skip generic or uncertain
+tags. document_type must be one of invoice, receipt, contract, report, letter,
+cv_resume, photo, presentation, spreadsheet, notes, form, certificate, manual,
+other. Use YYYY-MM-DD for detected_date only for an explicit date in the text,
+otherwise null. language is an ISO 639-1 code. confidence is 0 to 1.
 
 For suggested_name: reflect the actual content.
 Examples:
@@ -469,8 +502,9 @@ class DocumentAnalyzer(BaseAnalyzer):
         text = extraction.text
         ext = path.suffix.lower()
 
-        # Vision fallback: PDFs that yield near-zero extractable text are
-        # almost always image-based (scans, menus, flyers, design covers)
+        # Vision fallback: PDFs and PDF-backed Illustrator files that yield
+        # near-zero extractable text are often image-based (scans, menus,
+        # flyers, design covers)
         # OR over-large files where pdfplumber refused to parse (like the
         # 452 MB Solar Dekathlon 15.12.pdf report with 33 pages of text
         # and 3D renderings). Instead of letting the text-only LLM guess
@@ -479,7 +513,9 @@ class DocumentAnalyzer(BaseAnalyzer):
         # signal for naming. _render returns [] on any failure (missing
         # pypdfium2, encrypted / corrupt PDF, render OOM, etc.).
         is_text_empty = not text or len(text.strip()) < 20
-        if is_text_empty and ext == ".pdf":
+        if is_text_empty and (ext == ".pdf" or (
+            ext == ".ai" and _is_pdf_backed_illustrator(path)
+        )):
             pdf_pages = _render_pdf_pages_as_jpegs(path)
             if pdf_pages:
                 vision_result = self._analyze_rendered_pdf(
@@ -543,11 +579,11 @@ class DocumentAnalyzer(BaseAnalyzer):
         pages: list[bytes],
     ) -> AnalysisResult | None:
         """
-        Vision path for text-empty PDFs. Sends up to MAX_VISION_PAGES
+        Vision path for text-empty PDFs, including PDF-backed Illustrator files.
+        Sends up to MAX_VISION_PAGES
         rendered pages to the vision model and returns a full
-        AnalysisResult. Returns None only if the vision call itself
-        raised — caller falls back to the text-only (filename-guess)
-        path in that case.
+        AnalysisResult. Provider failures return a failed result so the
+        pipeline records ERROR without AI evidence.
 
         For single-page inputs we use `image_bytes=` (cheaper / simpler
         path in both the Ollama and Gemini clients). For multi-page we

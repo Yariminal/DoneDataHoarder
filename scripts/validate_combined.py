@@ -9,10 +9,14 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import sqlite3
+import subprocess
 import sys
 import uuid
 import zipfile
@@ -150,7 +154,8 @@ def _enrich_coverage(engine, session_id: str, data: Path,
 
 
 def _final_coverage(engine, session_id: str, data: Path, indexed: set[str],
-                    mode: str, analysis_result: dict | None) -> dict:
+                    mode: str, analysis_result: dict | None,
+                    *, compare_run_counters: bool = True) -> dict:
     rows = _indexed_rows(engine, session_id, data)
     if rows.keys() != indexed:
         raise RuntimeError("final database paths differ from indexed baseline")
@@ -177,7 +182,7 @@ def _final_coverage(engine, session_id: str, data: Path, indexed: set[str],
     counts["indexed"] = len(rows)
     if counts["errors"] or counts["unprocessed"]:
         raise RuntimeError(f"final coverage incomplete: {counts}")
-    if mode != "metadata_only":
+    if mode != "metadata_only" and compare_run_counters:
         expected = {"fresh": "analyzed", "cached": "cached", "sampled": "sampled",
                     "skipped": "skipped", "errors": "errors"}
         if analysis_result is None or any(
@@ -186,6 +191,28 @@ def _final_coverage(engine, session_id: str, data: Path, indexed: set[str],
         ):
             raise RuntimeError("persisted analysis coverage differs from run counters")
     return counts
+
+
+def _pipeline_report(root: Path, basename: str = "pipeline.json") -> tuple[Path, dict]:
+    """Select an explicit completed pipeline or continuation report in this run."""
+    if (not basename or Path(basename).name != basename
+            or basename not in {"pipeline.json", "continuation-1.json"}):
+        raise ValueError("unsupported pipeline report basename")
+    path = root / "reports" / basename
+    report = read_json(path)
+    original = read_json(root / "reports" / "pipeline.json")
+    if "final" not in report:
+        raise ValueError("pipeline incomplete")
+    if report.get("session_id") != original.get("session_id"):
+        raise ValueError("selected pipeline report session differs from original")
+    if basename != "pipeline.json":
+        if (report.get("status") != "complete" or report.get("run_dir") != str(root)
+                or report.get("original_pipeline_sha256") != digest(root / "reports" / "pipeline.json")
+                or report.get("original_source_report_sha256") != digest(
+                    root / "reports" / "astra-source-fingerprint-start.json")
+                or report.get("indexed_records_sha256") != digest(root / "reports" / "indexed-records.json")):
+            raise ValueError("continuation provenance differs from original run")
+    return path, report
 
 
 def prepare(_args) -> None:
@@ -376,6 +403,293 @@ def pipeline(args) -> None:
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
+def _file_evidence_hash(file) -> str:
+    """Hash every persisted File field so retained rows can be checked after retry."""
+    values = {column.name: getattr(file, column.name)
+              for column in file.__table__.columns}
+    payload = json.dumps(values, sort_keys=True, default=str, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _check_sqlite_integrity(path: Path) -> None:
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
+        if db.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+            raise RuntimeError("combined database quick_check failed")
+        if db.execute("PRAGMA foreign_key_check").fetchall():
+            raise RuntimeError("combined database foreign_key_check failed")
+
+
+def continue_analysis(args) -> None:
+    """One guarded continuation of a failed full run, on its original indexed IDs."""
+    root, data, state = combined_paths(args.run_dir)
+    report_path = root / "reports" / "continuation-1.json"
+    snapshot_path = root / "reports" / "continuation-before.json"
+    database_snapshot = root / "reports" / "continuation-before.sqlite"
+    if any(path.exists() for path in (report_path, snapshot_path, database_snapshot)):
+        raise ValueError("combined continuation already attempted")
+    original_path = root / "reports" / "pipeline.json"
+    original = read_json(original_path)
+    stages = original.get("steps", {})
+    if (original.get("mode") != "full" or original.get("model") != args.model
+            or original.get("workers") != 1 or "final" in original
+            or "analyze" not in stages or stages["analyze"].get("result", {}).get("errors", 0) < 1
+            or any(name in stages for name in ("dedup_semantic", "dedup_proposals", "relate", "propose", "organize"))):
+        raise ValueError("original pipeline is not a stopped full-analysis failure")
+    if (root / "reports" / "execution.json").exists() or list(
+            (state / "datahoarder").glob("undo*.log")):
+        raise ValueError("execution report or undo journal already exists")
+    if not all(name in stages for name in (
+            "preflight_coverage", "scan_coverage", "enrich_coverage",
+            "dedup_exact", "dedup_perceptual", "dedup_text")):
+        raise ValueError("original pre-analysis stages are incomplete")
+    if any(stages[name].get("error") for name in stages if name != "analyze"):
+        raise ValueError("original pipeline has an earlier stage failure")
+    if args.original_commit == args.recovery_commit:
+        raise ValueError("continuation must identify both original and recovery commits")
+    if not all(re.fullmatch(r"[0-9a-f]{40}", value)
+               for value in (args.original_commit, args.recovery_commit)):
+        raise ValueError("continuation commits must be full lowercase SHA-1 IDs")
+    actual_commit = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True).stdout.strip()
+    if actual_commit != args.recovery_commit:
+        raise ValueError("recovery commit differs from checked-out source")
+    tracked_changes = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "status", "--porcelain", "--untracked-files=no"],
+        check=True, capture_output=True, text=True).stdout.strip()
+    if tracked_changes:
+        raise ValueError("recovery source has uncommitted tracked changes")
+    source_report_name = getattr(
+        args, "original_source_report", "astra-source-fingerprint-start.json")
+    if (Path(source_report_name).name != source_report_name
+            or source_report_name != "astra-source-fingerprint-start.json"):
+        raise ValueError("unsupported original source report basename")
+    source_report_path = root / "reports" / source_report_name
+    source_report = read_json(source_report_path)
+    source_hashes = source_report.get("source_sha256")
+    if (source_report.get("commit") != args.original_commit
+            or not isinstance(source_hashes, dict)
+            or "scripts/validate_combined.py" not in source_hashes):
+        raise ValueError("original commit differs from recorded source provenance")
+    source_match_counts = {"raw_git_blob": 0, "crlf_checkout": 0}
+    for relative, expected_hash in source_hashes.items():
+        parts = Path(relative).parts
+        if (not parts or Path(relative).is_absolute() or ".." in parts
+                or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)):
+            raise ValueError("invalid original source fingerprint entry")
+        original_bytes = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "show", f"{args.original_commit}:{relative}"],
+            check=True, capture_output=True).stdout
+        if hashlib.sha256(original_bytes).hexdigest() == expected_hash:
+            source_match_counts["raw_git_blob"] += 1
+        else:
+            try:
+                original_bytes.decode("utf-8")
+                is_text = b"\x00" not in original_bytes
+            except UnicodeDecodeError:
+                is_text = False
+            checkout_bytes = original_bytes.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+            if not is_text or hashlib.sha256(checkout_bytes).hexdigest() != expected_hash:
+                raise ValueError("recorded source bytes differ from original commit")
+            source_match_counts["crlf_checkout"] += 1
+    from urllib.parse import urlparse
+    endpoint = urlparse(args.ollama_host)
+    if endpoint.scheme != "http" or endpoint.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise ValueError("Ollama must be local loopback")
+    baseline = read_json(root / "reports" / "baseline.json")
+    expected = sorted(({key: row[key] for key in ("path", "size", "sha256")}
+                       for row in baseline), key=lambda row: row["path"])
+    if current_manifest(data) != expected:
+        raise ValueError("combined data differs from original extraction baseline")
+    if directory_manifest(data) != read_json(root / "reports" / "directories.json"):
+        raise ValueError("combined directories differ from original extraction baseline")
+    metadata = read_json(root / "run.json")
+    if any(digest(Path(item["source"])) != item["source_sha256"]
+           for item in metadata["archives"]):
+        raise ValueError("a source ZIP differs from original prepare")
+    indexed_records = read_json(root / "reports" / "indexed-records.json")
+    indexed_paths = read_json(root / "reports" / "indexed-baseline.json")
+    if (len(indexed_records) != len(indexed_paths)
+            or sorted(row["path"] for row in indexed_records) != indexed_paths
+            or len({row["id"] for row in indexed_records}) != len(indexed_records)):
+        raise ValueError("original indexed baseline is inconsistent")
+    _check_sqlite_integrity(state / "corpus.sqlite")
+    # Preserve the failed database before init_db can apply any migration.
+    with sqlite3.connect(state / "corpus.sqlite") as source, sqlite3.connect(database_snapshot) as target:
+        source.backup(target)
+    database_snapshot_sha256 = digest(database_snapshot)
+    isolate(root, state)
+    engine = db_session(state)
+    from sqlalchemy.orm import Session
+    from donedatahoarder.db.models import File, FileStatus, Proposal, UserSession
+    with Session(engine) as db:
+        owner = db.get(UserSession, original["session_id"])
+        files = db.query(File).filter_by(session_id=original["session_id"]).order_by(File.id).all()
+        if db.query(Proposal).join(File).filter(File.session_id == original["session_id"]).count():
+            raise ValueError("session already has proposals before continuation")
+        actual_records = sorted(({"id": f.id, "path": Path(f.path).relative_to(data).as_posix()}
+                                 for f in files), key=lambda row: row["id"])
+        if (owner is None or owner.root_path != str(data) or owner.backend != "ollama"
+                or owner.model != args.model or actual_records != indexed_records):
+            raise ValueError("database session or indexed IDs differ from original")
+        if any(f.status not in {FileStatus.ANALYZED, FileStatus.SKIPPED, FileStatus.ERROR}
+               for f in files):
+            raise ValueError("original analysis has unprocessed or unexpected statuses")
+        provider_errors = [f for f in files if f.status == FileStatus.ERROR
+                           and ((f.analysis_reason or "").startswith("provider_")
+                                or (f.error_message or "").startswith("AI inference failed"))]
+        if len(provider_errors) != sum(f.status == FileStatus.ERROR for f in files):
+            raise ValueError("non-provider error requires separate review")
+        skipped_ids = sorted(set(args.reviewed_skipped_ids))
+        if len(skipped_ids) != len(args.reviewed_skipped_ids):
+            raise ValueError("reviewed skipped IDs must be unique")
+        by_id = {f.id: f for f in files}
+        if any(fid not in by_id or by_id[fid].status != FileStatus.SKIPPED
+               or by_id[fid].analysis_outcome == "sampled" for fid in skipped_ids):
+            raise ValueError("reviewed IDs must be non-sampled skipped rows")
+        selected_ids = sorted([f.id for f in provider_errors] + skipped_ids)
+        if not selected_ids:
+            raise ValueError("continuation has no reviewed rows to process")
+        retained_hashes = {str(f.id): _file_evidence_hash(f)
+                           for f in files if f.id not in selected_ids}
+        prior_states = {str(fid): {"status": by_id[fid].status.value,
+                                   "outcome": by_id[fid].analysis_outcome,
+                                   "reason": by_id[fid].analysis_reason}
+                        for fid in selected_ids}
+        observed_digests = {f.analysis_model_digest for f in files if f.analysis_model_digest}
+    from donedatahoarder.ai.ollama_client import OllamaClient
+    local = OllamaClient(host=args.ollama_host, text_model=args.model, vision_model=args.model)
+    model_digest = local.model_digest(args.model)
+    if (args.model not in local.list_models() or not model_digest
+            or observed_digests != {model_digest}):
+        raise ValueError("local model digest differs from original analyzed rows")
+    from donedatahoarder.ai.provider import init_ai
+    init_ai(backend="ollama", ollama_host=args.ollama_host,
+            text_model=args.model, vision_model=args.model)
+    require_local_provider(args.model)
+    before = {"run_dir": str(root), "session_id": original["session_id"],
+              "original_commit": args.original_commit,
+              "recovery_commit": args.recovery_commit,
+              "original_pipeline_sha256": digest(original_path),
+              "original_source_report_sha256": digest(source_report_path),
+              "original_source_match_counts": source_match_counts,
+              "baseline_sha256": digest(root / "reports" / "baseline.json"),
+              "indexed_records_sha256": digest(root / "reports" / "indexed-records.json"),
+              "model": args.model, "model_digest": model_digest,
+              "selected_ids": selected_ids, "reviewed_skipped_ids": skipped_ids,
+              "prior_states": prior_states, "retained_evidence_hashes": retained_hashes,
+              "indexed_count": len(indexed_records),
+              "created_utc": datetime.now(timezone.utc).isoformat()}
+    before["database_snapshot_sha256"] = database_snapshot_sha256
+    write_json(snapshot_path, before)
+    report = {key: before[key] for key in (
+        "run_dir", "session_id", "original_commit", "recovery_commit",
+        "original_pipeline_sha256", "indexed_records_sha256", "model", "model_digest",
+        "original_source_report_sha256",
+        "original_source_match_counts",
+        "selected_ids", "reviewed_skipped_ids", "indexed_count")}
+    report.update({"status": "running", "pre_retry_snapshot": str(snapshot_path),
+                   "steps": {}, "started_utc": datetime.now(timezone.utc).isoformat()})
+    write_json(report_path, report)
+    try:
+        with Session(engine) as db:
+            for fid in skipped_ids:
+                row = db.get(File, fid)
+                row.status = FileStatus.ENRICHED
+                row.analysis_outcome = None
+                row.analysis_reason = None
+            db.commit()
+        from donedatahoarder.analyzers.pipeline import _eligible_for_analysis, analyze
+        with Session(engine) as db:
+            eligible_ids = sorted(row[0] for row in db.query(File.id).filter(
+                File.session_id == original["session_id"],
+                _eligible_for_analysis(True, include_sampled=True)).all())
+        if eligible_ids != selected_ids:
+            raise RuntimeError("analysis retry selection differs from reviewed IDs")
+        result = run_step(report, report_path, "analyze_retry", lambda: analyze(
+            workers=1, min_size_kb=0, session_id=original["session_id"],
+            retry_errors=True, use_cache=True))
+        with Session(engine) as db:
+            retained = db.query(File).filter(
+                File.session_id == original["session_id"],
+                File.id.notin_(selected_ids)).all()
+            after_hashes = {str(f.id): _file_evidence_hash(f) for f in retained}
+            selected_after = {f.id: f for f in db.query(File).filter(
+                File.session_id == original["session_id"],
+                File.id.in_(selected_ids)).all()}
+        report["retained_evidence_unchanged"] = after_hashes == retained_hashes
+        report["selected_final"] = {str(fid): {
+            "status": selected_after[fid].status.value,
+            "outcome": selected_after[fid].analysis_outcome,
+            "reason": selected_after[fid].analysis_reason,
+            "evidence_source": selected_after[fid].analysis_evidence_source,
+            "model_tag": selected_after[fid].analysis_model_tag,
+            "model_digest": selected_after[fid].analysis_model_digest,
+            "cache_hit": bool(selected_after[fid].analysis_cache_hit),
+        } for fid in selected_ids if fid in selected_after}
+        write_json(report_path, report)
+        if not report["retained_evidence_unchanged"]:
+            raise RuntimeError("previously processed file evidence changed during retry")
+        if (set(selected_after) != set(selected_ids)
+                or any(f.status != FileStatus.ANALYZED
+                       or f.analysis_outcome not in {
+                           "content_verified", "context_only", "metadata_only"}
+                       or f.analysis_model_digest != model_digest
+                       or (f.ai_description or "").lower().startswith("ai inference failed")
+                       for f in selected_after.values())):
+            raise RuntimeError("selected retry IDs did not finish with accepted analysis")
+        report["coverage"] = run_step(report, report_path, "analysis_coverage", lambda:
+            _final_coverage(engine, original["session_id"], data, set(indexed_paths),
+                            "full", None, compare_run_counters=False))
+        if result["errors"] or sum(result.values()) != len(selected_ids):
+            raise RuntimeError("selected analysis retry failed or processed the wrong count")
+        _check_sqlite_integrity(state / "corpus.sqlite")
+        from donedatahoarder.core.dedup import find_semantic_duplicates, generate_dedup_proposals
+        run_step(report, report_path, "dedup_semantic",
+                 lambda: find_semantic_duplicates(session_id=original["session_id"]))
+        run_step(report, report_path, "dedup_proposals",
+                 lambda: generate_dedup_proposals(session_id=original["session_id"]))
+        from donedatahoarder.core.relate import relate
+        require_local_provider(args.model)
+        run_ai_step(report, report_path, "relate",
+                    lambda: relate(session_id=original["session_id"],
+                                   scope="per_directory", model=args.model),
+                    state / "logs" / "donedatahoarder.log")
+        if report["steps"]["relate"].get("warning_count"):
+            raise RuntimeError("relation stage logged warnings")
+        from donedatahoarder.proposals.namer import generate_proposals
+        run_step(report, report_path, "propose",
+                 lambda: generate_proposals(session_id=original["session_id"]))
+        from donedatahoarder.proposals.organizer import generate_reorg_proposals
+        require_local_provider(args.model)
+        run_ai_step(report, report_path, "organize",
+                    lambda: generate_reorg_proposals(session_id=original["session_id"]),
+                    state / "logs" / "donedatahoarder.log")
+        if report["steps"]["organize"].get("warning_count"):
+            raise RuntimeError("organization stage logged warnings")
+        from donedatahoarder.executor import execute, _make_quiet_console
+        dry_run = run_step(report, report_path, "dry_run", lambda: execute(
+            dry_run=True, session_id=original["session_id"],
+            _console=_make_quiet_console()))
+        if dry_run.get("failed", 0):
+            raise RuntimeError("continuation dry run reported failed proposals")
+        report["coverage"] = run_step(report, report_path, "final_coverage", lambda:
+            _final_coverage(engine, original["session_id"], data, set(indexed_paths),
+                            "full", None, compare_run_counters=False))
+        report["final"] = status_report(engine, original["session_id"])
+        if report["final"]["provider_errors"]:
+            raise RuntimeError("provider errors remain in final session")
+        report["status"] = "complete"
+    except BaseException as exc:
+        report["status"] = "failed"
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        report["completed_utc"] = datetime.now(timezone.utc).isoformat()
+        write_json(report_path, report)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
 def audit(args) -> dict:
     root, data, state = combined_paths(args.run_dir)
     meta = read_json(root / "run.json")
@@ -398,12 +712,15 @@ def audit(args) -> dict:
     foreign_keys = None
     pipeline_path = root / "reports" / "pipeline.json"
     if pipeline_path.exists():
+        selected_report = (_pipeline_report(root, args.pipeline_report)[1]
+                           if getattr(args, "pipeline_report", "pipeline.json") != "pipeline.json"
+                           else read_json(pipeline_path))
         isolate(root, state)
         engine = db_session(state)
         from sqlalchemy import text
         from sqlalchemy.orm import Session
         from donedatahoarder.db.models import File
-        session_id = read_json(pipeline_path)["session_id"]
+        session_id = selected_report["session_id"]
         with Session(engine) as db:
             rows = [(file_id, Path(path).relative_to(data).as_posix())
                     for file_id, path in db.query(File.id, File.path)
@@ -451,9 +768,8 @@ def execute_cycle(args) -> None:
     if any(digest(Path(item["source"])) != item["source_sha256"]
            for item in meta["archives"]):
         raise ValueError("a source ZIP changed")
-    pipeline_report = read_json(root / "reports" / "pipeline.json")
-    if "final" not in pipeline_report:
-        raise ValueError("pipeline incomplete")
+    selected_path, pipeline_report = _pipeline_report(
+        root, getattr(args, "pipeline_report", "pipeline.json"))
     sid = pipeline_report["session_id"]
     isolate(root, state)
     engine = db_session(state)
@@ -484,6 +800,7 @@ def execute_cycle(args) -> None:
             proposal.review_kind = "individual"
         db.commit()
     report = {"run_dir": str(root), "session_id": sid, "proposal_ids": ids,
+              "pipeline_report": selected_path.name,
               "retain_organized": args.retain_organized}
     write_json(report_path, report)
     report["dry_run"] = execute(dry_run=True, min_confidence=1.1,
@@ -517,6 +834,7 @@ def execute_cycle(args) -> None:
     write_json(report_path, report)
     try:
         verified = audit(argparse.Namespace(run_dir=args.run_dir,
+                                            pipeline_report=selected_path.name,
                                             organized=args.retain_organized))
     except Exception:
         report["audit_status"] = "failed"
@@ -554,11 +872,25 @@ def main() -> None:
     run.add_argument("--mode", choices=("full", "representative", "metadata_only"), default="full")
     run.add_argument("--sequence-sample-stride", type=int, default=10)
     run.add_argument("--cache", action=argparse.BooleanOptionalAction, default=True)
+    continuation = sub.add_parser(
+        "continue-analysis", help="one guarded continuation of a failed full analysis")
+    continuation.add_argument("--run-dir", required=True)
+    continuation.add_argument("--original-commit", required=True)
+    continuation.add_argument("--recovery-commit", required=True)
+    continuation.add_argument("--original-source-report",
+                              default="astra-source-fingerprint-start.json")
+    continuation.add_argument("--reviewed-skipped-ids", type=int, nargs="*", default=[])
+    continuation.add_argument("--model", default="gemma4:26b")
+    continuation.add_argument("--ollama-host", default="http://127.0.0.1:11434")
     check = sub.add_parser("audit", help="check source ZIPs, files, paths and database")
     check.add_argument("--run-dir", required=True)
+    check.add_argument("--pipeline-report", default="pipeline.json",
+                       help="completed report basename (pipeline.json or continuation-1.json)")
     check.add_argument("--organized", action="store_true", help="compare content multiset after final organization")
     execution = sub.add_parser("execute", help="dry-run, commit and normally undo reviewed IDs")
     execution.add_argument("--run-dir", required=True)
+    execution.add_argument("--pipeline-report", default="pipeline.json",
+                           help="completed report basename (pipeline.json or continuation-1.json)")
     execution.add_argument("--proposal-ids", type=int, nargs="+", required=True)
     execution.add_argument("--retain-organized", action="store_true")
     args = parser.parse_args()
@@ -566,6 +898,8 @@ def main() -> None:
         prepare(args)
     elif args.command == "pipeline":
         pipeline(args)
+    elif args.command == "continue-analysis":
+        continue_analysis(args)
     elif args.command == "execute":
         execute_cycle(args)
     else:

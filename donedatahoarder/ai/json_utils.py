@@ -133,11 +133,12 @@ def extract_json(
     if fix_escapes:
         attempts.append(_fix_json_escapes(cleaned))
 
+    last_decode_error: Optional[json.JSONDecodeError] = None
     for text in attempts:
         try:
             return json.loads(text, strict=not allow_control_chars)
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as exc:
+            last_decode_error = exc
 
     # Try extracting a JSON substring
     for text in attempts:
@@ -145,10 +146,10 @@ def extract_json(
         if snippet:
             try:
                 return json.loads(snippet, strict=not allow_control_chars)
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as exc:
+                last_decode_error = exc
 
-    raise ValueError(f"Could not extract valid JSON from response: {raw[:500]!r}")
+    raise ValueError(f"Could not extract valid JSON from response: {raw[:500]!r}") from last_decode_error
 
 
 def validate_json(data: Any, model_cls: Type[T]) -> T:
@@ -204,6 +205,7 @@ def generate_json_with_retry(
     full_prompt = prompt + json_instruction
 
     last_error: Optional[Exception] = None
+    retry_feedback = ""
     for attempt in range(max_retries):
         current_temp = round(temperature + attempt * 0.1, 2)
         current_seed = seed + attempt if seed is not None else None
@@ -214,7 +216,7 @@ def generate_json_with_retry(
                 kwargs["response_format"] = response_format
 
             raw = generate_fn(
-                prompt=full_prompt,
+                prompt=full_prompt + retry_feedback,
                 system=system,
                 temperature=current_temp,
                 seed=current_seed,
@@ -224,9 +226,23 @@ def generate_json_with_retry(
             return validate_json(data, model_cls)
         except (ValueError, ValidationError, json.JSONDecodeError) as exc:
             last_error = exc
-            delay = BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5)
-            time.sleep(delay)
-            continue
+            cause = exc.__cause__
+            if isinstance(cause, json.JSONDecodeError):
+                problem = f"invalid JSON syntax: {cause.msg} at line {cause.lineno}, column {cause.colno}"
+            elif isinstance(cause, ValidationError):
+                first = cause.errors(include_url=False)[0]
+                field = ".".join(str(part) for part in first["loc"]) or "root"
+                problem = f"field {field}: {first['msg']}"
+            else:
+                problem = "invalid JSON or a value that does not match the required fields"
+            retry_feedback = (
+                f"\n\nYour previous response had {problem}. Generate a fresh, complete "
+                "JSON response for the original request. Put a colon after every key, "
+                "use commas only between entries, and keep the required field types."
+            )
+            if attempt + 1 < max_retries:
+                delay = BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5)
+                time.sleep(delay)
 
     raise RuntimeError(
         f"Failed to generate valid JSON after {max_retries} attempts. "

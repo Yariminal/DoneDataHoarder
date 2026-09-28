@@ -74,15 +74,26 @@ Context about the file:
 
 {exif_extra}
 
-Return a JSON object with these fields:
+Return a JSON object in this shape, replacing the example values:
 {{
-  "description": "2-3 sentence description of what is in the image",
-  "suggested_name": "a concise, meaningful filename stem. Rules: (1) Describe the actual content, not the folder or project it belongs to — do NOT repeat the containing folder name in the stem. (2) Preserve specific proper nouns (people, places) only if they add meaning beyond the folder context. (3) Translate to English if not already. (4) No extension, no date prefix, use_underscores, max 50 chars",
-  "tags": ["tag1", "tag2", ...]  // 4-8 specific, lowercase tags. RULES: (a) each tag must add information NOT already implied by the filename or folder name; (b) NO generic words like "image", "photo", "picture", "file", "object", "scene"; (c) prefer concrete nouns/attributes (subject, setting, style, technique, colour, material) over abstract categories; (d) no duplicates or near-duplicates; (e) use_underscores; (f) skip the tag rather than guessing if unsure,
-  "category": "one of: photo_person, photo_group, photo_place, photo_event, photo_document, photo_object, screenshot, artwork, other",
-  "detected_date": "YYYY-MM-DD only if a specific date is clearly visible in the image content itself (e.g. a calendar, dated document, visible timestamp) — NOT inferred from the filename or folder name. Return null if uncertain.",
-  "confidence": 0.0-1.0
+  "description": "A concise description of the visible image content.",
+  "suggested_name": "visible_subject_descriptive_detail",
+  "tags": ["specific_subject", "visible_attribute"],
+  "category": "photo_object",
+  "detected_date": null,
+  "confidence": 0.8
 }}
+
+Write 2-3 sentences for description. For suggested_name, describe the actual
+content, not its folder or project; preserve meaningful proper nouns, translate
+to English, omit extension and date prefix, use_underscores, max 50 chars.
+Use 4-8 specific lowercase tags when supported, each adding information not
+already in the filename or folder. Prefer concrete subjects, settings, styles,
+techniques, colours and materials; avoid generic or duplicate tags, and skip
+uncertain ones. category must be one of photo_person, photo_group, photo_place,
+photo_event, photo_document, photo_object, screenshot, artwork, other.
+Use YYYY-MM-DD for detected_date only when visible in the image itself, never
+from the filename or folder; otherwise use null. confidence is a number from 0 to 1.
 
 For suggested_name: describe what the image actually shows. Examples:
 - "team_group_photo_outdoor" not "project_name_team_photo"

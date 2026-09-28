@@ -1,8 +1,10 @@
 """Combined harness keeps all source ZIPs and every namespace distinct."""
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
+from types import SimpleNamespace
 import zipfile
 
 import pytest
@@ -14,6 +16,179 @@ from donedatahoarder.db.models import (
     File, FileStatus, Proposal, ProposalStatus, ProposalType, UserSession,
 )
 from donedatahoarder.db.session import init_db
+
+
+@pytest.mark.parametrize("behavior", [
+    "success", "crlf", "source_mismatch", "mutate_retained", "leave_error",
+    "reskipped", "preexisting_proposal"])
+def test_guarded_combined_continuation_preserves_original_success_and_report(
+        tmp_path, monkeypatch, capsys, behavior):
+    corpus = tmp_path / "corpus"
+    root = corpus / "DDH-combined-fixture"
+    data, state, reports = (root / name for name in ("data", "state", "reports"))
+    for path in (data, state, reports):
+        path.mkdir(parents=True, exist_ok=True)
+    contents = {"done.txt": "already analyzed", "failed.txt": "retry provider",
+                "reviewed.txt": "newly supported"}
+    source = corpus / "source.zip"
+    with zipfile.ZipFile(source, "w") as archive:
+        for name, content in contents.items():
+            archive.writestr(name, content)
+            (data / name).write_text(content, encoding="utf-8")
+    monkeypatch.setattr(validate_combined, "CORPUS_DIR", corpus)
+    monkeypatch.setattr(validate_combined, "isolate", lambda _root, _state: None)
+    engine = init_db(state / "corpus.sqlite")
+    with Session(engine) as db:
+        owner = UserSession(root_path=str(data), name="combined-fixture",
+                            backend="ollama", model="gemma4:26b")
+        db.add(owner)
+        db.flush()
+        rows = []
+        for name, status, outcome, reason in (
+                ("done.txt", FileStatus.ANALYZED, "content_verified", None),
+                ("failed.txt", FileStatus.ERROR, "failed", "provider_invalid_response"),
+                ("reviewed.txt", FileStatus.SKIPPED, "skipped", "unsupported_type")):
+            row = File(session_id=owner.id, path=str(data / name), filename=name,
+                       size_bytes=len(contents[name]), status=status,
+                       analysis_outcome=outcome, analysis_reason=reason,
+                       analysis_model_digest="fixture-digest")
+            db.add(row)
+            rows.append(row)
+        db.commit()
+        sid = owner.id
+        ids = {row.filename: row.id for row in rows}
+        retained_hash = validate_combined._file_evidence_hash(rows[0])
+        if behavior == "preexisting_proposal":
+            db.add(Proposal(file_id=ids["done.txt"], proposal_type=ProposalType.RENAME,
+                            current_value=str(data / "done.txt"),
+                            proposed_value=str(data / "renamed.txt"),
+                            status=ProposalStatus.PENDING, confidence=0.9))
+            db.commit()
+    validate_corpus.write_json(root / "run.json", {
+        "schema": 1, "run_dir": str(root.resolve()), "files": 3,
+        "logical_bytes": sum(len(s) for s in contents.values()),
+        "archives": [{"namespace": "Corpus", "source": str(source),
+                      "source_sha256": validate_corpus.digest(source)}],
+    })
+    validate_corpus.write_json(reports / "baseline.json", [
+        {"archive": "Corpus", **item} for item in validate_corpus.current_manifest(data)])
+    validate_corpus.write_json(reports / "directories.json",
+                               validate_corpus.directory_manifest(data))
+    validate_corpus.write_json(reports / "indexed-baseline.json", sorted(contents))
+    validate_corpus.write_json(reports / "indexed-records.json", sorted(
+        ({"id": fid, "path": name} for name, fid in ids.items()), key=lambda row: row["id"]))
+    original = {"run_dir": str(root), "session_id": sid, "mode": "full",
+                "model": "gemma4:26b", "workers": 1,
+                "steps": {name: {} for name in (
+                    "preflight_coverage", "scan_coverage", "enrich_coverage",
+                    "dedup_exact", "dedup_perceptual", "dedup_text")}}
+    original["steps"]["analyze"] = {"result": {"analyzed": 1, "errors": 1}}
+    validate_corpus.write_json(reports / "pipeline.json", original)
+    original_source = b"fixture\noriginal harness\n"
+    fingerprint_bytes = (original_source.replace(b"\n", b"\r\n")
+                         if behavior == "crlf" else original_source)
+    if behavior == "source_mismatch":
+        fingerprint_bytes = b"unrelated source"
+    validate_corpus.write_json(reports / "astra-source-fingerprint-start.json", {
+        "commit": "a" * 40,
+        "source_sha256": {"scripts/validate_combined.py":
+                          hashlib.sha256(fingerprint_bytes).hexdigest()},
+    })
+    original_bytes = (reports / "pipeline.json").read_bytes()
+    monkeypatch.setattr(validate_combined.subprocess, "run", lambda cmd, **kw:
+                        SimpleNamespace(stdout=("b" * 40 + "\n" if "rev-parse" in cmd
+                                                else original_source if "show" in cmd else "")))
+    from donedatahoarder.ai.ollama_client import OllamaClient
+    monkeypatch.setattr(OllamaClient, "model_digest", lambda self, model: "fixture-digest")
+    monkeypatch.setattr(OllamaClient, "list_models", lambda self: ["gemma4:26b"])
+    from donedatahoarder.ai import provider
+    monkeypatch.setattr(provider, "init_ai", lambda **kw: None)
+    monkeypatch.setattr(validate_combined, "require_local_provider", lambda model: None)
+    from donedatahoarder.analyzers import pipeline as analyzer_pipeline
+
+    def fake_analyze(**kwargs):
+        assert kwargs["retry_errors"] is True
+        with Session(engine) as db:
+            for fid in ((ids["reviewed.txt"],) if behavior == "leave_error"
+                        else (ids["failed.txt"], ids["reviewed.txt"])):
+                row = db.get(File, fid)
+                row.status = (FileStatus.SKIPPED if behavior == "reskipped"
+                              and fid == ids["reviewed.txt"] else FileStatus.ANALYZED)
+                row.analysis_outcome = ("skipped" if row.status == FileStatus.SKIPPED
+                                        else "content_verified")
+                row.analysis_reason = None
+            if behavior == "mutate_retained":
+                db.get(File, ids["done.txt"]).ai_description = "unexpected mutation"
+            db.commit()
+        return {"analyzed": 1 if behavior in {"leave_error", "reskipped"} else 2,
+                "cached": 0, "sampled": 0, "skipped": 1 if behavior == "reskipped" else 0,
+                "errors": 1 if behavior == "leave_error" else 0}
+
+    monkeypatch.setattr(analyzer_pipeline, "analyze", fake_analyze)
+    from donedatahoarder.core import dedup, relate
+    downstream_calls = []
+    monkeypatch.setattr(dedup, "find_semantic_duplicates", lambda **kw:
+                        downstream_calls.append("semantic") or {})
+    monkeypatch.setattr(dedup, "generate_dedup_proposals", lambda **kw: {})
+    monkeypatch.setattr(relate, "relate", lambda **kw: None)
+    from donedatahoarder.proposals import namer, organizer
+    monkeypatch.setattr(namer, "generate_proposals", lambda **kw: {})
+    monkeypatch.setattr(organizer, "generate_reorg_proposals", lambda **kw: None)
+    from donedatahoarder import executor
+    monkeypatch.setattr(executor, "execute", lambda **kw: {"applied": 0, "failed": 0})
+    args = argparse.Namespace(run_dir=str(root), original_commit="a" * 40,
+                              recovery_commit="b" * 40, reviewed_skipped_ids=[ids["reviewed.txt"]],
+                              model="gemma4:26b", ollama_host="http://127.0.0.1:11434")
+    if behavior in {"success", "crlf"}:
+        validate_combined.continue_analysis(args)
+    elif behavior == "source_mismatch":
+        with pytest.raises(ValueError, match="recorded source bytes differ"):
+            validate_combined.continue_analysis(args)
+        assert not (reports / "continuation-1.json").exists()
+        assert not (reports / "continuation-before.sqlite").exists()
+        assert (reports / "pipeline.json").read_bytes() == original_bytes
+        return
+    elif behavior == "preexisting_proposal":
+        with pytest.raises(ValueError, match="already has proposals"):
+            validate_combined.continue_analysis(args)
+        assert not (reports / "continuation-1.json").exists()
+        assert (reports / "continuation-before.sqlite").exists()
+        assert (reports / "pipeline.json").read_bytes() == original_bytes
+        return
+    else:
+        with pytest.raises(RuntimeError):
+            validate_combined.continue_analysis(args)
+    capsys.readouterr()
+    result = validate_corpus.read_json(reports / "continuation-1.json")
+    assert result["status"] == ("complete" if behavior in {"success", "crlf"} else "failed")
+    if behavior not in {"success", "crlf"}:
+        assert downstream_calls == []
+        assert (reports / "pipeline.json").read_bytes() == original_bytes
+        assert (reports / "continuation-before.sqlite").exists()
+        return
+    assert result["coverage"] == {"fresh": 3, "cached": 0, "sampled": 0,
+                                  "skipped": 0, "errors": 0, "unprocessed": 0,
+                                  "metadata_only_unanalyzed": 0, "indexed": 3}
+    assert result["selected_ids"] == sorted([ids["failed.txt"], ids["reviewed.txt"]])
+    assert result["original_source_match_counts"] == ({
+        "raw_git_blob": 0, "crlf_checkout": 1} if behavior == "crlf" else {
+        "raw_git_blob": 1, "crlf_checkout": 0})
+    assert result["retained_evidence_unchanged"] is True
+    assert (reports / "pipeline.json").read_bytes() == original_bytes
+    assert (reports / "continuation-before.sqlite").exists()
+    with Session(engine) as db:
+        assert validate_combined._file_evidence_hash(db.get(File, ids["done.txt"])) == retained_hash
+    assert validate_combined._pipeline_report(root, "continuation-1.json")[1]["status"] == "complete"
+    validate_combined.audit(argparse.Namespace(
+        run_dir=str(root), organized=False, pipeline_report="continuation-1.json"))
+    assert validate_corpus.read_json(reports / "audit-restored.json")["pass"] is True
+    with pytest.raises(ValueError, match="unsupported pipeline report basename"):
+        validate_combined._pipeline_report(root, "../pipeline.json")
+    with pytest.raises(ValueError, match="already attempted"):
+        validate_combined.continue_analysis(args)
+    (reports / "pipeline.json").write_bytes(original_bytes + b" ")
+    with pytest.raises(ValueError, match="provenance differs"):
+        validate_combined._pipeline_report(root, "continuation-1.json")
 
 
 def test_prepare_six_namespaced_archives_and_audit(tmp_path, monkeypatch, capsys):
@@ -92,7 +267,7 @@ def test_pipeline_coverage_gates_scan_enrich_and_final_analysis(tmp_path):
     data.mkdir(parents=True)
     path = data / "notes.txt"
     path.write_text("fixture", encoding="utf-8")
-    (data / "excluded.db").write_text("not indexed", encoding="utf-8")
+    (data / "excluded.tmp").write_text("not indexed", encoding="utf-8")
     validate_corpus.write_json(root / "run.json", {"files": 2})
     with pytest.raises(RuntimeError, match="could not read the whole"):
         validate_combined._preflight_coverage(

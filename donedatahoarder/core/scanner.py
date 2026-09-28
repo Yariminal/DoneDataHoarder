@@ -59,13 +59,10 @@ SKIP_DIRS: set[str] = {
     "lost+found",
 }
 
-# File extensions that carry no useful content
+# Transient files are outside the collection index. Archived SQLite sidecars
+# may be required to recover user data; only this app's active DB is excluded.
 SKIP_EXTENSIONS: set[str] = {
-    ".lnk", ".url", ".tmp", ".part",
-    ".sys", ".dll", ".exe", ".com",
-    ".ini", ".dat", ".log",
-    ".db", ".db-shm", ".db-wal",
-    ".ctb", ".3dmbak", ".plt",
+    ".tmp", ".part",
 }
 
 # Filenames that should always be skipped (macOS/Windows metadata, etc.)
@@ -73,11 +70,8 @@ SKIP_FILENAMES: set[str] = {
     ".DS_Store", "Thumbs.db", "desktop.ini", "._.DS_Store",
 }
 
-# Subset of SKIP_EXTENSIONS that is safe to physically move to trash during
-# post-execute cleanup. SKIP_EXTENSIONS exists to keep files out of the AI
-# pipeline — it includes .exe, .db, .ini, .dat, .log, which are legitimate
-# archive content that must never be swept off disk automatically.
-JUNK_FILE_EXTENSIONS: set[str] = {".tmp", ".part", ".ctb", ".plt"}
+# Cleanup, when explicitly invoked, must never treat CAD plot resources as junk.
+JUNK_FILE_EXTENSIONS: set[str] = {".tmp", ".part"}
 
 # Filename prefixes that indicate system/metadata files (macOS AppleDouble)
 SKIP_FILENAME_PREFIXES: tuple[str, ...] = ("._",)
@@ -95,6 +89,19 @@ def _is_link_or_reparse(path: Path) -> bool:
     )
 
 
+def _active_database_files() -> set[Path]:
+    """Keep this application's live SQLite files out of a selected root."""
+    try:
+        database = get_engine().url.database
+    except RuntimeError:
+        database = os.environ.get("DDH_DB")
+    if not database:
+        return set()
+    path = Path(database).resolve()
+    return {path, Path(f"{path}-wal"), Path(f"{path}-shm"),
+            Path(f"{path}-journal")}
+
+
 def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[Path]:
     """
     Yield Path objects for every regular file under *root*.
@@ -105,6 +112,7 @@ def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[
     - extra_skip_dirs parameter
     """
     skip = SKIP_DIRS | (extra_skip_dirs or set())
+    active_database_files = _active_database_files()
     if _is_link_or_reparse(root):
         return
     ddhignore = load_ddhignore(root)
@@ -144,6 +152,8 @@ def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[
             # Check .ddhignore patterns
             file_path = dirpath_obj / name
             if _is_link_or_reparse(file_path):
+                continue
+            if file_path.resolve() in active_database_files:
                 continue
             if ddhignore.should_ignore(file_path, is_dir=False):
                 continue

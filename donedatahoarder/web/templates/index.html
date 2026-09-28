@@ -635,13 +635,36 @@
         <div class="preflight-result" role="status" aria-live="polite">
           <p x-show="preflightError" class="text-sm" style="color:var(--danger)" x-text="preflightError"></p>
           <template x-if="preflight"><div>
-            <strong x-text="preflight.files.toLocaleString() + ' files · ' + formatBytes(preflight.logical_bytes) + ' logical size'"></strong>
-            <div class="text-sm" x-text="'Potential AI calls: ' + preflight.estimated_ai_calls_range.join('–') + ' · estimated inference: ' + preflight.estimated_ai_seconds_range.map(s => (s / 3600).toFixed(1) + ' h').join('–')"></div>
-            <div class="text-sm" x-text="'Indexed bytes: ' + formatBytes(preflight.indexed_logical_bytes) + ' · excluded files: ' + preflight.excluded_files + ' · possible sampled frames: up to ' + preflight.estimated_sampled_upper.toLocaleString()"></div>
+            <strong x-text="preflight.files.toLocaleString() + ' likely indexed files · ' + formatBytes(preflight.logical_bytes) + ' retained size'"></strong>
+            <div class="text-sm" x-text="'Likely files needing AI: ' + preflight.estimated_ai_calls_range.join('–') + ' · estimated inference: ' + preflight.estimated_ai_seconds_range.map(s => (s / 3600).toFixed(1) + ' h').join('–')"></div>
+            <div class="text-sm" x-text="'Indexed bytes: ' + formatBytes(preflight.indexed_logical_bytes) + ' · excluded from index: ' + preflight.excluded_files + ' · possible sampled frames: up to ' + preflight.estimated_sampled_upper.toLocaleString()"></div>
             <div class="text-sm" x-text="'Inaccessible entries: ' + preflight.inaccessible_entries"></div>
             <div class="text-sm text-dim">Estimate only. Scan, extraction, model response, and file system speed can change actual totals.</div>
           </div></template>
         </div>
+      </div>
+
+      <div class="card mb-2 preflight-card" x-show="analysisCoverage" aria-label="Analysis coverage">
+        <div class="card-label">Analysis coverage</div>
+        <div class="coverage-grid" role="status" aria-live="polite">
+          <div><strong x-text="analysisCoverage?.total_indexed || 0"></strong><span>Indexed</span></div>
+          <div><strong x-text="analysisCoverage?.by_outcome?.content_verified || 0"></strong><span>Content read by AI</span></div>
+          <div><strong x-text="(analysisCoverage?.by_outcome?.context_only || 0) + (analysisCoverage?.by_outcome?.metadata_only || 0)"></strong><span>Limited evidence</span></div>
+          <div><strong x-text="analysisCoverage?.by_outcome?.skipped || 0"></strong><span>No content analysis</span></div>
+          <div><strong x-text="analysisCoverage?.by_outcome?.sampled || 0"></strong><span>Sampled out</span></div>
+          <div><strong x-text="analysisCoverage?.by_outcome?.unprocessed || 0"></strong><span>Not processed</span></div>
+          <div><strong x-text="analysisCoverage?.by_outcome?.unknown_provenance || 0"></strong><span>Legacy result, unverified</span></div>
+          <div><strong x-text="analysisCoverage?.by_outcome?.failed || 0"></strong><span>Failed</span></div>
+        </div>
+        <p class="text-sm text-dim">Skipped files stay indexed and on disk, but have no model analysis. Reading content does not certify the AI's interpretation. Scan exclusions appear in the collection estimate.</p>
+        <div class="text-sm" x-show="analysisCoverage?.skipped_by_extension?.length">Top skipped formats and reasons:</div>
+        <ul class="text-sm" x-show="analysisCoverage?.skipped_by_extension?.length">
+          <template x-for="row in (analysisCoverage?.skipped_by_extension || [])" :key="row.extension + ':' + row.reason">
+            <li x-text="row.extension + ': ' + row.count + ' (' + row.reason.replaceAll('_', ' ') + ')'"></li>
+          </template>
+        </ul>
+        <p class="text-sm" x-show="analysisCoverage?.other_skipped_formats" x-text="(analysisCoverage?.other_skipped_formats || 0) + ' more skipped files in other formats'"></p>
+        <button class="btn btn-outline btn-sm mt-1" @click="loadAnalysisCoverage()">Refresh analysis coverage</button>
       </div>
 
       <div class="card mb-2 preflight-card" x-show="organizationCoverage" aria-label="Organization coverage">

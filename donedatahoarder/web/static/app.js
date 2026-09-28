@@ -1268,6 +1268,7 @@ document.addEventListener('alpine:init', () => {
     preflight: null,
     preflightBusy: false,
     preflightError: null,
+    analysisCoverage: null,
     organizationCoverage: null,
     sequenceSampleStride: 0,
     useAnalysisCache: true,
@@ -1312,6 +1313,7 @@ document.addEventListener('alpine:init', () => {
       await this.checkRunPlan();
       await this.loadAnalysisErrors();
       await this.loadOrganizationCoverage();
+      this.$watch(() => Alpine.store('session').current_session_id, () => this.checkRunPlan());
       this._runPlanPoll = setInterval(() => this.checkRunPlan(), 2500);
     },
 
@@ -1346,6 +1348,17 @@ document.addEventListener('alpine:init', () => {
       } catch (_) { this.organizationCoverage = null; }
     },
 
+    async loadAnalysisCoverage() {
+      const sid = Alpine.store('session').current_session_id;
+      if (!sid) { this.analysisCoverage = null; return; }
+      try {
+        const value = await api.get(`/pipeline/analysis/coverage?session_id=${encodeURIComponent(sid)}`);
+        if (sid === Alpine.store('session').current_session_id) this.analysisCoverage = value;
+      } catch (_) {
+        if (sid === Alpine.store('session').current_session_id) this.analysisCoverage = null;
+      }
+    },
+
     async checkRunPlan() {
       const sid = Alpine.store('session').current_session_id;
       const requestId = ++this._runPlanRequest;
@@ -1360,6 +1373,8 @@ document.addEventListener('alpine:init', () => {
         this.unattendedCompletedSteps = [];
         this.unattendedFailedStep = null;
         this.analysisErrors = null;
+        this.analysisCoverage = null;
+        if (sid) await this.loadAnalysisCoverage();
       }
       if (!sid) return;
       try {
@@ -1880,6 +1895,7 @@ document.addEventListener('alpine:init', () => {
 
       await this._refreshAfterStep();
       if (type === 'analyze') await this.loadAnalysisErrors();
+      if (['scan', 'analyze'].includes(type)) await this.loadAnalysisCoverage();
 
       await this.checkRunPlan();
     },

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 from starlette.responses import StreamingResponse
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from donedatahoarder.db.models import (
@@ -31,6 +32,69 @@ from .deps import _mark_session_unsaved, _require_session_id, _resolve_model, re
 from .schemas import ExecuteRequest, PipelineRequest, ResumeRunPlanRequest, RunPlanRequest
 
 router = APIRouter()
+
+
+@router.get("/pipeline/analysis/coverage")
+def get_analysis_coverage(session_id: str):
+    """Summarize persisted analysis outcomes without rereading source files."""
+    sid = _require_session_id(session_id)
+    with Session(get_engine()) as db:
+        if db.get(UserSession, sid) is None:
+            raise HTTPException(404, "Session not found")
+        scope = File.session_id == sid
+        statuses = {
+            status.value: count for status, count in
+            db.query(File.status, func.count(File.id)).filter(scope)
+            .group_by(File.status)
+        }
+        outcomes: dict[str, int] = {}
+        for status, outcome, count in (
+            db.query(File.status, File.analysis_outcome, func.count(File.id))
+            .filter(scope).group_by(File.status, File.analysis_outcome)
+        ):
+            if outcome is None:
+                if status == FileStatus.ERROR:
+                    outcome = "failed"
+                elif status == FileStatus.SKIPPED:
+                    outcome = "skipped"
+                elif status in {FileStatus.PENDING, FileStatus.ENRICHED}:
+                    outcome = "unprocessed"
+                else:
+                    outcome = "unknown_provenance"
+            outcomes[outcome] = outcomes.get(outcome, 0) + count
+        skipped = (scope, File.status == FileStatus.SKIPPED,
+                   or_(File.analysis_outcome.is_(None),
+                       File.analysis_outcome == "skipped"))
+        reasons = {
+            reason or "unspecified": count for reason, count in
+            db.query(File.analysis_reason, func.count(File.id))
+            .filter(*skipped).group_by(File.analysis_reason)
+            .order_by(func.count(File.id).desc()).limit(32)
+        }
+        format_rows = (
+            db.query(File.extension, File.analysis_reason, func.count(File.id))
+            .filter(*skipped).group_by(File.extension, File.analysis_reason)
+            .order_by(func.count(File.id).desc()).limit(20).all()
+        )
+    formats = [
+        {"extension": ext or "(none)", "reason": reason or "unspecified",
+         "count": count}
+        for ext, reason, count in format_rows
+    ]
+    skipped_total = outcomes.get("skipped", 0)
+    return {
+        "total_indexed": sum(statuses.values()),
+        "by_status": statuses,
+        "by_outcome": outcomes,
+        "skip_reasons": reasons,
+        "skipped_by_extension": formats,
+        "other_skipped_formats": skipped_total - sum(row["count"] for row in formats),
+        "note": (
+            "Counts cover indexed files only. Skipped means no model analysis; "
+            "unsupported files remain in the index and on disk. Scan exclusions "
+            "are shown by the collection estimate."
+        ),
+    }
 
 
 def _require_worker_exit(job_manager) -> None:

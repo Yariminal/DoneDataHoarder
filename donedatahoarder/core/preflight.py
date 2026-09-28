@@ -11,12 +11,20 @@ from donedatahoarder.core.scanner import walk_files, _is_link_or_reparse
 from donedatahoarder.proposals.sequence_identity import numbered_frame_identity
 
 
+# A light, extension-only estimate of the current analyzer routes. The actual
+# route also depends on MIME, readability, installed extractors and cache state.
+# Keep this list explicit so preflight never needs to initialize AI clients.
 _AI_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff",
-    ".heic", ".pdf", ".txt", ".md", ".csv", ".json", ".xml", ".html",
-    ".docx", ".pptx", ".xlsx", ".odt", ".rtf", ".py", ".js", ".ts",
-    ".css", ".svg", ".mp4", ".mov", ".mkv", ".avi", ".obj", ".fbx",
-    ".blend", ".zip", ".7z", ".rar",
+    ".heic", ".heif", ".avif", ".cr2", ".nef", ".arw", ".dng", ".orf",
+    ".rw2", ".hdr", ".pdf", ".txt", ".md", ".csv", ".json", ".xml",
+    ".html", ".htm", ".docx", ".pptx", ".xlsx", ".rtf",
+    ".yaml", ".yml", ".svg", ".psd",
+    ".ai", ".mtl", ".mp4", ".mov", ".mkv", ".avi", ".wmv",
+    ".flv", ".webm", ".m4v", ".3gp", ".ts", ".mts", ".m2ts",
+    ".mpg", ".mpeg", ".mp3", ".m4a", ".aac", ".flac", ".wav",
+    ".ogg", ".wma", ".opus", ".obj", ".fbx", ".max", ".3ds",
+    ".3dm", ".zip",
 }
 MIB = 1024 * 1024
 
@@ -62,7 +70,7 @@ def estimate_collection(root: Path, *, mode: str = "full",
         ext = path.suffix.lower()
         extensions[ext or "[none]"] += 1
         ai_candidates += ext in _AI_EXTENSIONS
-        if ext in {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}:
+        if ext in {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}:
             numbered_visual_candidates += numbered_frame_identity(path) is not None
 
     estimated_sampled = 0
@@ -71,8 +79,8 @@ def estimate_collection(root: Path, *, mode: str = "full",
         # numbered images, so fewer may be sampled than this estimate.
         estimated_sampled = numbered_visual_candidates * (
             sequence_sample_stride - 1) // sequence_sample_stride
-    ai_calls_upper = 0 if mode == "metadata_only" else ai_candidates
-    ai_calls_lower = max(0, ai_calls_upper - estimated_sampled)
+    ai_calls_estimate = 0 if mode == "metadata_only" else ai_candidates
+    ai_calls_lower = max(0, ai_calls_estimate - estimated_sampled)
     # Count every real file in the collection for copy-space estimates,
     # including paths intentionally excluded from the app index.
     full_files = 0
@@ -117,13 +125,17 @@ def estimate_collection(root: Path, *, mode: str = "full",
         "inaccessible_entries": inaccessible,
         "unreadable_directories": unreadable_directories[:20],
         "size_estimate_complete": complete,
-        "ai_candidate_files_upper": ai_candidates,
+        # Compatibility field: every indexed file is a true upper bound when
+        # MIME-only routes may exist. Use the separate estimate for planning.
+        "ai_candidate_files_upper": files,
+        "ai_candidate_files_estimate": ai_candidates,
+        "unsupported_files_estimate": files - ai_candidates,
         "numbered_visual_candidates_upper": numbered_visual_candidates,
         "estimated_sampled_upper": estimated_sampled,
-        "estimated_ai_calls_range": [ai_calls_lower, ai_calls_upper],
+        "estimated_ai_calls_range": [ai_calls_lower, ai_calls_estimate],
         "estimated_ai_seconds_range": [
             round(ai_calls_lower * model_seconds_per_file * 0.5),
-            round(ai_calls_upper * model_seconds_per_file * 2.0),
+            round(ai_calls_estimate * model_seconds_per_file * 2.0),
         ],
         "estimated_hash_seconds_range": hash_read_seconds,
         "estimated_db_bytes_range": [db_bytes_low, db_bytes_high],
@@ -135,8 +147,11 @@ def estimate_collection(root: Path, *, mode: str = "full",
             "Stat-only preflight. Copy budget includes excluded regular files "
             "when size_estimate_complete is true; otherwise logical_bytes is "
             "only a measured lower bound. "
-            "symlinks and junctions are excluded. AI eligibility and sampling "
-            "are estimates; hash read range includes one enrichment pass and "
+            "symlinks and junctions are excluded. Likely AI eligibility is an "
+            "extension-only estimate; MIME routing, unreadable content, missing "
+            "extractors, sampling, and cache hits can change actual attempts. "
+            "The indexed-file count is the conservative candidate upper bound. "
+            "Hash read range includes one enrichment pass and "
             "up to two cache validation passes at 50-200 MiB/s. Cache hits "
             "and provider variability are unknown until the run."
         ),

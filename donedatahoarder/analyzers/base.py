@@ -16,8 +16,8 @@ You are a file analysis assistant helping to organize a personal archive.
 Your job is to analyze files and return structured metadata to help rename and categorize them.
 Be concise, factual, and consistent. Always respond in valid JSON.
 """
-PROMPT_VERSION = "analysis-v2-2026-09-27"
-EXTRACTOR_VERSION = "extractors-v3-2026-09-28"
+PROMPT_VERSION = "analysis-v3-2026-09-28"
+EXTRACTOR_VERSION = "extractors-v4-2026-09-28"
 
 # Tags the LLM commonly emits that carry no information for organisation.
 # Lower-cased, with spaces normalised to underscores.

@@ -14,6 +14,7 @@ from donedatahoarder.ai.json_utils import (
     _fix_json_escapes,
     _strip_markdown_fences,
 )
+from donedatahoarder.ai.ollama_client import OllamaClient
 
 
 class DummySchema(BaseModel):
@@ -202,6 +203,76 @@ class TestGenerateJsonWithRetry:
             response_format={"type": "json_object"},
         )
         assert received.get("response_format") == {"type": "json_object"}
+
+    def test_malformed_vision_json_retries_with_syntax_feedback_and_same_image(self, monkeypatch):
+        monkeypatch.setattr("donedatahoarder.ai.json_utils.time.sleep", lambda _: None)
+        client = OllamaClient(text_model="gemma4:26b", vision_model="gemma4:26b")
+        calls = []
+
+        def fake_vision(prompt, **kwargs):
+            calls.append((prompt, kwargs))
+            if len(calls) == 1:
+                return '{"name", "visible_subject", "count": 1}'
+            return '{"name": "visible_subject", "count": 1}'
+
+        monkeypatch.setattr(client, "generate_with_image", fake_vision)
+        result = client.generate_json(
+            "Describe the attached image in the archive", image_bytes=b"image bytes",
+            model_cls=DummySchema,
+        )
+
+        assert result == {"name": "visible_subject", "count": 1}
+        assert len(calls) == 2
+        assert all("Describe the attached image in the archive" in prompt for prompt, _ in calls)
+        assert "invalid JSON syntax" in calls[1][0]
+        assert "colon after every key" in calls[1][0]
+        assert all(kwargs["image_bytes"] == b"image bytes" for _, kwargs in calls)
+        assert all(kwargs["response_format"] == {"type": "json_object"} for _, kwargs in calls)
+
+    def test_type_validation_retry_reports_field_without_accepting_bad_value(self, monkeypatch):
+        monkeypatch.setattr("donedatahoarder.ai.json_utils.time.sleep", lambda _: None)
+        calls = []
+
+        def fake_generate(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return '{"name": "ok", "count": "not a number"}'
+            return '{"name": "ok", "count": 2}'
+
+        result = generate_json_with_retry(fake_generate, "original request", DummySchema)
+        assert result.count == 2
+        assert len(calls) == 2
+        assert "original request" in calls[1]["prompt"]
+        assert "field count" in calls[1]["prompt"]
+
+    def test_malformed_json_exhaustion_stays_failed(self, monkeypatch):
+        monkeypatch.setattr("donedatahoarder.ai.json_utils.time.sleep", lambda _: None)
+        calls = []
+
+        def fake_generate(**kwargs):
+            calls.append(kwargs)
+            return '{"name", "visible_subject", "count": 1}'
+
+        with pytest.raises(RuntimeError, match="after 3 attempts"):
+            generate_json_with_retry(fake_generate, "original request", DummySchema)
+        assert len(calls) == 3
+
+
+def test_analyzer_output_examples_are_valid_json():
+    from donedatahoarder.analyzers.archive import ARCHIVE_PROMPT
+    from donedatahoarder.analyzers.document import DOC_PROMPT, PDF_VISION_PROMPT
+    from donedatahoarder.analyzers.image import VISION_PROMPT
+    from donedatahoarder.analyzers.threedmodel import THREED_PROMPT
+    from donedatahoarder.analyzers.video import AUDIO_PROMPT, VIDEO_PROMPT
+
+    templates = (VISION_PROMPT, PDF_VISION_PROMPT, DOC_PROMPT,
+                 VIDEO_PROMPT, AUDIO_PROMPT, THREED_PROMPT, ARCHIVE_PROMPT)
+    marker = "object in this shape, replacing the example values:\n"
+    for template in templates:
+        example = template.split(marker, 1)[1].lstrip().replace("{{", "{").replace("}}", "}")
+        parsed, _ = json.JSONDecoder().raw_decode(example)
+        assert isinstance(parsed, dict)
+        assert isinstance(parsed["confidence"], float)
 
 
 # ---------------------------------------------------------------------------
