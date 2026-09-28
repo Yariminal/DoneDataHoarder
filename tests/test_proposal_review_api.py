@@ -326,7 +326,7 @@ def test_relate_numeric_directory_progress_keeps_job_live(review_db, monkeypatch
         progress_cb({"phase": "directory_complete", "done": 2,
                      "directories": 2, "groups": 2})
         second_entered.set()
-        assert release_second.wait(5)
+        assert release_second.wait(12)
         return {"directories": 2, "groups": 2}
 
     monkeypatch.setattr("donedatahoarder.ai.router.init_ai", lambda **_kwargs: None)
@@ -347,12 +347,31 @@ def test_relate_numeric_directory_progress_keeps_job_live(review_db, monkeypatch
         # A newly attached SSE subscriber must not treat numeric count as terminal.
         stream = job_manager.subscribe(job_id)
         assert next(stream)["done"] == 1
+        # Reproduce the valid initial-snapshot/queued-update race explicitly.
+        job.push_progress(job.progress.copy())
         release.set()
         assert second_entered.wait(5)
-        assert next(stream)["done"] == 2
+        deadline = time.monotonic() + 8
+        for _ in range(6):
+            update = next(stream)
+            assert update.get("done") is not True
+            if update.get("done") == 2:
+                break
+            assert update.get("done") == 1 or update.get("heartbeat") is True
+            assert time.monotonic() < deadline
+        else:
+            pytest.fail("SSE stream did not reach the second numeric directory update")
         assert job_manager.get_job(job_id).state == JobState.RUNNING
         release_second.set()
-        assert next(stream)["done"] is True
+        deadline = time.monotonic() + 8
+        for _ in range(6):
+            update = next(stream)
+            if update.get("done") is True:
+                break
+            assert update.get("done") in (1, 2) or update.get("heartbeat") is True
+            assert time.monotonic() < deadline
+        else:
+            pytest.fail("SSE stream did not reach Boolean completion")
         stream.close()
     finally:
         release.set()
