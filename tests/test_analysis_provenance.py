@@ -154,7 +154,7 @@ def test_pdf_backed_illustrator_provider_failure_has_no_saved_evidence(tmp_path,
         def generate_json(self, prompt, **_kwargs):
             def malformed_response(**kwargs):
                 attempts.append(kwargs)
-                return '{"description", "missing colon"}'
+                return '{"description" "missing colon"}'
 
             return generate_json_with_retry(malformed_response, prompt, LooseDict)
 
