@@ -179,21 +179,28 @@
             </div>
           </div>
 
-          <!-- Pipeline progress -->
-          <h3 class="mb-1" style="font-size:1rem;">Pipeline Progress</h3>
+          <!-- Job state and proposal review are separate from indexed file states. -->
+          <div class="card mb-2" role="status" aria-live="polite">
+            <div class="card-label">Processing status</div>
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+              <strong x-text="executionSummary()"></strong>
+              <span class="badge" x-text="executionState()"></span>
+            </div>
+            <p class="text-sm text-dim mt-1" x-text="executionDetail()"></p>
+            <p class="text-sm mt-1" x-show="reviewWaiting()" x-text="reviewWaiting()"></p>
+          </div>
+
+          <h3 class="mb-1" style="font-size:1rem;">File status breakdown</h3>
+          <p class="text-sm text-dim mb-1" x-text="($store.session.current_session_id ? 'Each indexed file appears once in this session. ' : 'All sessions combined; choose a session for its own totals. ') + 'These are current file states, not pipeline phase progress. Proposed means the suggestion stage checked the file; Skipped means analysis was omitted.'"></p>
           <div class="table-wrap mb-2">
             <table>
-              <thead><tr><th>Status</th><th>Count</th><th style="width:50%">Progress</th></tr></thead>
+              <thead><tr><th>Status</th><th>Count</th><th>Share of indexed files</th></tr></thead>
               <tbody>
-                <template x-for="step in pipelineProgress()" :key="step.label">
+                <template x-for="step in fileStatusDistribution()" :key="step.label">
                   <tr>
                     <td><span class="badge" :class="'badge-' + step.label.toLowerCase()" x-text="step.label"></span></td>
                     <td x-text="step.count.toLocaleString()"></td>
-                    <td>
-                      <div class="progress-bar">
-                        <div class="fill" :class="step.cls" :style="'width:' + step.pct + '%'"></div>
-                      </div>
-                    </td>
+                    <td x-text="step.share"></td>
                   </tr>
                 </template>
               </tbody>

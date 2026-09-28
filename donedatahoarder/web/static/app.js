@@ -23,6 +23,8 @@ document.addEventListener('alpine:init', () => {
     tab: 'home',
     toasts: [],
     loading: false,
+    foregroundOperation: null,
+    foregroundOperationSeq: 0,
     version: '0.6.0',
 
     toast(msg, type = 'info') {
@@ -560,23 +562,142 @@ document.addEventListener('alpine:init', () => {
    * -------------------------------------------------------- */
   Alpine.data('dashboard', () => ({
     stats: null,
+    activeJob: null,
+    latestPlan: null,
+    jobStatusError: false,
+    planStatusError: false,
+    statusLoading: false,
+    statusSessionId: null,
     _loadedVersion: -1,
+    _statsRequest: 0,
+    _statusRequest: 0,
+    _statusInFlightSession: null,
+    _statusInFlightPromise: null,
+    _statusPoll: null,
     async init() {
       await this.load();
       document.addEventListener('datahoarder:refresh', () => this.load());
       this.$watch(() => Alpine.store('app').tab, (tab) => {
-        if (tab === 'dashboard' && this._loadedVersion < window._dataVersion) this.load();
+        if (tab === 'dashboard') {
+          if (this._loadedVersion < window._dataVersion) this.load();
+          else this.loadExecutionStatus();
+        }
       });
+      this.$watch(() => Alpine.store('session').current_session_id, () => this.load());
+      this._statusPoll = setInterval(() => {
+        if (Alpine.store('app').tab === 'dashboard') this.loadExecutionStatus();
+      }, 5000);
+    },
+    destroy() {
+      if (this._statusPoll) clearInterval(this._statusPoll);
     },
     async load() {
+      const sid = Alpine.store('session').current_session_id;
+      const requestId = ++this._statsRequest;
+      this.stats = null;
+      this._loadedVersion = -1;
+      const statusRequest = this.loadExecutionStatus();
       try {
-        const sid = Alpine.store('session').current_session_id;
-        const url = sid ? `/stats?session_id=${sid}` : '/stats';
-        this.stats = await api.get(url);
+        const url = sid ? `/stats?session_id=${encodeURIComponent(sid)}` : '/stats';
+        const stats = await api.get(url);
+        if (requestId !== this._statsRequest || sid !== Alpine.store('session').current_session_id) return;
+        this.stats = stats;
         this._loadedVersion = window._dataVersion;
       } catch (e) {
-        Alpine.store('app').toast('Failed to load stats', 'error');
+        if (requestId === this._statsRequest && sid === Alpine.store('session').current_session_id)
+          Alpine.store('app').toast('Failed to load stats', 'error');
       }
+      await statusRequest;
+    },
+    async loadExecutionStatus() {
+      const sid = Alpine.store('session').current_session_id;
+      if (this._statusInFlightPromise && this._statusInFlightSession === sid)
+        return this._statusInFlightPromise;
+      const requestId = ++this._statusRequest;
+      if (sid !== this.statusSessionId) {
+        this.statusSessionId = sid;
+        this.activeJob = null;
+        this.latestPlan = null;
+        this.jobStatusError = false;
+        this.planStatusError = false;
+        this.statusLoading = !!sid;
+      }
+      if (!sid) { this.statusLoading = false; return; }
+      const request = Promise.allSettled([
+        api.get('/pipeline/jobs/active'),
+        api.get(`/pipeline/runs/latest?session_id=${encodeURIComponent(sid)}`),
+      ]).then(([jobResult, planResult]) => {
+        if (requestId !== this._statusRequest || sid !== Alpine.store('session').current_session_id) return;
+        this.jobStatusError = jobResult.status !== 'fulfilled';
+        this.planStatusError = planResult.status !== 'fulfilled';
+        this.activeJob = !this.jobStatusError && jobResult.value.job_id && jobResult.value.session_id === sid
+          ? jobResult.value : null;
+        this.latestPlan = planResult.status === 'fulfilled' ? planResult.value.plan : null;
+        this.statusLoading = false;
+      });
+      this._statusInFlightSession = sid;
+      this._statusInFlightPromise = request;
+      try { await request; } finally {
+        if (this._statusInFlightPromise === request) {
+          this._statusInFlightPromise = null;
+          this._statusInFlightSession = null;
+        }
+      }
+    },
+    executionState() {
+      if (Alpine.store('app').foregroundOperation?.session_id === this.statusSessionId)
+        return 'Running';
+      if (this.statusLoading) return 'Checking';
+      if (this.activeJob) {
+        const state = this.activeJob.state;
+        if (state === 'paused') return 'Paused';
+        if (state === 'cancelling') return 'Cancelling';
+        if (state === 'running') return 'Running';
+      }
+      if (this.jobStatusError || this.planStatusError) return 'Unavailable';
+      const planState = this.latestPlan?.state;
+      if (planState === 'paused') return 'Paused';
+      if (planState === 'cancelling') return 'Cancelling';
+      if (planState === 'failed') return 'Failed';
+      if (planState === 'interrupted') return 'Interrupted';
+      if (planState === 'running') return 'Running';
+      if (!this.statusSessionId) return 'No session';
+      return 'Idle';
+    },
+    executionSummary() {
+      const state = this.executionState();
+      if (state === 'Running') return this.activeJob
+        ? `Processing ${this.activeJob.job_type || 'files'}`
+        : Alpine.store('app').foregroundOperation?.session_id === this.statusSessionId
+          ? `Processing ${Alpine.store('app').foregroundOperation.step}`
+          : 'Managed run is between steps';
+      if (state === 'Paused') return 'Processing paused';
+      if (state === 'Cancelling') return 'Stopping processing';
+      if (state === 'Failed') return 'Latest managed run failed';
+      if (state === 'Interrupted') return 'Latest managed run needs recovery';
+      if (state === 'Unavailable') return 'Processing status unavailable';
+      if (state === 'Checking') return 'Checking processing status';
+      if (state === 'No session') return 'Choose a session to see its processing status';
+      return 'No active app processing';
+    },
+    executionDetail() {
+      const state = this.executionState();
+      if (state === 'Idle' && this.latestPlan?.state === 'completed')
+        return 'The latest managed run completed. Review proposals before applying changes.';
+      if (state === 'Idle' && this.latestPlan?.state === 'ready')
+        return 'The latest managed run is ready to continue.';
+      if (state === 'Idle' && this.latestPlan?.state === 'cancelled')
+        return 'The latest managed run was cancelled.';
+      if (state === 'Failed' || state === 'Interrupted')
+        return 'Open Pipeline to inspect the saved run and recovery options.';
+      if (state === 'Idle') return 'No app job or action from this browser is running for this session.';
+      if (state === 'Unavailable') return 'Could not check the job service; this is not a completion signal.';
+      return '';
+    },
+    reviewWaiting() {
+      const pending = this.stats?.proposal_counts?.pending || 0;
+      return this.executionState() === 'Idle' && pending > 0
+        ? `${pending.toLocaleString()} suggestions awaiting review` : '';
     },
     formatBytes(b) {
       if (!b) return '0 B';
@@ -584,19 +705,20 @@ document.addEventListener('alpine:init', () => {
       const i = Math.floor(Math.log(b) / Math.log(1024));
       return (b / Math.pow(1024, i)).toFixed(i > 1 ? 1 : 0) + ' ' + units[i];
     },
-    pipelineProgress() {
+    fileStatusDistribution() {
       if (!this.stats) return [];
-      const s = this.stats.by_status;
+      const s = this.stats.by_status || {};
       const total = this.stats.total_files || 1;
       return [
-        { label: 'Pending',  count: s.pending  || 0, pct: ((s.pending  || 0) / total * 100), cls: 'fill-warning' },
-        { label: 'Enriched', count: s.enriched || 0, pct: ((s.enriched || 0) / total * 100), cls: 'fill-primary' },
-        { label: 'Analyzed', count: s.analyzed || 0, pct: ((s.analyzed || 0) / total * 100), cls: 'fill-primary' },
-        { label: 'Proposed', count: s.proposed || 0, pct: ((s.proposed || 0) / total * 100), cls: 'fill-primary' },
-        { label: 'Applied',  count: s.applied  || 0, pct: ((s.applied  || 0) / total * 100), cls: 'fill-success' },
-        { label: 'Skipped',  count: s.skipped  || 0, pct: ((s.skipped  || 0) / total * 100), cls: '' },
-        { label: 'Error',    count: s.error    || 0, pct: ((s.error    || 0) / total * 100), cls: 'fill-warning' },
-      ].filter(x => x.count > 0);
+        { label: 'Pending',  count: s.pending  || 0 },
+        { label: 'Enriched', count: s.enriched || 0 },
+        { label: 'Analyzed', count: s.analyzed || 0 },
+        { label: 'Proposed', count: s.proposed || 0 },
+        { label: 'Applied',  count: s.applied  || 0 },
+        { label: 'Skipped',  count: s.skipped  || 0 },
+        { label: 'Error',    count: s.error    || 0 },
+      ].map(item => ({ ...item, share: `${(item.count / total * 100).toFixed(1)}%` }))
+        .filter(item => item.count > 0);
     },
   }));
 
@@ -1366,6 +1488,9 @@ document.addEventListener('alpine:init', () => {
     // Background job state
     activeJobId: null,
     activeJobType: null,
+    activeJobSessionId: null,
+    _activeJobRequest: 0,
+    _runStepRequestId: 0,
     jobState: null,  // 'running', 'paused', 'completed', 'failed', 'cancelled'
     _eventSource: null,
     // Unattended mode state
@@ -1395,7 +1520,10 @@ document.addEventListener('alpine:init', () => {
       await this.checkRunPlan();
       await this.loadAnalysisErrors();
       await this.loadOrganizationCoverage();
-      this.$watch(() => Alpine.store('session').current_session_id, () => this.checkRunPlan());
+      this.$watch(() => Alpine.store('session').current_session_id, () => {
+        this.checkRunPlan();
+        this.checkActiveJob();
+      });
       this._runPlanPoll = setInterval(() => this.checkRunPlan(), 2500);
     },
 
@@ -1443,6 +1571,7 @@ document.addEventListener('alpine:init', () => {
 
     async checkRunPlan() {
       const sid = Alpine.store('session').current_session_id;
+      this.clearOtherSessionJob(sid);
       const requestId = ++this._runPlanRequest;
       if (sid !== this.runPlanSessionId) {
         this.runPlanSessionId = sid;
@@ -1520,8 +1649,10 @@ document.addEventListener('alpine:init', () => {
           session_id: settings.session_id, backend: settings.backend,
           model: settings.analyzeModel, workers: settings.workers, retry_errors: true,
         });
+        if (settings.session_id !== Alpine.store('session').current_session_id) return;
         this.activeJobId = response.job_id;
         this.activeJobType = 'analyze';
+        this.activeJobSessionId = settings.session_id;
         this.jobState = 'running';
         this.running = 'analyze';
         this._connectJobStream(response.job_id, 'analyze');
@@ -1538,6 +1669,7 @@ document.addEventListener('alpine:init', () => {
         const response = await api.post(`/pipeline/runs/${this.runPlanId}/${action}`, {
           session_id: sid, retry_errors: !!this.analysisErrors?.retryable,
         });
+        if (sid !== Alpine.store('session').current_session_id) return;
         this.runPlanState = response.plan.state;
         await this.checkRunPlan();
       } catch (e) {
@@ -1545,12 +1677,39 @@ document.addEventListener('alpine:init', () => {
       }
     },
 
+    clearOtherSessionJob(sid) {
+      if (!this.activeJobSessionId || this.activeJobSessionId === sid) return;
+      this.clearJobView();
+    },
+
+    clearJobView() {
+      this._eventSource?.close();
+      this._eventSource = null;
+      this.activeJobId = null;
+      this.activeJobType = null;
+      this.activeJobSessionId = null;
+      this.jobState = null;
+      this.running = null;
+      this.analyzeProgress = null;
+      this.enrichProgress = null;
+      this.dedupProgress = null;
+      this.relateProgress = null;
+      this.proposeProgress = null;
+      this.organizeProgress = null;
+      this.executeProgress = null;
+    },
+
     async checkActiveJob() {
+      const sid = Alpine.store('session').current_session_id;
+      const requestId = ++this._activeJobRequest;
+      this.clearOtherSessionJob(sid);
       try {
         const data = await api.get('/pipeline/jobs/active');
-        if (data.job_id) {
+        if (requestId !== this._activeJobRequest || sid !== Alpine.store('session').current_session_id) return;
+        if (data.job_id && data.session_id === sid) {
           this.activeJobId = data.job_id;
           this.activeJobType = data.job_type;
+          this.activeJobSessionId = sid;
           this.jobState = data.state;
           this.running = data.job_type;
           this.progressStartTime = Date.now();
@@ -1561,6 +1720,8 @@ document.addEventListener('alpine:init', () => {
           }
           // Reconnect SSE stream
           this._connectJobStream(data.job_id, data.job_type);
+        } else if (this.activeJobSessionId === sid) {
+          this.clearJobView();
         }
       } catch (e) { /* ignore */ }
     },
@@ -1701,6 +1862,7 @@ document.addEventListener('alpine:init', () => {
         Alpine.store('app').toast('A job is already running. Pause or wait for it to finish.', 'error');
         return;
       }
+      const runRequestId = ++this._runStepRequestId;
 
       this.running = step;
       this.result = null;
@@ -1717,6 +1879,7 @@ document.addEventListener('alpine:init', () => {
       this.jobState = null;
       Alpine.store('app').loading = true;
       const settings = this.getSettings();
+      let foregroundOperation = null;
       try {
         let data;
         switch (step) {
@@ -1728,6 +1891,9 @@ document.addEventListener('alpine:init', () => {
               return;
             }
             const skipDirs = Alpine.store('session').skip_dirs || [];
+            const scanApp = Alpine.store('app');
+            foregroundOperation = { id: ++scanApp.foregroundOperationSeq, session_id: settings.session_id, step };
+            scanApp.foregroundOperation = foregroundOperation;
             data = await api.post('/pipeline/scan', { root_path: settings.rootPath, session_id: settings.session_id, skip_dirs: skipDirs });
             Alpine.store('app').toast(`Scan complete: ${data.new || 0} new files, ${data.skipped || 0} skipped`, 'success');
             break;
@@ -1788,6 +1954,9 @@ document.addEventListener('alpine:init', () => {
               Alpine.store('app').loading = false;
               return;
             }
+            const commitApp = Alpine.store('app');
+            foregroundOperation = { id: ++commitApp.foregroundOperationSeq, session_id: settings.session_id, step };
+            commitApp.foregroundOperation = foregroundOperation;
             data = await api.post('/execute', { session_id: settings.session_id, dry_run: false, preview_token: this.commitPreview.token });
             this.commitPreview = null;
             Alpine.store('app').toast('Changes applied to disk', 'success');
@@ -1799,12 +1968,15 @@ document.addEventListener('alpine:init', () => {
         Alpine.store('app').toast(`${step} failed: ${e.message}`, 'error');
         this.result = { error: e.message };
       } finally {
-        // Only reset for synchronous steps (scan, execute-commit). Background
-        // steps return early; their cleanup happens in _onJobComplete.
-        if (!this._BACKGROUND_STEPS.has(step)) {
+        if (foregroundOperation && Alpine.store('app').foregroundOperation?.id === foregroundOperation.id)
+          Alpine.store('app').foregroundOperation = null;
+        // Background jobs clean up on completion. A failed or stale launch
+        // has no active job and must not leave this browser in a loading state.
+        if (runRequestId === this._runStepRequestId &&
+            (!this._BACKGROUND_STEPS.has(step) || !this.activeJobId)) {
           this.running = null;
           Alpine.store('app').loading = false;
-          await this._refreshAfterStep();
+          if (!this._BACKGROUND_STEPS.has(step)) await this._refreshAfterStep();
         }
       }
     },
@@ -1831,8 +2003,10 @@ document.addEventListener('alpine:init', () => {
       // the body's dry_run flag selects the background path.
       const url = (type === 'execute-dry') ? '/execute' : `/pipeline/${type}`;
       const res = await api.post(url, body);
+      if (settings.session_id !== Alpine.store('session').current_session_id) return res;
       this.activeJobId = res.job_id;
       this.activeJobType = type;
+      this.activeJobSessionId = settings.session_id;
       this.jobState = 'running';
       this.progressStartTime = Date.now();
       Alpine.store('app').loading = false;
@@ -1857,6 +2031,7 @@ document.addEventListener('alpine:init', () => {
     },
 
     _connectJobStream(jobId, type) {
+      const sid = this.activeJobSessionId;
       // Close any existing connection
       if (this._eventSource) {
         this._eventSource.close();
@@ -1867,6 +2042,7 @@ document.addEventListener('alpine:init', () => {
       this._eventSource = es;
 
       es.onmessage = (event) => {
+        if (sid !== Alpine.store('session').current_session_id) return;
         try {
           const data = JSON.parse(event.data);
 
@@ -1899,6 +2075,7 @@ document.addEventListener('alpine:init', () => {
     },
 
     async _onJobComplete(type, data) {
+      if (this.activeJobSessionId !== Alpine.store('session').current_session_id) return;
       const state = data.state || 'completed';
       this.jobState = state;
 
@@ -1965,6 +2142,7 @@ document.addEventListener('alpine:init', () => {
       this.running = null;
       this.activeJobId = null;
       this.activeJobType = null;
+      this.activeJobSessionId = null;
       // Reset all progress vars
       this.analyzeProgress = null;
       this.enrichProgress = null;
