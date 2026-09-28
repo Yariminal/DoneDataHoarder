@@ -7,6 +7,7 @@ const vm = require('node:vm');
 const listeners = new Map();
 const stores = new Map();
 const components = new Map();
+let stream;
 const web = path.join(__dirname, '..', 'donedatahoarder', 'web');
 const Alpine = {
   store(name, value) {
@@ -30,7 +31,10 @@ const context = {
   document: { addEventListener(name, callback) { listeners.set(name, callback); } },
   window: { addEventListener() {} },
   localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
-  EventSource: class { close() {} },
+  EventSource: class {
+    constructor() { this.closed = false; stream = this; }
+    close() { this.closed = true; }
+  },
   setTimeout, clearTimeout, console,
 };
 vm.runInNewContext(fs.readFileSync(path.join(web, 'static', 'app.js'), 'utf8'), context);
@@ -44,6 +48,22 @@ listeners.get('alpine:init')();
   assert.equal(panel.relateProgress.groups, 4);
   assert.equal(panel.relateProgress.updated_utc, snapshot.updated_utc);
   assert.equal(panel.relateProgress.chunk_active, 1);
+  let completed = null;
+  panel._onJobComplete = async (type, data) => { completed = { type, data }; };
+  stream.onmessage({ data: JSON.stringify({ phase: 'directory_complete',
+    done: 1, directories_done: 1, groups: 1 }) });
+  assert.equal(stream.closed, false);
+  assert.equal(panel.activeJobId, 'job-1');
+  assert.equal(panel.relateProgress.directories_done, 1);
+  stream.onmessage({ data: JSON.stringify({ phase: 'directory_complete',
+    done: 2, directories_done: 2, groups: 2 }) });
+  assert.equal(stream.closed, false);
+  assert.equal(completed, null);
+  stream.onmessage({ data: JSON.stringify({ done: true, directories_done: 2,
+    directories: 2, total: 2, groups: 2 }) });
+  assert.equal(stream.closed, true);
+  assert.equal(completed.type, 'relate');
+  assert.equal(completed.data.directories_done, 2);
 
   const html = fs.readFileSync(path.join(web, 'templates', 'index.html'), 'utf8');
   const directoryExpr = html.match(/x-text="([^"]*Directories processed:[^"]*)"/)[1];
@@ -51,7 +71,7 @@ listeners.get('alpine:init')();
     { relateProgress });
   assert.equal(renderDirectories(snapshot), 'Directories processed: 2 (total unknown)');
   const complete = { done: true, directories_done: 3, directories: 3,
-    groups: 5, total: null };
-  assert.equal(renderDirectories(complete), 'Directories processed: 3 (total unknown)');
+    groups: 5, total: 3 };
+  assert.equal(renderDirectories(complete), 'Directories: 3 / 3');
   console.log('Relation progress retains measured counts through heartbeat and completion');
 })().catch(error => { console.error(error); process.exitCode = 1; });

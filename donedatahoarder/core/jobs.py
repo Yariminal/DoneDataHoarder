@@ -424,7 +424,7 @@ class JobManager:
                 )) as stream:
                     for progress in stream:
                         job.push_progress(progress)
-                        if progress.get("done") or progress.get("cancelled"):
+                        if progress.get("done") is True or progress.get("cancelled") is True:
                             break
 
                 if self._cancel_requested(job):
@@ -458,7 +458,7 @@ class JobManager:
                 )) as stream:
                     for progress in stream:
                         job.push_progress(progress)
-                        if progress.get("done") or progress.get("cancelled"):
+                        if progress.get("done") is True or progress.get("cancelled") is True:
                             break
 
                 if self._cancel_requested(job):
@@ -500,7 +500,7 @@ class JobManager:
 
             with closing(gen_factory()) as stream:
                 for progress in stream:
-                    if progress.get("done") or progress.get("cancelled"):
+                    if progress.get("done") is True or progress.get("cancelled") is True:
                         # Push the terminal payload too so subscribers see counts
                         job.push_progress(progress)
                         break
@@ -945,7 +945,7 @@ class JobManager:
                 try:
                     msg = sub_queue.get(timeout=2.0)
                     yield msg
-                    if msg.get("done"):
+                    if msg.get("done") is True:
                         return
                 except queue.Empty:
                     # Heartbeat to keep SSE alive

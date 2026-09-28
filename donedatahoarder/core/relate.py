@@ -1029,10 +1029,27 @@ def _relate_impl(
 
             if 5 <= len(singletons) <= 2000:
                 cross_script_groups: list[dict] = []
-                for chunk in _chunk(singletons, MAX_FILES_PER_CALL):
+                chunks = list(_chunk(singletons, MAX_FILES_PER_CALL))
+                for chunk_number, chunk in enumerate(chunks, 1):
+                    if progress_cb:
+                        progress_cb({
+                            "phase": "cross_script", "done": summary["directories"],
+                            "total": None, "chunk_done": chunk_number - 1,
+                            "chunk_active": chunk_number, "chunk_total": len(chunks),
+                            "updated_utc": datetime.now(timezone.utc).isoformat(),
+                            **summary,
+                        })
                     cross_script_groups.extend(
                         _llm_cross_script_cluster(client, chunk, model=model)
                     )
+                    if progress_cb:
+                        progress_cb({
+                            "phase": "cross_script", "done": summary["directories"],
+                            "total": None, "chunk_done": chunk_number,
+                            "chunk_active": None, "chunk_total": len(chunks),
+                            "updated_utc": datetime.now(timezone.utc).isoformat(),
+                            **summary,
+                        })
 
                 if cross_script_groups:
                     _deduplicate_labels(cross_script_groups)
@@ -1047,6 +1064,12 @@ def _relate_impl(
                     summary["members"] += sum(
                         len(g["members"]) for g in cross_script_groups
                     )
+
+        if progress_cb:
+            progress_cb({"phase": "finalizing", "done": summary["directories"],
+                         "total": None,
+                         "updated_utc": datetime.now(timezone.utc).isoformat(),
+                         **summary})
 
         # Singleton-to-folder linkage: attach remaining singletons to existing
         # groups based on numeric prefix or alpha token matching.
@@ -1113,6 +1136,7 @@ def relate_with_progress(
     sentinel_done = object()
     sentinel_error = object()
     final_summary: dict = {}
+    stop_requested = threading.Event()
     last_progress: dict = {
         "phase": "starting", "directories": 0, "directories_done": 0,
         "done": 0, "total": None, "groups": 0,
@@ -1120,13 +1144,26 @@ def relate_with_progress(
     }
     error_holder: list = [None]
 
+    def _signal(value: object) -> None:
+        """Deliver a terminal sentinel even if closing stopped queue consumption."""
+        while True:
+            try:
+                progress_queue.put_nowait(value)
+                return
+            except queue.Full:
+                try:
+                    progress_queue.get_nowait()
+                except queue.Empty:
+                    # The consumer made room between the two queue calls.
+                    pass
+
     def _progress_cb(progress: dict) -> None:
         """Invoked on worker thread per directory by relate()."""
         # Block while paused
         if pause_event is not None:
             pause_event.wait()
         # Cancel: raise to abort relate()'s loop
-        if cancel_check and cancel_check():
+        if stop_requested.is_set() or (cancel_check and cancel_check()):
             raise _RelateCancelled()
         try:
             progress_queue.put_nowait({
@@ -1164,12 +1201,12 @@ def relate_with_progress(
                 progress_cb=_progress_cb,
             )
             final_summary.update(summary)
-            progress_queue.put(sentinel_done)
+            _signal(sentinel_done)
         except _RelateCancelled:
-            progress_queue.put(sentinel_done)  # treat as graceful end
+            _signal(sentinel_done)  # treat as graceful end
         except Exception as exc:
             error_holder[0] = exc
-            progress_queue.put(sentinel_error)
+            _signal(sentinel_error)
 
     # Initial yield so subscribers see the job has started before the first
     # potentially slow directory or model chunk completes.
@@ -1188,30 +1225,35 @@ def relate_with_progress(
         from donedatahoarder.core.jobs import job_manager
         job_manager.start_tracked_worker(worker)
 
-        while True:
-            try:
-                msg = progress_queue.get(timeout=2.0)
-            except queue.Empty:
-                # Periodic cancel check while waiting for first progress
-                if cancel_check and cancel_check():
-                    yield {"cancelled": True, **final_summary}
-                    return
-                # Heartbeat to keep SSE alive
-                yield {**last_progress, "heartbeat": True,
-                       "heartbeat_utc": datetime.now(timezone.utc).isoformat()}
-                continue
+        try:
+            while True:
+                try:
+                    msg = progress_queue.get(timeout=2.0)
+                except queue.Empty:
+                    # Cancellation remains pending until the model call and
+                    # nested writer have exited. The next callback aborts it.
+                    cancelling = bool(cancel_check and cancel_check())
+                    yield {**last_progress,
+                           "phase": "cancelling" if cancelling else last_progress["phase"],
+                           "heartbeat": True,
+                           "heartbeat_utc": datetime.now(timezone.utc).isoformat()}
+                    continue
 
-            if msg is sentinel_done:
-                break
-            if msg is sentinel_error:
-                # Re-raise so JobManager marks the job FAILED
-                raise error_holder[0] if error_holder[0] else RuntimeError("relate failed")
+                if msg is sentinel_done:
+                    break
+                if msg is sentinel_error:
+                    # Re-raise so JobManager marks the job FAILED
+                    raise error_holder[0] if error_holder[0] else RuntimeError("relate failed")
 
-            last_progress = msg
-            yield msg
-
-        # Wait for worker to finish (it should already have)
-        worker.join(timeout=5.0)
+                last_progress = msg
+                yield msg
+        finally:
+            # Closing a generator must not detach a writer from the lease.
+            # Stop at its next callback, unpause it, and wait for it to exit.
+            stop_requested.set()
+            if pause_event is not None:
+                pause_event.set()
+            worker.join()
 
     # Detect cancellation: if cancel_check was true, we raised _RelateCancelled
     # mid-iteration; the worker put sentinel_done. We still need to surface that.
@@ -1220,4 +1262,4 @@ def relate_with_progress(
         return
 
     yield {**final_summary, "directories_done": final_summary.get("directories", 0),
-           "done": True}
+           "total": final_summary.get("directories", 0), "done": True}

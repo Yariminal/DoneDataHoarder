@@ -2302,7 +2302,7 @@ document.addEventListener('alpine:init', () => {
           const data = JSON.parse(event.data);
 
           // Skip pure heartbeats (no useful payload)
-          if (data.heartbeat && !data.done && !data.cancelled && !data.state) return;
+          if (data.heartbeat && data.done !== true && data.cancelled !== true && !data.state) return;
 
           // Update progress
           this._setProgressForType(type, data);
@@ -2311,7 +2311,7 @@ document.addEventListener('alpine:init', () => {
           if (data.state) this.jobState = data.state;
 
           // Handle completion
-          if (data.done) {
+          if (data.done === true) {
             es.close();
             this._eventSource = null;
             this._onJobComplete(type, data);

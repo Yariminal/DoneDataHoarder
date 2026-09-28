@@ -7,6 +7,7 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from threading import Event, Thread
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -306,6 +307,108 @@ def test_cancel_endpoint_reports_cancelling_until_worker_exit(review_db, monkeyp
     response = client.post("/api/pipeline/jobs/synthetic-job/cancel")
     assert response.status_code == 200
     assert response.json() == {"status": "cancelling", "job_id": "synthetic-job"}
+
+
+def test_relate_numeric_directory_progress_keeps_job_live(review_db, monkeypatch):
+    from donedatahoarder.core.jobs import JobState, job_manager
+
+    _, (session_id, _), _ = review_db
+    entered = Event()
+    release = Event()
+    second_entered = Event()
+    release_second = Event()
+
+    def fake_relate(*, progress_cb, **_kwargs):
+        progress_cb({"phase": "directory_complete", "done": 1,
+                     "directories": 1, "groups": 1})
+        entered.set()
+        assert release.wait(5)
+        progress_cb({"phase": "directory_complete", "done": 2,
+                     "directories": 2, "groups": 2})
+        second_entered.set()
+        assert release_second.wait(5)
+        return {"directories": 2, "groups": 2}
+
+    monkeypatch.setattr("donedatahoarder.ai.router.init_ai", lambda **_kwargs: None)
+    monkeypatch.setattr("donedatahoarder.ai.router.get_client", lambda: None)
+    monkeypatch.setattr("donedatahoarder.core.relate.relate", fake_relate)
+    job_id = job_manager.start_relate(session_id)
+    try:
+        assert entered.wait(5)
+        deadline = time.monotonic() + 5
+        while job_manager.get_job(job_id).progress.get("directories_done") != 1:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        job = job_manager.get_job(job_id)
+        assert job.progress["done"] == 1
+        assert job.state == JobState.RUNNING
+        assert job_manager.get_active().job_id == job_id
+        assert job_manager.has_live_workers()
+        # A newly attached SSE subscriber must not treat numeric count as terminal.
+        stream = job_manager.subscribe(job_id)
+        assert next(stream)["done"] == 1
+        release.set()
+        assert second_entered.wait(5)
+        assert next(stream)["done"] == 2
+        assert job_manager.get_job(job_id).state == JobState.RUNNING
+        release_second.set()
+        assert next(stream)["done"] is True
+        stream.close()
+    finally:
+        release.set()
+        release_second.set()
+    deadline = time.monotonic() + 5
+    while job_manager.get_job(job_id).state == JobState.RUNNING:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert job_manager.get_job(job_id).state == JobState.COMPLETED
+    assert job_manager.get_job(job_id).progress["directories_done"] == 2
+
+
+def test_relate_cancel_waits_for_blocked_model_worker(review_db, monkeypatch):
+    from donedatahoarder.core.jobs import JobState, job_manager
+
+    _, (session_id, _), _ = review_db
+    entered = Event()
+    release = Event()
+    after_model = Event()
+
+    def fake_relate(*, progress_cb, **_kwargs):
+        progress_cb({"phase": "grouping", "done": 0, "directories": 1,
+                     "chunk_active": 1, "groups": 0})
+        entered.set()
+        assert release.wait(8)
+        # This callback must abort before any post-model write can occur.
+        progress_cb({"phase": "grouping", "done": 0, "directories": 1,
+                     "chunk_done": 1, "groups": 0})
+        after_model.set()
+        return {"directories": 1, "groups": 1}
+
+    monkeypatch.setattr("donedatahoarder.ai.router.init_ai", lambda **_kwargs: None)
+    monkeypatch.setattr("donedatahoarder.ai.router.get_client", lambda: None)
+    monkeypatch.setattr("donedatahoarder.core.relate.relate", fake_relate)
+    job_id = job_manager.start_relate(session_id)
+    try:
+        assert entered.wait(5)
+        job_manager.force_cancel(job_id)
+        deadline = time.monotonic() + 5
+        while job_manager.get_job(job_id).progress.get("phase") != "cancelling":
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert job_manager.get_job(job_id).progress["heartbeat"] is True
+        assert job_manager.get_job(job_id).state == JobState.CANCELLING
+        assert job_manager.get_active().job_id == job_id
+        assert job_manager.has_live_workers()
+        with pytest.raises(RuntimeError, match="running|worker|lease|live|cancelling"):
+            job_manager._create_job("test", session_id)
+    finally:
+        release.set()
+    deadline = time.monotonic() + 5
+    while job_manager.get_job(job_id).state == JobState.CANCELLING:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert job_manager.get_job(job_id).state == JobState.CANCELLED
+    assert not after_model.is_set()
 
 
 @pytest.mark.parametrize("state", ["paused", "running"])

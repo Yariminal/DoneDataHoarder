@@ -3,7 +3,7 @@
 import json
 import importlib
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -261,7 +261,8 @@ def test_unsupported_shx_stays_indexed_and_in_structural_companions_but_not_llm(
     assert summary["backstop_groups"] == 1
     assert any(event["phase"] == "grouping" and event["chunk_done"] == 1
                and event["total"] is None and event["updated_utc"] for event in events)
-    assert events[-1]["phase"] == "directory_complete"
+    assert events[-1]["phase"] == "finalizing"
+    assert any(event["phase"] == "directory_complete" for event in events)
     with Session(engine) as db:
         shx = db.query(File).filter_by(filename="101.shx").one()
         assert shx.status == FileStatus.SKIPPED
@@ -360,6 +361,48 @@ def test_relate_heartbeat_preserves_last_measured_progress(monkeypatch):
     finally:
         release.set()
         progress.close()
+
+
+def test_closing_relate_generator_waits_for_blocked_writer(monkeypatch):
+    module = importlib.import_module("donedatahoarder.core.relate")
+    from donedatahoarder.core.jobs import job_manager
+
+    release = Event()
+    closing_started = Event()
+    closed = Event()
+    post_model_write = Event()
+
+    def fake_relate(*, progress_cb, **_kwargs):
+        progress_cb({"phase": "grouping", "done": 0, "directories": 1,
+                     "groups": 0, "chunk_active": 1})
+        assert release.wait(5)
+        progress_cb({"phase": "grouping", "done": 0, "directories": 1,
+                     "groups": 0, "chunk_done": 1})
+        post_model_write.set()
+        return {"directories": 1, "groups": 1}
+
+    monkeypatch.setattr(module, "relate", fake_relate)
+    monkeypatch.setattr("donedatahoarder.ai.router.get_client", lambda: None)
+    progress = module.relate_with_progress("fixture-session")
+    assert next(progress)["phase"] == "starting"
+    assert next(progress)["phase"] == "grouping"
+
+    def close_progress():
+        closing_started.set()
+        progress.close()
+        closed.set()
+
+    closer = Thread(target=close_progress, daemon=True)
+    try:
+        closer.start()
+        assert closing_started.wait(1)
+        assert not closed.wait(0.1)
+        assert job_manager.has_live_workers()
+    finally:
+        release.set()
+        closer.join(timeout=5)
+    assert closed.is_set()
+    assert not post_model_write.is_set()
 
 
 def test_relate_rejects_content_identity_claim_without_matching_hashes():
