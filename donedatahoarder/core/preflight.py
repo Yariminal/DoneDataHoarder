@@ -20,7 +20,7 @@ _AI_EXTENSIONS = {
     ".rw2", ".hdr", ".pdf", ".txt", ".md", ".csv", ".json", ".xml",
     ".html", ".htm", ".docx", ".pptx", ".xlsx", ".rtf",
     ".yaml", ".yml", ".svg", ".psd",
-    ".ai", ".mtl", ".mp4", ".mov", ".mkv", ".avi", ".wmv",
+    ".ai", ".mtl", ".log", ".mp4", ".mov", ".mkv", ".avi", ".wmv",
     ".flv", ".webm", ".m4v", ".3gp", ".ts", ".mts", ".m2ts",
     ".mpg", ".mpeg", ".mp3", ".m4a", ".aac", ".flac", ".wav",
     ".ogg", ".wma", ".opus", ".obj", ".fbx", ".max", ".3ds",
@@ -55,7 +55,7 @@ def estimate_collection(root: Path, *, mode: str = "full",
     files = 0
     indexed_logical_bytes = 0
     ai_candidates = 0
-    dxf_metadata_candidates = 0
+    deterministic_metadata_candidates = 0
     numbered_visual_candidates = 0
     inaccessible = 0
     unreadable_directories: list[str] = []
@@ -71,7 +71,7 @@ def estimate_collection(root: Path, *, mode: str = "full",
         ext = path.suffix.lower()
         extensions[ext or "[none]"] += 1
         ai_candidates += ext in _AI_EXTENSIONS
-        dxf_metadata_candidates += ext == ".dxf"
+        deterministic_metadata_candidates += ext in {".dxf", ".shp"}
         if ext in {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}:
             numbered_visual_candidates += numbered_frame_identity(path) is not None
 
@@ -131,8 +131,8 @@ def estimate_collection(root: Path, *, mode: str = "full",
         # MIME-only routes may exist. Use the separate estimate for planning.
         "ai_candidate_files_upper": files,
         "ai_candidate_files_estimate": ai_candidates,
-        "deterministic_metadata_candidates_estimate": dxf_metadata_candidates,
-        "unsupported_files_estimate": files - ai_candidates - dxf_metadata_candidates,
+        "deterministic_metadata_candidates_estimate": deterministic_metadata_candidates,
+        "unsupported_files_estimate": files - ai_candidates - deterministic_metadata_candidates,
         "numbered_visual_candidates_upper": numbered_visual_candidates,
         "estimated_sampled_upper": estimated_sampled,
         "estimated_ai_calls_range": [ai_calls_lower, ai_calls_estimate],
@@ -153,8 +153,11 @@ def estimate_collection(root: Path, *, mode: str = "full",
             "symlinks and junctions are excluded. Likely AI eligibility is an "
             "extension-only estimate; MIME routing, unreadable content, missing "
             "extractors, sampling, and cache hits can change actual attempts. "
-            "ASCII DXF candidates receive bounded structural metadata inspection "
-            "without AI; binary or malformed DXF may still be unsupported. "
+            "DXF and AutoCAD shape-source candidates receive bounded structural "
+            "metadata inspection without AI; binary or malformed files may "
+            "still be unsupported. A plot log with a CAD event signature also "
+            "takes a deterministic metadata route, while ordinary readable "
+            "logs may retain the text/AI route. "
             "The indexed-file count is the conservative candidate upper bound. "
             "Hash read range includes one enrichment pass and "
             "up to two cache validation passes at 50-200 MiB/s. Cache hits "

@@ -27,7 +27,8 @@ from sqlalchemy.orm import Session
 
 from donedatahoarder.analyzers.archive import ArchiveAnalyzer
 from donedatahoarder.analyzers.base import BaseAnalyzer, AnalysisResult
-from donedatahoarder.analyzers.document import DocumentAnalyzer
+from donedatahoarder.analyzers.cad_text import CadTextAnalyzer, has_cad_plot_signature
+from donedatahoarder.analyzers.document import DOC_MIMES, DocumentAnalyzer
 from donedatahoarder.analyzers.dxf import DxfAnalyzer
 from donedatahoarder.analyzers.format_policy import OPAQUE_RESOURCE_EXTENSIONS
 from donedatahoarder.analyzers.image import ImageAnalyzer
@@ -134,7 +135,16 @@ def _get_analyzer(
         return None
     if ext == ".dxf":
         return next((a for a in analyzers if isinstance(a, DxfAnalyzer)), None)
+    if ext == ".shp":
+        return next((a for a in analyzers if isinstance(a, CadTextAnalyzer)), None)
+    if ext == ".log":
+        if (mime not in DOC_MIMES or path and not _has_reparse_component(Path(path))
+                and has_cad_plot_signature(Path(path))):
+            return next((a for a in analyzers if isinstance(a, CadTextAnalyzer)), None)
+        # Ordinary readable logs retain their existing MIME-based text route.
     for a in analyzers:
+        if ext == ".log" and isinstance(a, CadTextAnalyzer):
+            continue
         if a.can_handle(mime, ext):
             return a
     return None
@@ -199,11 +209,11 @@ def _process_one_file(
         )
 
         ext = file_rec.extension or ""
-        if ext.lower() == ".bak" and _has_reparse_component(Path(file_rec.path)):
+        if ext.lower() in {".bak", ".log", ".shp"} and _has_reparse_component(Path(file_rec.path)):
             file_rec.status = FileStatus.ERROR
             file_rec.analysis_outcome = "failed"
             file_rec.analysis_reason = "stale_enrichment"
-            file_rec.error_message = "Backup path changed or includes a reparse point; rescan before analysis"
+            file_rec.error_message = "File path changed or includes a reparse point; rescan before analysis"
             session.commit()
             return file_id, "error", file_rec.error_message
         if ext in skip_ext:
@@ -276,6 +286,7 @@ def _process_one_file(
         cache_route_stable = not (
             isinstance(analyzer, VideoAnalyzer)
             or isinstance(analyzer, DxfAnalyzer)
+            or isinstance(analyzer, CadTextAnalyzer)
             or isinstance(analyzer, DocumentAnalyzer) and ext.lower() in {".pdf", ".ai"}
         )
         ctx = build_context(file_rec)
@@ -462,6 +473,7 @@ def _analyze_with_progress_unlocked(
     client = get_client()
     analyzer_list: list[BaseAnalyzer] = [
         DxfAnalyzer(),
+        CadTextAnalyzer(),
         ImageAnalyzer(client),
         VideoAnalyzer(client),
         DocumentAnalyzer(client),

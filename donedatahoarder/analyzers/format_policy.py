@@ -16,6 +16,10 @@ def disposition(path: Path) -> str:
     ext = path.suffix.lower()
     if ext == ".dxf":
         return "bounded_ascii_dxf_metadata_or_unsupported"
+    if ext == ".log":
+        return "cad_plot_metadata_or_existing_text_route_or_unsupported"
+    if ext == ".shp":
+        return "signature_checked_autocad_shape_source_metadata_or_unsupported"
     if ext in OPAQUE_RESOURCE_EXTENSIONS:
         return "preserve_opaque_font_or_cad_resource"
     if ext in {".dwg", ".3dmbak"}:
