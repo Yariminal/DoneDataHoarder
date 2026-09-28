@@ -1,5 +1,7 @@
 # Real corpus validation
 
+The measured six-source iteration and its limits are in [Iteration 4 validation](ITERATION_4_VALIDATION_REPORT.md); follow-up gates are in [Iteration 4 next steps](ITERATION_4_NEXT_STEPS.md).
+
 Run from the repository root with the project's virtual environment. The source ZIPs and existing folders in `D:\Test` are never modified. Each `prepare` creates a new, uniquely named `D:\Test\DDH-validation-*` directory. Reports, SQLite, config, logs, and the undo journal live inside that directory; only its `data` child is scanned.
 
 On Windows, set `$env:PYTHONUTF8='1'` and `$env:PYTHONDONTWRITEBYTECODE='1'` before running the commands so non-Latin filenames and Rich progress render reliably.
