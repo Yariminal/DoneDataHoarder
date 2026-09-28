@@ -22,10 +22,11 @@ from __future__ import annotations
 import logging
 import re
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-from sqlalchemy import func
+from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
 from donedatahoarder.ai.json_utils import extract_json
@@ -40,6 +41,24 @@ logger = logging.getLogger(__name__)
 LLM_CONFIDENCE = 0.8
 BACKSTOP_CONFIDENCE = 0.3
 MAX_RELATION_UNIT_FILES = 20_000
+
+
+def _unsupported_shx(file: File) -> bool:
+    """Keep opaque SHX resources available to structural grouping, not the LLM."""
+    return (file.status == FileStatus.SKIPPED
+            and (file.extension or "").lower() == ".shx"
+            and file.analysis_outcome == "skipped"
+            and file.analysis_reason == "unsupported_type")
+
+
+def _unsupported_shx_clause():
+    """SQL equivalent for the bounded cross-script singleton query."""
+    return and_(
+        File.status == FileStatus.SKIPPED,
+        func.lower(func.coalesce(File.extension, "")) == ".shx",
+        func.coalesce(File.analysis_outcome, "") == "skipped",
+        func.coalesce(File.analysis_reason, "") == "unsupported_type",
+    )
 
 
 def _iter_relation_units(reader: Session, session_id: str, scope: str):
@@ -862,8 +881,8 @@ def _relate_impl(
                 LLM call. Overrides the client's default text_model. Use this
                 when the caller needs a reasoning-capable model regardless of
                 which model was last initialised via init_ai().
-        progress_cb: optional callback invoked with {"dir": str, "done": N, "total": M}
-                     after each directory is processed.
+        progress_cb: optional callback after each model chunk and directory.
+                     Directory totals may be unknown while streaming.
 
     Returns:
         Summary dict: {"directories": int, "groups": int, "members": int,
@@ -915,10 +934,13 @@ def _relate_impl(
                 summary["backstop_groups"] += saved
                 summary["members"] += sum(len(group["members"]) for group in sequence_groups)
             dir_files = [file for file in unit_files if file.id not in placed_ids]
+            semantic_files = [file for file in dir_files if not _unsupported_shx(file)]
             if len(dir_files) < 2:
                 if progress_cb:
-                    progress_cb({"dir": dir_label, "done": summary["directories"],
-                                 "total": None, **summary})
+                    progress_cb({"phase": "directory_complete", "dir": dir_label,
+                                 "done": summary["directories"], "total": None,
+                                 "updated_utc": datetime.now(timezone.utc).isoformat(),
+                                 **summary})
                 continue
             # Map filename (basename) → file_id for this unit.
             # For per_directory scope, filenames are unique within the dir.
@@ -932,12 +954,30 @@ def _relate_impl(
             llm_groups: list[dict] = []
             if client is not None:
                 # Chunk very large dirs into multiple LLM calls
-                for chunk in _chunk(dir_files, MAX_FILES_PER_CALL):
-                    if len(chunk) < 2:
-                        continue
+                chunks = [chunk for chunk in _chunk(semantic_files, MAX_FILES_PER_CALL)
+                          if len(chunk) >= 2]
+                for chunk_number, chunk in enumerate(chunks, 1):
+                    if progress_cb:
+                        progress_cb({
+                            "phase": "grouping", "done": summary["directories"] - 1,
+                            "directory_index": summary["directories"], "total": None,
+                            "chunk_done": chunk_number - 1,
+                            "chunk_active": chunk_number, "chunk_total": len(chunks),
+                            "updated_utc": datetime.now(timezone.utc).isoformat(),
+                            **summary,
+                        })
                     llm_groups.extend(
                         _call_llm_for_group(client, dir_label, chunk, model=model)
                     )
+                    if progress_cb:
+                        progress_cb({
+                            "phase": "grouping", "done": summary["directories"] - 1,
+                            "directory_index": summary["directories"], "total": None,
+                            "chunk_done": chunk_number, "chunk_total": len(chunks),
+                            "chunk_active": None,
+                            "updated_utc": datetime.now(timezone.utc).isoformat(),
+                            **summary,
+                        })
 
             # A numeric prefix alone is not evidence that two LLM chunks or
             # CAD and image files share one project. Keep their groups apart.
@@ -966,9 +1006,11 @@ def _relate_impl(
 
             if progress_cb:
                 progress_cb({
+                    "phase": "directory_complete",
                     "dir": dir_label,
                     "done": summary["directories"],
                     "total": None,
+                    "updated_utc": datetime.now(timezone.utc).isoformat(),
                     **summary,
                 })
 
@@ -982,7 +1024,7 @@ def _relate_impl(
             )
             singletons = session.query(File).filter(
                 File.session_id == session_id, File.status != FileStatus.ERROR,
-                ~File.id.in_(assigned),
+                ~File.id.in_(assigned), ~_unsupported_shx_clause(),
             ).order_by(File.id).limit(2001).all()
 
             if 5 <= len(singletons) <= 2000:
@@ -1071,6 +1113,11 @@ def relate_with_progress(
     sentinel_done = object()
     sentinel_error = object()
     final_summary: dict = {}
+    last_progress: dict = {
+        "phase": "starting", "directories": 0, "directories_done": 0,
+        "done": 0, "total": None, "groups": 0,
+        "updated_utc": datetime.now(timezone.utc).isoformat(),
+    }
     error_holder: list = [None]
 
     def _progress_cb(progress: dict) -> None:
@@ -1082,12 +1129,18 @@ def relate_with_progress(
         if cancel_check and cancel_check():
             raise _RelateCancelled()
         try:
-            progress_queue.put_nowait({"phase": "running", **progress})
+            progress_queue.put_nowait({
+                "phase": "running", **progress,
+                "directories_done": progress.get("done", progress.get("directories", 0)),
+            })
         except queue.Full:
             # Drop oldest to make room
             try:
                 progress_queue.get_nowait()
-                progress_queue.put_nowait({"phase": "running", **progress})
+                progress_queue.put_nowait({
+                    "phase": "running", **progress,
+                    "directories_done": progress.get("done", progress.get("directories", 0)),
+                })
             except (queue.Empty, queue.Full):
                 pass
 
@@ -1118,8 +1171,9 @@ def relate_with_progress(
             error_holder[0] = exc
             progress_queue.put(sentinel_error)
 
-    # Initial yield so subscribers see the job has started
-    yield {"phase": "starting", "directories": 0, "groups": 0}
+    # Initial yield so subscribers see the job has started before the first
+    # potentially slow directory or model chunk completes.
+    yield dict(last_progress)
 
     # Suppress Rich/log output from inside relate()
     import contextlib
@@ -1143,7 +1197,8 @@ def relate_with_progress(
                     yield {"cancelled": True, **final_summary}
                     return
                 # Heartbeat to keep SSE alive
-                yield {"phase": "running", "heartbeat": True, **final_summary}
+                yield {**last_progress, "heartbeat": True,
+                       "heartbeat_utc": datetime.now(timezone.utc).isoformat()}
                 continue
 
             if msg is sentinel_done:
@@ -1152,6 +1207,7 @@ def relate_with_progress(
                 # Re-raise so JobManager marks the job FAILED
                 raise error_holder[0] if error_holder[0] else RuntimeError("relate failed")
 
+            last_progress = msg
             yield msg
 
         # Wait for worker to finish (it should already have)
@@ -1163,4 +1219,5 @@ def relate_with_progress(
         yield {"cancelled": True, **final_summary}
         return
 
-    yield {"done": True, **final_summary}
+    yield {**final_summary, "directories_done": final_summary.get("directories", 0),
+           "done": True}

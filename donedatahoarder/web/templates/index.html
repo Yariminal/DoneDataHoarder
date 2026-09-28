@@ -917,18 +917,22 @@
           <div class="step-num" :class="{ active: running === 'relate', 'step-done': isStepDone('relate') }" x-text="isStepDone('relate') ? '✓' : '4'"></div>
           <div class="step-info">
             <div class="step-name">Relate</div>
-            <div class="step-desc">LLM groups conceptually-related files (CAD source + backups + exports, photo sets, font families)</div>
-            <!-- Live per-directory progress -->
-            <template x-if="relateProgress && relateProgress.total">
+            <div class="step-desc">Groups related source files, backups, exports and photo sets</div>
+            <!-- Relation units are streamed, so the directory total may be unknown. -->
+            <template x-if="relateProgress">
               <div class="mt-1">
-                <div class="text-sm" style="color:var(--primary); font-weight:600;"
-                     x-text="'Directory: ' + (relateProgress.done || 0) + ' / ' + (relateProgress.total || 0) + (relateProgress.dir ? ' — ' + relateProgress.dir : '')"></div>
-                <div style="margin-top:4px; background:var(--surface-2); border-radius:4px; height:6px; overflow:hidden;">
+                <div class="text-sm" role="status" aria-live="polite" style="color:var(--primary); font-weight:600;"
+                     x-text="relateProgress.total != null ? 'Directories: ' + (relateProgress.directories_done || 0) + ' / ' + relateProgress.total : 'Directories processed: ' + (relateProgress.directories_done || 0) + ' (total unknown)'"></div>
+                <div class="text-dim text-sm mt-1" x-show="relateProgress.phase === 'grouping'"
+                     x-text="'Grouping directory ' + (relateProgress.directory_index || 1) + ': chunk ' + (relateProgress.chunk_active || relateProgress.chunk_done || 0) + ' / ' + (relateProgress.chunk_total || 0) + (relateProgress.chunk_active ? ' in progress' : ' complete')"></div>
+                <div x-show="relateProgress.total != null" style="margin-top:4px; background:var(--surface-2); border-radius:4px; height:6px; overflow:hidden;">
                   <div style="height:100%; background:var(--primary); border-radius:4px; transition:width .3s;"
-                       :style="'width:' + (relateProgress.total ? ((relateProgress.done || 0) / relateProgress.total * 100) : 0) + '%'"></div>
+                       :style="'width:' + (relateProgress.total ? ((relateProgress.directories_done || 0) / relateProgress.total * 100) : 0) + '%'"></div>
                 </div>
                 <div class="text-dim text-sm mt-1"
                      x-text="'Groups: ' + (relateProgress.groups || 0) + ' | LLM: ' + (relateProgress.llm_groups || 0) + ' | Backstop: ' + (relateProgress.backstop_groups || 0)"></div>
+                <div class="text-dim text-sm mt-1" x-show="relateProgress.updated_utc"
+                     x-text="'Last activity: ' + new Date(relateProgress.updated_utc).toLocaleTimeString()"></div>
               </div>
             </template>
             <template x-if="activeJobType === 'relate' && jobState === 'paused'">

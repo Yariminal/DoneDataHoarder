@@ -18,6 +18,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 import uuid
 import zipfile
 
@@ -42,6 +44,64 @@ ADDITIONAL_NAMESPACE = "Corpus"
 PREFIX = "DDH-combined-"
 MAX_COMBINED_FILES = 20_000
 MAX_COMBINED_BYTES = 12 * 1024**3
+
+
+def _relate_with_heartbeat(root: Path, session_id: str, model: str) -> dict:
+    """Persist and print bounded numeric progress without exposing file names."""
+    from donedatahoarder.core.relate import relate
+
+    sidecar = root / "reports" / "relate-progress.json"
+    progress = {"phase": "starting", "directories_done": 0, "groups": 0,
+                "updated_utc": datetime.now(timezone.utc).isoformat()}
+    write_json(sidecar, progress)
+    stop = threading.Event()
+    last_written = [0.0]
+
+    def callback(event: dict) -> None:
+        progress.update({
+            "phase": event.get("phase", "directory_complete"),
+            "directories_done": event.get("done", 0),
+            "directory_index": event.get("directory_index"),
+            "chunk_done": event.get("chunk_done"),
+            "chunk_active": event.get("chunk_active"),
+            "chunk_total": event.get("chunk_total"),
+            "groups": event.get("groups", 0),
+            "llm_groups": event.get("llm_groups", 0),
+            "backstop_groups": event.get("backstop_groups", 0),
+            "updated_utc": event.get("updated_utc") or datetime.now(timezone.utc).isoformat(),
+        })
+        moment = time.monotonic()
+        if moment - last_written[0] >= 2.0:
+            write_json(sidecar, progress)
+            last_written[0] = moment
+
+    def heartbeat() -> None:
+        while not stop.wait(30):
+            print("Relate active: processed %d directories; groups %d; directory %s chunk %s/%s"
+                  % (progress["directories_done"], progress["groups"],
+                     progress.get("directory_index") or "?",
+                     progress.get("chunk_done") or "?",
+                     progress.get("chunk_total") or "?"), flush=True)
+
+    worker = threading.Thread(target=heartbeat, name="relate-cli-heartbeat", daemon=True)
+    worker.start()
+    try:
+        result = relate(session_id=session_id, scope="per_directory", model=model,
+                        progress_cb=callback)
+        progress.update({"phase": "completed", "directories_done": result["directories"],
+                         "directory_index": None, "chunk_done": None,
+                         "chunk_active": None, "chunk_total": None,
+                         "groups": result["groups"],
+                         "updated_utc": datetime.now(timezone.utc).isoformat()})
+        write_json(sidecar, progress)
+        return result
+    except BaseException:
+        progress.update({"phase": "failed", "updated_utc": datetime.now(timezone.utc).isoformat()})
+        write_json(sidecar, progress)
+        raise
+    finally:
+        stop.set()
+        worker.join(timeout=1)
 
 
 def selected_archives(additional_zip: str | None = None) -> tuple[tuple[str, Path], ...]:
@@ -381,10 +441,9 @@ def pipeline(args) -> None:
     run_step(report, report_path, "dedup_proposals",
              lambda: generate_dedup_proposals(session_id=session_id))
     if args.mode != "metadata_only":
-        from donedatahoarder.core.relate import relate
         run_ai_step(report, report_path, "relate",
-                    lambda: relate(session_id=session_id, scope="per_directory",
-                                   model=args.model), state / "logs" / "donedatahoarder.log")
+                    lambda: _relate_with_heartbeat(root, session_id, args.model),
+                    state / "logs" / "donedatahoarder.log")
     from donedatahoarder.proposals.namer import generate_proposals
     run_step(report, report_path, "propose",
              lambda: generate_proposals(session_id=session_id))
@@ -649,11 +708,9 @@ def continue_analysis(args) -> None:
                  lambda: find_semantic_duplicates(session_id=original["session_id"]))
         run_step(report, report_path, "dedup_proposals",
                  lambda: generate_dedup_proposals(session_id=original["session_id"]))
-        from donedatahoarder.core.relate import relate
         require_local_provider(args.model)
         run_ai_step(report, report_path, "relate",
-                    lambda: relate(session_id=original["session_id"],
-                                   scope="per_directory", model=args.model),
+                    lambda: _relate_with_heartbeat(root, original["session_id"], args.model),
                     state / "logs" / "donedatahoarder.log")
         if report["steps"]["relate"].get("warning_count"):
             raise RuntimeError("relation stage logged warnings")

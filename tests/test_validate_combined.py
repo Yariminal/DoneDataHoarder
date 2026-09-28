@@ -18,6 +18,36 @@ from donedatahoarder.db.models import (
 from donedatahoarder.db.session import init_db
 
 
+def test_relate_heartbeat_exposes_numeric_progress_without_private_paths(
+        tmp_path, monkeypatch, capsys):
+    calls = []
+
+    def fake_relate(*, session_id, scope, model, progress_cb):
+        calls.append((session_id, scope, model))
+        progress_cb({"phase": "grouping", "dir": "/private/project/secret-file.shx",
+                     "done": 0, "directory_index": 1, "total": None,
+                     "chunk_done": 1, "chunk_total": 2,
+                     "groups": 0, "llm_groups": 0, "backstop_groups": 0})
+        progress_cb({"phase": "directory_complete", "dir": "/private/project",
+                     "done": 1, "total": None, "groups": 2,
+                     "llm_groups": 1, "backstop_groups": 1})
+        return {"directories": 1, "groups": 2, "members": 3,
+                "llm_groups": 1, "backstop_groups": 1}
+
+    monkeypatch.setattr("donedatahoarder.core.relate.relate", fake_relate)
+    summary = validate_combined._relate_with_heartbeat(tmp_path, "fixture-session", "fixture-model")
+    sidecar = (tmp_path / "reports" / "relate-progress.json").read_text(encoding="utf-8")
+    assert summary["groups"] == 2
+    assert calls == [("fixture-session", "per_directory", "fixture-model")]
+    assert json.loads(sidecar)["phase"] == "completed"
+    assert json.loads(sidecar)["directories_done"] == 1
+    assert json.loads(sidecar)["chunk_done"] is None
+    assert json.loads(sidecar)["chunk_total"] is None
+    assert json.loads(sidecar)["directory_index"] is None
+    assert "private" not in sidecar and "secret-file" not in sidecar
+    assert "secret-file" not in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("behavior", [
     "success", "crlf", "source_mismatch", "mutate_retained", "leave_error",
     "reskipped", "preexisting_proposal"])
@@ -130,7 +160,10 @@ def test_guarded_combined_continuation_preserves_original_success_and_report(
     monkeypatch.setattr(dedup, "find_semantic_duplicates", lambda **kw:
                         downstream_calls.append("semantic") or {})
     monkeypatch.setattr(dedup, "generate_dedup_proposals", lambda **kw: {})
-    monkeypatch.setattr(relate, "relate", lambda **kw: None)
+    monkeypatch.setattr(relate, "relate", lambda **kw: {
+        "directories": 0, "groups": 0, "members": 0,
+        "llm_groups": 0, "backstop_groups": 0,
+    })
     from donedatahoarder.proposals import namer, organizer
     monkeypatch.setattr(namer, "generate_proposals", lambda **kw: {})
     monkeypatch.setattr(organizer, "generate_reorg_proposals", lambda **kw: None)

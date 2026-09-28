@@ -1,7 +1,9 @@
 """Bounded Ollama requests used by the relation grouping step."""
 
 import json
+import importlib
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -193,6 +195,7 @@ def test_relate_persists_one_group_for_503_frames_without_chunking_them(monkeypa
     engine = create_engine(f"sqlite:///{tmp_path / 'frames.db'}")
     Base.metadata.create_all(engine)
     monkeypatch.setattr("donedatahoarder.core.relate.get_engine", lambda: engine)
+    monkeypatch.setattr("donedatahoarder.db.session.get_engine", lambda: engine)
     with Session(engine) as db:
         user = UserSession(root_path=str(tmp_path))
         db.add(user)
@@ -219,6 +222,144 @@ def test_relate_persists_one_group_for_503_frames_without_chunking_them(monkeypa
         group = db.query(RelationGroup).filter_by(session_id=session_id).one()
         assert len(group.members) == 503
         assert group.reason.startswith("Numbered image sequence")
+
+
+def test_unsupported_shx_stays_indexed_and_in_structural_companions_but_not_llm(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'shx.db'}")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr("donedatahoarder.core.relate.get_engine", lambda: engine)
+    monkeypatch.setattr("donedatahoarder.db.session.get_engine", lambda: engine)
+    with Session(engine) as db:
+        owner = UserSession(root_path=str(tmp_path))
+        db.add(owner)
+        db.flush()
+        sid = owner.id
+        for name, status, outcome, reason in (
+            ("101.shx", FileStatus.SKIPPED, "skipped", "unsupported_type"),
+            ("101.dwg", FileStatus.SKIPPED, "skipped", "unsupported_type"),
+            ("101.bak", FileStatus.SKIPPED, "skipped", "unsupported_type"),
+            ("notes.docx", FileStatus.ANALYZED, "content_verified", None),
+            ("plan.pdf", FileStatus.ANALYZED, "content_verified", None),
+        ):
+            db.add(File(session_id=sid, path=str(tmp_path / name), filename=name,
+                        extension=Path(name).suffix, status=status,
+                        analysis_outcome=outcome, analysis_reason=reason))
+        db.commit()
+
+    prompts = []
+    events = []
+
+    class Client:
+        def generate_json(self, prompt, **_kwargs):
+            prompts.append(prompt)
+            return []
+
+    summary = relate(sid, client=Client(), progress_cb=events.append)
+    assert len(prompts) == 1
+    assert "101.shx" not in prompts[0]
+    assert "101.dwg" in prompts[0] and "101.bak" in prompts[0]
+    assert summary["backstop_groups"] == 1
+    assert any(event["phase"] == "grouping" and event["chunk_done"] == 1
+               and event["total"] is None and event["updated_utc"] for event in events)
+    assert events[-1]["phase"] == "directory_complete"
+    with Session(engine) as db:
+        shx = db.query(File).filter_by(filename="101.shx").one()
+        assert shx.status == FileStatus.SKIPPED
+        assert shx.analysis_reason == "unsupported_type"
+        group = db.query(RelationGroup).one()
+        member_ids = {member.file_id for member in group.members}
+        assert {row.filename for row in db.query(File).filter(File.id.in_(member_ids))} == {
+            "101.shx", "101.dwg", "101.bak",
+        }
+
+
+def test_relate_emits_each_model_chunk_and_omits_unsupported_shx_from_cross_script(
+        monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'chunks.db'}")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr("donedatahoarder.core.relate.get_engine", lambda: engine)
+    monkeypatch.setattr("donedatahoarder.db.session.get_engine", lambda: engine)
+    with Session(engine) as db:
+        owner = UserSession(root_path=str(tmp_path))
+        db.add(owner)
+        db.flush()
+        sid = owner.id
+        for number in range(202):
+            name = f"note_{number:03}.txt"
+            db.add(File(session_id=sid, path=str(tmp_path / name), filename=name,
+                        extension=".txt", status=FileStatus.ANALYZED,
+                        analysis_outcome="content_verified"))
+        for number in range(6):
+            name = f"font_{number:03}.shx"
+            db.add(File(session_id=sid, path=str(tmp_path / name), filename=name,
+                        extension=".shx", status=FileStatus.SKIPPED,
+                        analysis_outcome="skipped", analysis_reason="unsupported_type"))
+        db.commit()
+
+    group_prompts = []
+    cross_prompts = []
+    events = []
+
+    class Client:
+        def generate_json(self, prompt, **_kwargs):
+            group_prompts.append(prompt)
+            return []
+
+        def generate(self, prompt, **_kwargs):
+            cross_prompts.append(prompt)
+            return "[]"
+
+    relate(sid, client=Client(), progress_cb=events.append)
+    grouping = [event for event in events if event["phase"] == "grouping"]
+    assert [(event["chunk_done"], event["chunk_active"]) for event in grouping] == [
+        (0, 1), (1, None), (1, 2), (2, None), (2, 3), (3, None),
+    ]
+    assert all(event["chunk_total"] == 3 and event["done"] == 0 for event in grouping)
+    assert len(group_prompts) == 3
+    assert cross_prompts
+    assert all(".shx" not in prompt for prompt in group_prompts + cross_prompts)
+
+
+def test_relate_heartbeat_preserves_last_measured_progress(monkeypatch):
+    module = importlib.import_module("donedatahoarder.core.relate")
+    release = Event()
+
+    def fake_relate(*, progress_cb, **_kwargs):
+        progress_cb({"phase": "grouping", "done": 2, "directories": 3,
+                     "directory_index": 3, "chunk_done": 0, "chunk_active": 1,
+                     "chunk_total": 2, "groups": 4,
+                     "updated_utc": "2026-01-01T00:00:00+00:00"})
+        assert release.wait(5)
+        progress_cb({"phase": "directory_complete", "done": 3,
+                     "directories": 3, "groups": 5,
+                     "updated_utc": "2026-01-01T00:00:03+00:00"})
+        return {"directories": 3, "groups": 5}
+
+    monkeypatch.setattr(module, "relate", fake_relate)
+    monkeypatch.setattr("donedatahoarder.ai.router.get_client", lambda: None)
+    progress = module.relate_with_progress("fixture-session")
+    try:
+        assert next(progress)["phase"] == "starting"
+        measured = next(progress)
+        assert measured["directories_done"] == 2
+        assert measured["chunk_active"] == 1
+        heartbeat = next(progress)
+        assert heartbeat["heartbeat"] is True
+        assert heartbeat["directories_done"] == 2
+        assert heartbeat["groups"] == 4
+        assert heartbeat["updated_utc"] == measured["updated_utc"]
+        assert heartbeat["heartbeat_utc"] != measured["updated_utc"]
+        release.set()
+        complete = next(progress)
+        assert complete["phase"] == "directory_complete"
+        assert complete["directories_done"] == 3
+        terminal = next(progress)
+        assert terminal["done"] is True
+        assert terminal["directories_done"] == 3
+        assert terminal["groups"] == 5
+    finally:
+        release.set()
+        progress.close()
 
 
 def test_relate_rejects_content_identity_claim_without_matching_hashes():
