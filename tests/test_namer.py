@@ -2,6 +2,7 @@
 Unit tests for donedatahoarder.proposals.namer — naming heuristics.
 """
 from pathlib import Path
+from datetime import datetime
 
 import pytest
 
@@ -15,6 +16,129 @@ from donedatahoarder.proposals.namer.core import (
     _restore_descriptive_identity, _suppress_unsafe_rename_postpasses,
 )
 from types import SimpleNamespace
+from donedatahoarder.proposals.namer.naming import (
+    _ensure_prefix, _is_meaningful_date, _name_date_provenance, _source_filename_date,
+    build_new_name,
+)
+
+
+def _dated_name_record(path: Path, *, suggested: str, modified=None, created=None,
+                       exif=None):
+    return SimpleNamespace(
+        path=str(path), ai_suggested_name=suggested,
+        ai_description="Brief subject description", ai_tags=None,
+        ai_confidence=0.9, date_modified=modified, date_created=created,
+        date_best=exif or modified or created, date_exif=exif,
+    )
+
+
+def test_copied_document_mtime_cannot_create_a_new_date_prefix(tmp_path):
+    row = _dated_name_record(
+        tmp_path / "report.docx", suggested="policy_summary",
+        modified=datetime(2018, 1, 17), created=datetime(2026, 9, 28),
+    )
+    assert not _is_meaningful_date(row)
+    assert build_new_name(row, root_path=str(tmp_path)) == "policy_summary.docx"
+    assert _name_date_provenance(row, "policy_summary") == ""
+    row.ai_suggested_name = "2018-01-17_policy_summary"
+    assert build_new_name(row, root_path=str(tmp_path)) == "policy_summary.docx"
+
+
+def test_existing_full_date_is_retained_as_filename_identity(tmp_path):
+    row = _dated_name_record(
+        tmp_path / "notes_2021.10.12.docx", suggested="meeting_notes",
+        modified=datetime(2019, 5, 1), created=datetime(2026, 9, 28),
+    )
+    assert _source_filename_date(Path(row.path).stem) == "2021-10-12"
+    proposed = build_new_name(row, root_path=str(tmp_path))
+    assert proposed == "2021-10-12_meeting_notes.docx"
+    assert "original filename" in _name_date_provenance(row, Path(proposed).stem)
+    assert _source_filename_date("notes_2021.02.30") is None
+    row.path = str(tmp_path / "2021.10.12_report.docx")
+    proposed = build_new_name(row, root_path=str(tmp_path))
+    assert proposed == "2021-10-12_meeting_notes.docx"
+    assert _ensure_prefix(Path(proposed).stem, Path(row.path).stem) == Path(proposed).stem
+    row.path = str(tmp_path / "10.8_notes_2021-10-12.docx")
+    proposed = build_new_name(row, root_path=str(tmp_path))
+    assert proposed == "2021-10-12_meeting_notes.docx"
+    assert _ensure_prefix(Path(proposed).stem, Path(row.path).stem).startswith("10_8_2021-10-12_")
+
+
+def test_project_year_identifier_is_not_replaced_by_file_mtime(tmp_path):
+    row = _dated_name_record(
+        tmp_path / "PROJECTQ_B_2022.pptx", suggested="annual_report",
+        modified=datetime(2021, 10, 12), created=datetime(2026, 9, 28),
+    )
+    proposed = build_new_name(row, root_path=str(tmp_path))
+    assert proposed == "annual_report.pptx"
+    assert _restore_descriptive_identity(Path(row.path).stem, Path(proposed).stem).startswith("PROJECTQ_B_2022_")
+
+
+def test_stored_photo_exif_date_is_used_without_claiming_capture_time(tmp_path):
+    row = _dated_name_record(
+        tmp_path / "IMG_1234.jpg", suggested="family_portrait",
+        modified=datetime(2026, 9, 28), created=datetime(2026, 9, 28),
+        exif=datetime(2020, 5, 6, 12, 34, 56),
+    )
+    assert _is_meaningful_date(row)
+    proposed = build_new_name(row, root_path=str(tmp_path))
+    assert proposed == "2020-05-06_12-34-56_family_portrait.jpg"
+    note = _name_date_provenance(row, Path(proposed).stem)
+    assert "stored EXIF metadata" in note and "capture date unverified" in note
+    row.path = str(tmp_path / "clip.mp4")
+    assert not _is_meaningful_date(row)
+    assert build_new_name(row, root_path=str(tmp_path)) == "family_portrait.mp4"
+    row.path = str(tmp_path / "IMG_1234.jpg")
+    row.date_exif = "2020-05-06"
+    assert not _is_meaningful_date(row)
+    assert build_new_name(row, root_path=str(tmp_path)) == "family_portrait.jpg"
+    row.date_exif = datetime(1900, 5, 6)
+    assert not _is_meaningful_date(row)
+
+
+def test_rename_proposal_explains_only_supported_date_prefix(tmp_path, monkeypatch):
+    from sqlalchemy.orm import Session
+    from donedatahoarder.db.models import File, FileStatus, Proposal, ProposalType, UserSession
+    from donedatahoarder.db.session import init_db
+    from donedatahoarder.proposals.namer.core import generate_proposals
+
+    monkeypatch.setenv("DDH_DATA_DIR", str(tmp_path / "state"))
+    root = tmp_path / "collection"
+    root.mkdir()
+    engine = init_db(tmp_path / "naming-dates.sqlite")
+    with Session(engine) as db:
+        owner = UserSession(root_path=str(root))
+        db.add(owner)
+        db.flush()
+        for name, source, suggestion, modified, exif in [
+            ("report.docx", "text", "policy_brief", datetime(2018, 1, 17), None),
+            ("IMG_1234.jpg", "vision", "family_portrait", datetime(2026, 9, 28),
+             datetime(2020, 5, 6, 12, 34, 56)),
+        ]:
+            path = root / name
+            path.write_bytes(b"synthetic")
+            db.add(File(
+                session_id=owner.id, path=str(path), filename=name,
+                extension=path.suffix, status=FileStatus.ANALYZED,
+                analysis_outcome="content_verified", analysis_evidence_source=source,
+                ai_description="Subject verified from this file", ai_suggested_name=suggestion,
+                ai_confidence=0.9, date_modified=modified, date_created=datetime(2026, 9, 28),
+                date_exif=exif,
+            ))
+        db.commit()
+        session_id = owner.id
+    generate_proposals(session_id=session_id)
+    with Session(engine) as db:
+        renames = db.query(Proposal).filter(Proposal.proposal_type == ProposalType.RENAME).all()
+        by_source = {Path(row.current_value).name: row for row in renames}
+        assert len(by_source) == 2
+        doc = by_source["report.docx"]
+        assert "2018-01-17" not in Path(doc.proposed_value).name
+        assert "date" not in doc.reasoning.casefold()
+        photo = by_source["IMG_1234.jpg"]
+        assert "2020-05-06" in Path(photo.proposed_value).name
+        assert "stored EXIF metadata" in photo.reasoning
+        assert "capture date unverified" in photo.reasoning
 
 
 class TestIsUselessStem:

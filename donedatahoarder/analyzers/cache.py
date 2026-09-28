@@ -22,8 +22,10 @@ def context_hash(context: str) -> str:
     return hashlib.sha256(context.encode("utf-8")).hexdigest()
 
 
-def extractor_key(analyzer) -> str:
-    return f"{type(analyzer).__name__}/{EXTRACTOR_VERSION}"
+def extractor_key(analyzer, file_rec: File) -> str:
+    version_for = getattr(analyzer, "extractor_version_for", None)
+    version = version_for(file_rec) if version_for else EXTRACTOR_VERSION
+    return f"{type(analyzer).__name__}/{version}"
 
 
 def eligible_hash(file_rec: File) -> str | None:
@@ -74,7 +76,7 @@ def restore(session: Session, file_rec: File, *, content_hash: str,
             AnalysisCache.model_tag == tag,
             AnalysisCache.model_digest == digest,
             AnalysisCache.prompt_version == PROMPT_VERSION,
-            AnalysisCache.extractor_version == extractor_key(analyzer),
+            AnalysisCache.extractor_version == extractor_key(analyzer, file_rec),
         ).limit(1))
         if row is None:
             continue
@@ -115,7 +117,7 @@ def remember(session: Session, file_rec: File, *, content_hash: str,
         model_tag=file_rec.analysis_model_tag,
         model_digest=file_rec.analysis_model_digest,
         prompt_version=PROMPT_VERSION,
-        extractor_version=extractor_key(analyzer),
+        extractor_version=extractor_key(analyzer, file_rec),
         payload_json=json.dumps(payload, ensure_ascii=False),
     )
     stmt = insert(AnalysisCache).values(**values).on_conflict_do_nothing(

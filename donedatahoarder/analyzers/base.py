@@ -226,7 +226,9 @@ class BaseAnalyzer(ABC):
             f.analysis_model_tag = model_name if did_infer else None
             f.analysis_model_digest = model_digest if did_infer else None
             f.analysis_prompt_version = PROMPT_VERSION if did_infer else None
-            f.analysis_extractor_version = f"{result.extractor}/{EXTRACTOR_VERSION}"
+            version_for = getattr(self, "extractor_version_for", None)
+            extractor_version = version_for(f) if version_for else EXTRACTOR_VERSION
+            f.analysis_extractor_version = f"{result.extractor}/{extractor_version}"
             f.analysis_evidence_source = result.evidence_source
             f.analysis_outcome = result.outcome or (
                 "content_verified" if result.content_available

@@ -158,13 +158,22 @@ def list_proposals(
             proposed_name = Path(p.proposed_value).name if p.proposed_value and p.proposal_type == ProposalType.RENAME else p.proposed_value
             name_date_source = None
             if f and p.proposal_type == ProposalType.RENAME and p.proposed_value:
-                from donedatahoarder.proposals.namer.naming import _is_meaningful_date
-                date_value = (f.date_exif or f.date_modified) if _is_meaningful_date(f) else None
-                if date_value and date_value.strftime("%Y-%m-%d") in Path(p.proposed_value).stem:
-                    name_date_source = (
-                        "EXIF capture time" if f.date_exif
-                        else "filesystem modified time; may differ from document creation or event date"
-                    )
+                from donedatahoarder.proposals.namer.naming import (
+                    _is_meaningful_date, _source_filename_date,
+                )
+                proposed_date = _source_filename_date(Path(p.proposed_value).stem)
+                if proposed_date:
+                    original_date = _source_filename_date(Path(f.path).stem)
+                    if original_date == proposed_date:
+                        name_date_source = "Original filename date identifier; event date unverified"
+                    elif (_is_meaningful_date(f)
+                          and f.date_exif.strftime("%Y-%m-%d") == proposed_date):
+                        name_date_source = "Stored photo EXIF metadata; capture date unverified"
+                    elif (f.date_modified
+                          and f.date_modified.strftime("%Y-%m-%d") == proposed_date):
+                        name_date_source = "Matches filesystem modified date; event date unverified"
+                    else:
+                        name_date_source = "Unverified date in proposed name"
             duplicate_evidence = None
             group_id = getattr(p, "duplicate_group_id", None)
             if f and p.proposal_type == ProposalType.MARK_DUPLICATE and group_id:

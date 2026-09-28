@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import Optional
 from xml.etree import ElementTree
 
-from donedatahoarder.analyzers.base import AnalysisResult, BaseAnalyzer, SYSTEM_PROMPT
+from donedatahoarder.analyzers.base import (
+    AnalysisResult, BaseAnalyzer, EXTRACTOR_VERSION, SYSTEM_PROMPT,
+)
 from donedatahoarder.db.models import File
 
 MAX_CHARS = 3000   # max text chars to send to AI
@@ -51,6 +53,12 @@ MAX_PDF_RENDER_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 MAX_VISION_PAGES = 3
 MAX_PPTX_XML_ENTRY_BYTES = 8 * 1024 * 1024
 MAX_PPTX_XML_TOTAL_BYTES = 16 * 1024 * 1024
+MAX_DOCX_DOCUMENT_XML_BYTES = 8 * 1024 * 1024
+MAX_DOCX_EXPANDED_BYTES = 64 * 1024 * 1024
+MAX_DOCX_PACKAGE_ENTRIES = 1024
+MAX_DOCX_BLOCKS = 2000
+MAX_DOCX_TABLE_DEPTH = 4
+DOCX_EXTRACTOR_VERSION = "extractors-v5-2026-09-28"
 
 DOC_EXTENSIONS = {
     ".pdf", ".docx", ".doc", ".odt",
@@ -279,15 +287,73 @@ def _render_pdf_first_page_as_jpeg(path: Path) -> bytes | None:
 
 def _extract_docx(path: Path) -> str:
     if _file_too_big(path):
-        return ""
-    try:
-        from docx import Document
-        doc = Document(str(path))
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-    except ImportError:
-        return ""
-    except Exception:
-        return ""
+        raise ExtractionTooLarge("DOCX compressed package exceeds extraction cap")
+    # python-docx expands the OPC package in memory. Reject unusually large
+    # declared parts before it reads them, even when the ZIP itself is small.
+    with zipfile.ZipFile(path) as package:
+        entries = package.infolist()
+        document_xml = package.getinfo("word/document.xml")
+        if (len(entries) > MAX_DOCX_PACKAGE_ENTRIES
+                or document_xml.file_size > MAX_DOCX_DOCUMENT_XML_BYTES
+                or sum(entry.file_size for entry in entries) > MAX_DOCX_EXPANDED_BYTES):
+            raise ExtractionTooLarge("DOCX expanded package exceeds extraction cap")
+
+    from docx import Document
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    doc = Document(str(path))
+    visited = 0
+
+    def blocks(parent, depth: int):
+        nonlocal visited
+        if depth > MAX_DOCX_TABLE_DEPTH:
+            raise ExtractionTooLarge("DOCX nested table depth exceeds extraction cap")
+        element = parent.element if hasattr(parent, "element") else parent._tc
+        body = element.body if hasattr(element, "body") else element
+        for child in body.iterchildren():
+            if not isinstance(child, (CT_P, CT_Tbl)):
+                continue
+            visited += 1
+            if visited > MAX_DOCX_BLOCKS:
+                raise ExtractionTooLarge("DOCX visible blocks exceed extraction cap")
+            if isinstance(child, CT_P):
+                value = Paragraph(child, parent).text.strip()
+                if value:
+                    yield value
+                continue
+            table = Table(child, parent)
+            # Keep XML cell objects alive while traversing the table. Using
+            # id() alone lets Python recycle wrappers between successive rows.
+            seen_cells: set[object] = set()
+            for row in table.rows:
+                visited += 1
+                if visited > MAX_DOCX_BLOCKS:
+                    raise ExtractionTooLarge("DOCX table rows exceed extraction cap")
+                values = []
+                for cell in row.cells:
+                    key = cell._tc
+                    if key in seen_cells:
+                        continue  # merged cell repeated in row/cross-row views
+                    seen_cells.add(key)
+                    value = " / ".join(blocks(cell, depth + 1)).strip()
+                    if value:
+                        values.append(value)
+                if values:
+                    yield " | ".join(values)
+
+    parts = []
+    used = 0
+    for value in blocks(doc, 0):
+        remaining = MAX_CHARS - used
+        if remaining <= 0:
+            break
+        piece = value[:remaining]
+        parts.append(piece)
+        used += len(piece) + 1
+    return "\n".join(parts)[:MAX_CHARS]
 
 
 def _extract_xlsx(path: Path) -> str:
@@ -376,7 +442,13 @@ def extract_document(path: Path, mime_type: Optional[str] = None) -> ExtractionR
             import docx  # noqa: F401
         except ImportError:
             return ExtractionResult(reason="missing_dependency", extractor="python-docx")
-        text, extractor = _extract_docx(path), "python-docx"
+        try:
+            text = _extract_docx(path)
+        except ExtractionTooLarge:
+            return ExtractionResult(reason="oversized_content", extractor="python-docx")
+        except Exception:
+            return ExtractionResult(reason="unreadable_content", extractor="python-docx")
+        extractor = "python-docx"
     elif ext == ".xlsx":
         try:
             import openpyxl  # noqa: F401
@@ -490,6 +562,12 @@ If the text is empty or unreadable, use the filename and folder context to make 
 class DocumentAnalyzer(BaseAnalyzer):
     def __init__(self, ai_client):
         self._client = ai_client
+
+    def extractor_version_for(self, file_rec: File) -> str:
+        # Only DOCX body extraction changed. Keep existing PDF, spreadsheet,
+        # plain-text and other analyzer cache identities reusable.
+        return (DOCX_EXTRACTOR_VERSION if Path(file_rec.path).suffix.lower() == ".docx"
+                else EXTRACTOR_VERSION)
 
     def can_handle(self, mime_type: str, extension: str) -> bool:
         if mime_type and mime_type in DOC_MIMES:

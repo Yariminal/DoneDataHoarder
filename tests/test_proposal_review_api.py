@@ -1,6 +1,7 @@
 """Review decisions and commit previews stay inside the selected session."""
 
 from pathlib import Path
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -172,6 +173,31 @@ def test_bulk_rename_requires_verified_content_but_allows_individual_review(revi
     assert _status(proposal_id) == ProposalStatus.PENDING
     assert client.post(f"/api/proposals/{proposal_id}/approve", json={"session_id": sid}).status_code == 200
     assert _status(proposal_id) == ProposalStatus.APPROVED
+
+
+def test_proposal_date_labels_distinguish_source_and_legacy_dates(review_db):
+    client, (sid, _), (root, _) = review_db
+    cases = [
+        ("report.docx", "2018-01-17_policy_report.docx", None,
+         datetime(2018, 1, 17), "Matches filesystem modified date; event date unverified"),
+        ("IMG_1234.jpg", "2020-05-06_family_photo.jpg", datetime(2020, 5, 6),
+         datetime(2026, 9, 28), "Stored photo EXIF metadata; capture date unverified"),
+        ("notes_2021.10.12.docx", "2021-10-12_meeting_notes.docx", None,
+         datetime(2019, 5, 1), "Original filename date identifier; event date unverified"),
+        ("unknown.txt", "2017-02-03_unknown.txt", None,
+         datetime(2019, 5, 1), "Unverified date in proposed name"),
+    ]
+    for source_name, proposed_name, exif, modified, _ in cases:
+        proposal_id = _proposal(sid, root, source_name, destination=str(root / proposed_name))
+        with Session(get_engine()) as db:
+            file = db.get(File, db.get(Proposal, proposal_id).file_id)
+            file.date_exif = exif
+            file.date_modified = modified
+            db.commit()
+    response = client.get(f"/api/proposals?session_id={sid}&per_page=10")
+    assert response.status_code == 200
+    labels = {item["filename"]: item["name_date_source"] for item in response.json()["items"]}
+    assert labels == {source_name: expected for source_name, _, _, _, expected in cases}
 
 
 def test_review_mutations_and_preview_reject_concurrent_writer(review_db):

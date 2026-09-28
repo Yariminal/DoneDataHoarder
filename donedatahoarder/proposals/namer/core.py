@@ -16,7 +16,10 @@ from donedatahoarder.db.models import (
 from donedatahoarder.db.session import get_engine
 
 from .llm import translate_filename
-from .naming import _ensure_prefix, _is_useless_stem, _resolve_collision, build_new_name
+from .naming import (
+    _ensure_prefix, _is_useless_stem, _name_date_provenance,
+    _resolve_collision, build_new_name,
+)
 from .postpass import (
     _disambiguate_generic_stems_in_dir,
     _generate_fallback_for_useless_stems,
@@ -381,6 +384,7 @@ def _generate_proposals_impl(
                                 reasoning=(
                                     f"Renamed based on AI description: "
                                     f"{(item['ai_description'] or '')[:120]}"
+                                    + _name_date_provenance(file_rec, proposed_path.stem)
                                 ),
                                 confidence=(item["ai_confidence"] if item["ai_confidence"] is not None else 0.5),
                                 status=ProposalStatus.PENDING,
