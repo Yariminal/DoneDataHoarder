@@ -8,6 +8,7 @@ import io
 from pathlib import Path
 
 from donedatahoarder.analyzers.base import AnalysisResult, BaseAnalyzer, SYSTEM_PROMPT
+from donedatahoarder.analyzers.response_schemas import ImageAnalysisResponse
 from donedatahoarder.db.models import File
 
 try:
@@ -135,7 +136,8 @@ class ImageAnalyzer(BaseAnalyzer):
             text_prompt = VISION_PROMPT.format(context=context, exif_extra="")
             text_prompt += "\n(Note: image could not be decoded — infer from filename and folder context only.)"
             try:
-                data = self._client.generate_json(text_prompt, system=SYSTEM_PROMPT)
+                data = self._client.generate_json(text_prompt, system=SYSTEM_PROMPT,
+                                                  model_cls=ImageAnalysisResponse)
             except Exception as exc:
                 return AnalysisResult(
                     description=f"AI inference failed: {exc}",
@@ -161,6 +163,7 @@ class ImageAnalyzer(BaseAnalyzer):
                 prompt,
                 image_bytes=image_bytes,
                 system=SYSTEM_PROMPT,
+                model_cls=ImageAnalysisResponse,
             )
         except Exception as exc:
             return AnalysisResult(

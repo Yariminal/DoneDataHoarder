@@ -9,6 +9,7 @@ import zipfile
 from pathlib import Path
 
 from donedatahoarder.analyzers.base import AnalysisResult, BaseAnalyzer, SYSTEM_PROMPT
+from donedatahoarder.analyzers.response_schemas import ArchiveAnalysisResponse
 from donedatahoarder.db.models import File
 
 ARCHIVE_EXTENSIONS = {".zip"}
@@ -90,7 +91,8 @@ class ArchiveAnalyzer(BaseAnalyzer):
         )
 
         try:
-            data = self._client.generate_json(prompt, system=SYSTEM_PROMPT)
+            data = self._client.generate_json(prompt, system=SYSTEM_PROMPT,
+                                              model_cls=ArchiveAnalysisResponse)
         except Exception as exc:
             return AnalysisResult(
                 description=f"AI inference failed: {exc}",

@@ -100,7 +100,7 @@ def test_pdf_backed_illustrator_uses_rendered_page_vision(tmp_path, monkeypatch)
         assert saved.status == FileStatus.ANALYZED
         assert saved.analysis_evidence_source == "vision"
         assert saved.analysis_extractor_version == "pdfium_render/extractors-v4-2026-09-28"
-        assert saved.analysis_prompt_version == "analysis-v3-2026-09-28"
+        assert saved.analysis_prompt_version == "analysis-v4-2026-09-29"
         assert saved.ai_model == "gemma4:26b"
         assert saved.analysis_cache_hit is False
 

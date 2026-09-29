@@ -185,8 +185,11 @@ def extract_json(
 
 
 def _extract_json_with_repair_count(
-    raw: str, *, fix_escapes: bool, allow_control_chars: bool
+    raw: str, *, fix_escapes: bool, allow_control_chars: bool,
+    require_complete_response: bool = False,
 ) -> tuple[Any, int]:
+    if require_complete_response:
+        return _extract_complete_response(raw, fix_escapes=fix_escapes)
     cleaned = _strip_markdown_fences(raw)
 
     attempts = [cleaned]
@@ -225,6 +228,47 @@ def _extract_json_with_repair_count(
         raise ValueError(str(exc)) from exc
 
     raise ValueError(f"Could not extract valid JSON from response: {raw[:500]!r}") from last_decode_error
+
+
+def _extract_complete_response(raw: str, *, fix_escapes: bool) -> tuple[Any, int]:
+    """Parse one complete analysis value, optionally after a prose introduction.
+
+    A full markdown fence is accepted. A prose introduction must end in a
+    colon; anything after the JSON value except whitespace is rejected. This
+    prevents an apparently valid first object masking a second or truncated
+    value. The permissive extractor remains available to other JSON consumers.
+    """
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        fence = re.fullmatch(r"```(?:json)?\s*\n(.*?)\n```", cleaned, re.DOTALL | re.IGNORECASE)
+        if fence is None:
+            raise ValueError("Incomplete or trailing markdown fence in analysis response")
+        cleaned = fence.group(1).strip()
+
+    start = min((i for i in (cleaned.find("{"), cleaned.find("[")) if i >= 0), default=-1)
+    if start < 0:
+        raise ValueError("Analysis response contains no JSON object")
+    prefix = cleaned[:start]
+    if prefix and not re.fullmatch(r"[\w\s.!?'-]+:\s*", prefix):
+        raise ValueError("Unexpected text before analysis JSON value")
+    snippet = _extract_json_object_or_array(cleaned[start:])
+    if snippet is None:
+        raise ValueError("Incomplete analysis JSON value")
+    if cleaned[start + len(snippet):].strip():
+        raise ValueError("Unexpected text after analysis JSON value")
+
+    attempts = [snippet]
+    if fix_escapes:
+        attempts.append(_fix_json_escapes(snippet))
+    last_error: Exception | None = None
+    for candidate in attempts:
+        try:
+            return _parse_with_key_separator_repair(candidate, allow_control_chars=False)
+        except (json.JSONDecodeError, _DuplicateKeyError) as exc:
+            last_error = exc
+            if isinstance(exc, _DuplicateKeyError):
+                break
+    raise ValueError(f"Invalid analysis JSON: {last_error}") from last_error
 
 
 def validate_json(data: Any, model_cls: Type[T]) -> T:
@@ -298,7 +342,8 @@ def generate_json_with_retry(
                 **kwargs,
             )
             data, repairs = _extract_json_with_repair_count(
-                raw, fix_escapes=True, allow_control_chars=False
+                raw, fix_escapes=True, allow_control_chars=False,
+                require_complete_response=getattr(model_cls, "require_complete_response", False),
             )
             validated = validate_json(data, model_cls)
             if repairs:
