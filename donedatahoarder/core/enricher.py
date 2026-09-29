@@ -332,8 +332,11 @@ def _write_disk_results(
                     counts["errors"] += 1
                 else:
                     counts[_apply_disk_result(file_rec, result)] += 1
+                # Consumers persist durable job progress on another connection.
+                # Never yield with pending writes: the next file's autoflush
+                # would otherwise hold SQLite's writer lock across that yield.
+                session.commit()
                 yield "file"
-            session.commit()
     finally:
         stream.close()
 

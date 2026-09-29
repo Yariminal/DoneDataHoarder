@@ -60,9 +60,14 @@ def _print_duplicate_coverage(stage: str, result: dict) -> None:
 
 @app.callback()
 def main_callback(
+    ctx: typer.Context,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Enable debug logging to console.", envvar="DDH_LOG_VERBOSE")] = False,
 ):
     """Global options for all DoneDataHoarder commands."""
+    # Diagnostics can be piped as JSON, including under --verbose / DDH_LOG.
+    # Its capability probe needs neither application logging nor a welcome.
+    if ctx.invoked_subcommand == "tui-diagnostics":
+        return
     from donedatahoarder.logging import setup_logging
     setup_logging(verbose=verbose)
 
@@ -1287,6 +1292,235 @@ def config(
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+@app.command()
+def tui(
+    root: Annotated[Optional[str], typer.Argument(help="Folder to organize (on the workstation when using --connect); omit to choose a folder or session.")] = None,
+    session_id: Annotated[Optional[str], typer.Option("--session", help="Resume an existing session instead of opening a folder.")] = None,
+    db: Annotated[Optional[Path], typer.Option("--db", help="SQLite database; defaults to XDG_DATA_HOME/donedatahoarder/index.db.", envvar="DDH_DB")] = None,
+    model: Annotated[str, typer.Option("--model", help="Local Ollama model.", envvar="DDH_MODEL")] = "gemma3:12b",
+    ollama_host: Annotated[str, typer.Option("--ollama-host", help="Ollama server URL.", envvar="OLLAMA_HOST")] = "http://localhost:11434",
+    workers: Annotated[int, typer.Option("--workers", "-w", min=1, max=32, help="Analysis worker count.")] = 1,
+    images: Annotated[str, typer.Option("--images", help="Image renderer: auto, sixel, kitty, or off.")] = "auto",
+    connect: Annotated[Optional[str], typer.Option("--connect", help="Remote workstation URL: verified HTTPS or loopback HTTP through SSH.")] = None,
+    token_file: Annotated[Optional[Path], typer.Option("--token-file", help="Private remote connection token file.")] = None,
+    ca_file: Annotated[Optional[Path], typer.Option("--ca-file", help="Trusted workstation TLS certificate/CA PEM file.")] = None,
+    discover: Annotated[bool, typer.Option("--discover", help="Find nearby workstations and pair or open a saved device.")] = False,
+):
+    """Open the Omarchy-oriented terminal pipeline and review workspace (Python 3.12+)."""
+    if images not in {"auto", "sixel", "kitty", "off"}:
+        raise typer.BadParameter("Choose auto, sixel, kitty, or off.", param_hint="--images")
+    if root is not None and session_id:
+        raise typer.BadParameter("Choose a folder or --session, not both.")
+    if discover and (connect or token_file or ca_file):
+        raise typer.BadParameter("Choose --discover or the manual --connect options.")
+    if not connect and (token_file or ca_file):
+        raise typer.BadParameter("Use --connect with --token-file or --ca-file.")
+    if connect and not token_file:
+        raise typer.BadParameter("Remote connections require --token-file.")
+    if (connect or discover) and db is not None:
+        raise typer.BadParameter("Remote sessions use the workstation database; omit --db (including DDH_DB).")
+    from donedatahoarder.tui.launch import launch
+    try:
+        remote_options = {"connect": connect, "token_file": token_file, "ca_file": ca_file} if connect else {}
+        if discover:
+            remote_options["discover"] = True
+        folder = root if connect or discover else Path(root) if root is not None else None
+        launch(folder, session_id=session_id, db_path=db, model=model,
+               ollama_host=ollama_host, workers=workers, images=images, **remote_options)
+    except (RuntimeError, ValueError, OSError) as exc:
+        console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(1) from exc
+
+
+@app.command("remote-serve")
+def remote_serve(
+    roots: Annotated[list[Path], typer.Option("--root", help="Allowed workstation collection folder; repeat for multiple roots.")],
+    token_file: Annotated[Path, typer.Option("--token-file", help="Private token file; generated if absent. Share it with your laptop securely.")],
+    db: Annotated[Optional[Path], typer.Option("--db", help="Workstation SQLite index; defaults to the TUI index.", envvar="DDH_DB")] = None,
+    host: Annotated[str, typer.Option("--host", help="Listener; non-loopback requires TLS.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", min=1, max=65535)] = 8765,
+    cert_file: Annotated[Optional[Path], typer.Option("--cert-file", help="TLS certificate PEM for direct LAN connections.")] = None,
+    key_file: Annotated[Optional[Path], typer.Option("--key-file", help="TLS private key PEM.")] = None,
+    name: Annotated[Optional[str], typer.Option("--name", help="Workstation name displayed in connected TUIs.")] = None,
+    model: Annotated[str, typer.Option("--model", envvar="DDH_MODEL")] = "gemma3:12b",
+    workers: Annotated[int, typer.Option("--workers", min=1, max=32)] = 1,
+    ollama_host: Annotated[str, typer.Option("--ollama-host", envvar="OLLAMA_HOST")] = "http://localhost:11434",
+    discoverable: Annotated[bool, typer.Option("--discoverable", help="Advertise this workstation on the LAN using managed HTTPS.")] = False,
+    pair: Annotated[bool, typer.Option("--pair", help="With --discoverable, print a ten-minute, one-use pairing invitation.")] = False,
+):
+    """Run the authenticated workstation service for remote terminal sessions."""
+    from donedatahoarder.remote.config import ensure_token, validate_listener, validate_control_paths
+    from donedatahoarder.core.undo_log import get_datahoarder_dir
+    from donedatahoarder.tui.launch import default_database
+    try:
+        if pair and not discoverable:
+            raise ValueError("Use --pair with --discoverable.")
+        if discoverable:
+            from donedatahoarder.remote.config import is_loopback
+            if is_loopback(host):
+                raise ValueError("Nearby workstations need a LAN listener; use --host 0.0.0.0 or a LAN IP.")
+            if cert_file or key_file:
+                raise ValueError("Discoverable mode manages its own TLS identity; omit --cert-file and --key-file.")
+            try:
+                import zeroconf  # noqa: F401
+                import cryptography  # noqa: F401
+            except ImportError as exc:
+                raise RuntimeError("Install nearby support: python -m pip install 'donedatahoarder[remote,nearby]'") from exc
+        else:
+            validate_listener(host, cert_file, key_file)
+        if not roots or any(not root.expanduser().is_absolute() for root in roots):
+            raise ValueError("Each --root must be an absolute workstation folder path.")
+        try:
+            import uvicorn
+            from donedatahoarder.remote.server import create_app
+        except ImportError as exc:
+            raise RuntimeError("Install the workstation service: python -m pip install 'donedatahoarder[remote]'") from exc
+        database = (db or default_database()).expanduser().resolve()
+        control_paths = {"database": database, "connection token": token_file,
+                         "recovery journal": get_datahoarder_dir(create=False)}
+        pairing_path = Path(str(database) + ".remote-devices.sqlite3")
+        tls_directory = Path(str(database) + ".remote-tls")
+        control_paths.update({"device credentials": pairing_path, "TLS identity": tls_directory})
+        if key_file:
+            control_paths["TLS private key"] = key_file
+        validate_control_paths(control_paths, roots)
+        token = ensure_token(token_file)
+        database.parent.mkdir(parents=True, exist_ok=True)
+        from donedatahoarder.core.process_lock import operation_lock
+        # Separate from the collection writer lease: hold this for the entire
+        # daemon so a second server cannot reconcile still-running receipts.
+        with operation_lock("remote session server", db_path=Path(str(database) + ".remote-daemon")):
+            pairing_options = {"pairing_path": pairing_path} if discoverable or pairing_path.exists() else {}
+            remote_app = create_app(database, token=token, allowed_roots=roots,
+                                    model=model, workers=workers, ollama_host=ollama_host, name=name, **pairing_options)
+            if discoverable:
+                from donedatahoarder.remote.pairing import ensure_tls
+                cert_file, key_file, tls_hostname = ensure_tls(tls_directory, remote_app.state.remote_receipts.server_id)
+                if pair:
+                    invitation = remote_app.state.remote_pairing.create_invitation(cert_file.read_text(encoding="ascii"), tls_hostname)
+                    console.print("Pairing is open for ten minutes. Paste this private, one-use invitation into the laptop's Nearby workstations dialog:", markup=False)
+                    console.print(invitation, markup=False, soft_wrap=True)
+            scheme = "https" if cert_file else "http"
+            console.print(f"Remote sessions: {scheme}://{host}:{port}\nDatabase: {database}\nPrivate token file: {token_file.resolve()}\nProcessing continues when a client disconnects. Keep this process running.", markup=False)
+            if discoverable:
+                import socket
+                from donedatahoarder.remote.runtime import run_discoverable
+                run_discoverable(remote_app, host=host, port=port, cert_file=cert_file,
+                                 key_file=key_file, hostname=tls_hostname, name=name or socket.gethostname())
+            else:
+                uvicorn.run(remote_app, host=host, port=port, workers=1, log_level="warning",
+                            proxy_headers=False,
+                            ssl_certfile=str(cert_file) if cert_file else None,
+                            ssl_keyfile=str(key_file) if key_file else None)
+    except (RuntimeError, ValueError, OSError) as exc:
+        console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(1) from exc
+
+
+def _workstation_pairing_store(database: Path):
+    from donedatahoarder.remote.pairing import PairingStore
+    import sqlite3
+    path = Path(str(database) + ".remote-devices.sqlite3")
+    receipts_path = Path(str(database) + ".remote-receipts.sqlite3")
+    if not path.is_file() or not receipts_path.is_file():
+        raise ValueError("No paired-device store for this workstation index. Start remote-serve --discoverable first.")
+    with sqlite3.connect(receipts_path.as_uri() + "?mode=ro", uri=True) as receipts:
+        row = receipts.execute("SELECT value FROM remote_metadata WHERE key='server_id'").fetchone()
+        if row is None:
+            raise ValueError("Workstation identity is missing; preserve the index and receipt database.")
+    return PairingStore(path, row[0])
+
+
+@app.command("remote-pair")
+def remote_pair(
+    db: Annotated[Optional[Path], typer.Option("--db", help="Running workstation's SQLite index.", envvar="DDH_DB")] = None,
+):
+    """Issue a fresh ten-minute invitation without stopping workstation jobs."""
+    from donedatahoarder.tui.launch import default_database
+    from donedatahoarder.remote.pairing import ensure_tls
+    import sqlite3
+    try:
+        database = (db or default_database()).expanduser().resolve()
+        store = _workstation_pairing_store(database)
+        tls_directory = Path(str(database) + ".remote-tls")
+        if not (tls_directory / "certificate.pem").is_file():
+            raise ValueError("Start remote-serve --discoverable to create this workstation's TLS identity.")
+        certificate, _, hostname = ensure_tls(tls_directory, store.server_id)
+        invitation = store.create_invitation(certificate.read_text(encoding="ascii"), hostname)
+        console.print("Paste this private, one-use invitation into the laptop. It expires in ten minutes and replaces any earlier unused invitation:", markup=False)
+        console.print(invitation, markup=False, soft_wrap=True)
+    except (RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
+        console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(1) from exc
+
+
+@app.command("remote-devices")
+def remote_devices(
+    db: Annotated[Optional[Path], typer.Option("--db", help="Workstation SQLite index.", envvar="DDH_DB")] = None,
+    revoke: Annotated[Optional[str], typer.Option("--revoke", help="Revoke a paired device by its full ID.")] = None,
+):
+    """List or revoke paired laptops on the workstation; no network service needed."""
+    from donedatahoarder.tui.launch import default_database
+    import sqlite3
+    try:
+        database = (db or default_database()).expanduser().resolve()
+        store = _workstation_pairing_store(database)
+        if revoke:
+            if not store.revoke(revoke):
+                raise ValueError("No paired device has that ID.")
+            console.print("Device credential revoked.", markup=False)
+        for device in store.list_devices():
+            console.print(f"{device['device_id']}  {device['name']}  {'revoked' if device.get('revoked_at') is not None else 'active'}", markup=False)
+    except (RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
+        console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(1) from exc
+
+
+@app.command("tui-fixture")
+def tui_fixture(
+    destination: Annotated[Path, typer.Argument(help="New directory for synthetic images, isolated index, and manifest; must not exist.")],
+    index: Annotated[bool, typer.Option("--index/--no-index", help="Run the real metadata-only pipeline; no AI calls or applied changes.")] = True,
+):
+    """Create a disposable native-image qualification kit, ready to open in the TUI."""
+    from donedatahoarder.tui.qualification import create_fixture
+    try:
+        result = create_fixture(destination, index=index)
+    except (RuntimeError, ValueError, OSError) as exc:
+        console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(1) from exc
+    console.print(f"Created {len(result['files'])} synthetic diagnostic images in {result['root']}", markup=False)
+    console.print(f"Manifest and launch command: {Path(result['root']).parent / 'START.txt'}", markup=False)
+    if result["session_id"]:
+        console.print(f"Metadata session: {result['session_id']}", markup=False)
+    console.print("Native image qualification remains pending; follow docs/tui-qualification.md.", markup=False)
+
+
+@app.command("tui-diagnostics")
+def tui_diagnostics(
+    images: Annotated[str, typer.Option("--images", help="Probe auto, sixel, kitty, or off before opening the app.")] = "auto",
+    output: Annotated[Optional[Path], typer.Option("--output", help="Create a JSON report at a new path; defaults to stdout.")] = None,
+    terminal_name: Annotated[Optional[str], typer.Option("--terminal-name", help="Your reported terminal name; not inferred from TERM.")] = None,
+    terminal_version: Annotated[Optional[str], typer.Option("--terminal-version", help="Your reported terminal version.")] = None,
+    omarchy_version: Annotated[Optional[str], typer.Option("--omarchy-version", help="Your reported Omarchy version.")] = None,
+):
+    """Collect local terminal capabilities and a pending native qualification checklist."""
+    if images not in {"auto", "sixel", "kitty", "off"}:
+        raise typer.BadParameter("Choose auto, sixel, kitty, or off.", param_hint="--images")
+    import json
+    from donedatahoarder.tui.diagnostics import collect_diagnostics, write_report
+    try:
+        report = collect_diagnostics(images=images, terminal_name=terminal_name,
+                                     terminal_version=terminal_version, omarchy_version=omarchy_version)
+        if output is None:
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            path = write_report(report, output)
+            console.print(f"Saved {path}. Native checks remain not_run.", markup=False)
+    except (RuntimeError, ValueError, OSError) as exc:
+        console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(1) from exc
+
 
 if __name__ == "__main__":
     app()

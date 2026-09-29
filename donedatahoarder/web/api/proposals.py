@@ -3,7 +3,7 @@ Proposal review endpoints (list / approve / reject / edit / bulk ops).
 """
 from __future__ import annotations
 
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -41,28 +41,12 @@ def _within_root(path: Path, root: Path) -> bool:
 
 
 def _validated_edit(proposal: Proposal, file: File, root: Path, value: str) -> str:
-    if proposal.proposal_type == ProposalType.MARK_DUPLICATE:
-        raise HTTPException(400, "Choose a duplicate keeper in the duplicate review instead")
-    value = value.strip()
-    if not value or "\x00" in value:
-        raise HTTPException(400, "A non-empty destination is required")
-    if proposal.proposal_type == ProposalType.RENAME:
-        # A rename changes only the leaf name, never the parent directory.
-        if value in (".", "..") or Path(value).name != value or PureWindowsPath(value).name != value or ":" in value:
-            raise HTTPException(400, "Enter a filename without directories or drive letters")
-        source = Path(proposal.current_value or file.path)
-        if not _within_root(source, root):
-            raise HTTPException(400, "Source is outside the session folder")
-        return str(source.parent / value)
-    if proposal.proposal_type in (ProposalType.MOVE, ProposalType.RENAME_FOLDER):
-        destination = Path(value)
-        source = Path(proposal.current_value or file.path)
-        if not destination.is_absolute() or not _within_root(destination, root):
-            raise HTTPException(400, "Destination must be inside the session folder")
-        if not _within_root(source, root):
-            raise HTTPException(400, "Source is outside the session folder")
-        return str(destination.resolve(strict=False))
-    return value
+    from donedatahoarder.core.review import ReviewError, validated_edit
+
+    try:
+        return validated_edit(proposal, file, root, value)
+    except ReviewError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
 
 
 def _owned_proposal(session: Session, proposal_id: int, session_id: str) -> tuple[Proposal, File, UserSession]:

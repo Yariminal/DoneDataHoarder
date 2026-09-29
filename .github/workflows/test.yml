@@ -25,13 +25,18 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,web]"
+          pip install -e ".[dev,web,tui,remote,nearby]"
 
       - name: Run tests
         run: pytest tests/ -v --tb=short
 
       - name: Verify CLI entrypoint
-        run: ddh --help
+        run: |
+          ddh --help
+          ddh tui --help
+          ddh remote-serve --help
+          ddh remote-pair --help
+          ddh remote-devices --help
 
   ui-state:
     runs-on: ubuntu-latest
@@ -49,3 +54,28 @@ jobs:
           node tests/ui_dashboard_state.cjs
           node tests/ui_review_request_state.cjs
           node tests/ui_relate_progress_state.cjs
+
+  tui-distribution:
+    # Minimum TUI Python and Arch's current Python line. Preserve the core's
+    # Python 3.10/3.11 jobs above; graphical terminal qualification is separate.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install build and isolated tool installer
+        run: python -m pip install "build>=1.2,<2.0" "uv>=0.8,<1.0"
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Test artifacts outside the source checkout
+        run: python scripts/check_tui_distribution.py --uv "$(command -v uv)"
+      - name: Retain candidate and installation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-distribution-python-${{ matrix.python-version }}
+          path: dist/

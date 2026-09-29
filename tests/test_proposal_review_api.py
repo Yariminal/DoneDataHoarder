@@ -1013,16 +1013,17 @@ def test_worker_registration_is_atomic_with_thread_start():
     assert not job_manager.has_live_workers()
 
 
-def test_completed_job_allows_immediate_next_job_after_writes(monkeypatch):
+def test_completed_job_blocks_unrelated_dispatch_until_thread_exits(review_db, monkeypatch):
     from donedatahoarder.core import wake_lock
     from donedatahoarder.core.jobs import JobState, job_manager
 
     monkeypatch.setattr(wake_lock, "acquire", lambda: None)
     monkeypatch.setattr(wake_lock, "release", lambda: None)
+    _, (one, two), _ = review_db
     published = Event()
     release_publish = Event()
     finished = Event()
-    job = job_manager._create_job("test", "first")
+    job = job_manager._create_job("test", one)
     original_push = job.push_progress
 
     def slow_terminal_push(progress):
@@ -1039,17 +1040,25 @@ def test_completed_job_allows_immediate_next_job_after_writes(monkeypatch):
             finished.set()
 
     job_manager._start_worker(job, finish_job)
+    worker = job_manager._worker_threads[job.job_id]
     try:
         assert published.wait(5)
         assert job_manager.get_active() is None
-        # The old worker is still finishing its terminal notification, but
-        # has no remaining database writes or nested producer.
-        assert not job_manager.has_live_workers()
-        next_job = job_manager._create_job("test", "second")
-        job_manager._finish_job(next_job, JobState.CANCELLED)
+        # Publishing a completed checkpoint does not end the thread's lifetime.
+        # Only its own saved-plan continuation may overlap final bookkeeping;
+        # unrelated work must wait until the old worker actually exits.
+        assert job_manager.has_live_workers()
+        assert job_manager.has_live_workers(one)
+        with pytest.raises(RuntimeError, match="previous pipeline worker"):
+            job_manager._create_job("test", two)
     finally:
         release_publish.set()
         assert finished.wait(5)
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert not job_manager.has_live_workers()
+    next_job = job_manager._create_job("test", two)
+    job_manager._finish_job(next_job, JobState.CANCELLED)
 
 
 def test_pipeline_uses_saved_models_when_request_omits_model(review_db, monkeypatch):

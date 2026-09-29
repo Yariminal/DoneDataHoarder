@@ -333,6 +333,9 @@ def _scan_unlocked(
     session_id: str | None = None,
     workers: int = 1,
     cancel_check: Callable[[], bool] | None = None,
+    *,
+    show_progress: bool = True,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> dict:
     """
     Walk *root* and upsert File records into the database.
@@ -380,6 +383,7 @@ def _scan_unlocked(
         MofNCompleteColumn(),
         TimeElapsedColumn(),
         refresh_per_second=4,
+        disable=not show_progress,
     ) as progress:
         task = progress.add_task("Scanning…", total=None)
         batch: list[dict] = []
@@ -462,6 +466,11 @@ def _scan_unlocked(
                     sess_rec.last_scanned_path = last_path
                     session.commit()
             batch.clear()
+            if progress_callback:
+                # Publish only committed rows. Observers may persist a job
+                # checkpoint on a separate SQLite connection.
+                progress_callback({**counts, "current_file": last_path,
+                                   "processed": counts["new"] + counts["skipped"]})
 
         if workers > 1:
             # Only a small number of stat futures may be outstanding. Paths
@@ -567,9 +576,13 @@ def scan(
     session_id: str | None = None,
     workers: int = 1,
     cancel_check: Callable[[], bool] | None = None,
+    *,
+    show_progress: bool = True,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> dict:
     from donedatahoarder.core.process_lock import operation_lock
 
     with operation_lock("scan"):
         return _scan_unlocked(root, force_rescan, extra_skip_dirs, session_id,
-                              workers, cancel_check)
+                              workers, cancel_check, show_progress=show_progress,
+                              progress_callback=progress_callback)

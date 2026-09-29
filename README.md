@@ -1,6 +1,33 @@
 # DoneDataHoarder
 
-**AI-powered file organization for data hoarders** — transform chaotic folders of photos, documents, and media into a neatly organized, deduplicated, and AI-tagged archive.
+**A terminal file-organization workbench for Linux and Omarchy.** Watch a folder become an organized collection, compare images, and review every proposed change. Powered by the existing local-first CLI and Ollama pipeline.
+
+## Omarchy terminal workspace
+
+The new optional TUI keeps the full pipeline visible: **Scan → Enrich → Analyze → Dedup → Relate → Propose → Organize → Preview**, followed by manual review and apply. Open a real folder, inspect indexed files and image previews, review proposed destinations, and recover logged operations from History. Processing never commits file changes automatically.
+
+Install from this source checkout with **Python 3.12 or newer**:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[tui,docs]'
+ddh tui
+# Or open a folder directly:
+ddh tui ~/Downloads
+```
+
+Use the metadata-only run to scan, enrich, and find duplicates without Ollama. For the full run, start Ollama and choose an installed model with `ddh tui ~/Downloads --model gemma3:12b`. The terminal workspace uses the local Ollama backend and does not fall back to a cloud provider.
+
+With no folder argument, the TUI offers a folder/recent-session picker. Use `o` to switch while idle and `?` for keyboard help. See the [installation guide](docs/tui-installation.md) for an isolated installation and the [native image test kit](docs/tui-qualification.md) for repeatable terminal qualification.
+
+The TUI reads Omarchy's active palette and uses native terminal image rendering when available. Foot/Sixel is the primary target; an external **Open original** action handles unsupported terminals or formats. Use `--images off` to disable in-terminal photos, or `--images sixel` / `--images kitty` to select a renderer. See [the TUI guide](docs/tui.md) for shortcuts, image compatibility, and verification details.
+
+By default, the TUI index lives at `$XDG_DATA_HOME/donedatahoarder/index.db` (usually `~/.local/share/donedatahoarder/index.db`). Use `--db PATH` or `DDH_DB` to open an existing CLI/web database, and `--session ID` to resume a particular session. Existing CLI commands and the web UI remain available; their Python requirement stays at 3.10+.
+
+The development candidate also supports **remote terminal sessions**: keep the TUI on your Omarchy laptop and run processing, Ollama, and image preparation on a Windows workstation with the collection on an attached SSD. `ddh remote-serve` exposes explicitly authorized folders; `ddh tui --connect` attaches through verified HTTPS or an SSH tunnel. The connection button/F2 shows status and session settings, and closing the remote TUI leaves workstation jobs running. See the [setup guide and current limits](docs/remote-sessions.md). Automatic SSD classification and durable volume identity protection are proposed follow-up work, not properties of the current folder allowlist.
+
+For **nearby workstations**, install the `nearby` extra on both devices. Run the workstation with `--host 0.0.0.0 --discoverable --pair`, then `ddh tui --discover` on Omarchy. Select the workstation, paste its one-use invitation once, and optionally enable automatic reconnect. The main TUI stays the same; discovery, saved devices, and pairing live behind the connection indicator. Each laptop gets a revocable credential, and discovery never supplies certificate trust.
 
 ---
 
@@ -92,6 +119,9 @@ The web **Unattended Run** uses scan → enrich → analyze → dedup → relate
 
 | Command | Purpose |
 |---------|---------|
+| `tui [folder]` | Open the terminal pipeline, image comparison, review, and history workspace (Python 3.12+) |
+| `tui-fixture NEW_DIRECTORY` | Create a disposable indexed collection for native image checks |
+| `tui-diagnostics` | Capture terminal capabilities and a pending native qualification checklist |
 | `doctor` | Diagnose Ollama availability, disk space, and database integrity |
 | `scan` | Index a directory tree into the database |
 | `enrich` | Extract metadata, file hashes, and accurate modification dates |

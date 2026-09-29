@@ -23,19 +23,21 @@ from donedatahoarder.core.process_lock import operation_lock
 # Paths
 # ---------------------------------------------------------------------------
 
-def get_datahoarder_dir() -> Path:
+def get_datahoarder_dir(*, create: bool = True) -> Path:
     """Get the DoneDataHoarder data directory (~/.datahoarder)."""
     override = os.environ.get("DDH_DATA_DIR")
     if override:
         dh_dir = Path(override).expanduser().resolve()
-        dh_dir.mkdir(parents=True, exist_ok=True)
+        if create:
+            dh_dir.mkdir(parents=True, exist_ok=True)
         return dh_dir
     if os.name == "nt":
         base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
     else:
         base = Path.home()
     dh_dir = base / ".datahoarder"
-    dh_dir.mkdir(parents=True, exist_ok=True)
+    if create:
+        dh_dir.mkdir(parents=True, exist_ok=True)
     return dh_dir
 
 

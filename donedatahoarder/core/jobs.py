@@ -222,11 +222,19 @@ class JobManager:
         threading.Thread(target=self._heartbeat_worker, args=(job,), daemon=True,
                          name=f"heartbeat-{job.job_id}").start()
 
-    def has_live_workers(self) -> bool:
-        """True while any pipeline worker can still mutate the database."""
+    def has_live_workers(self, session_id: str | None = None) -> bool:
+        """Report local workers, optionally restricted to one session.
+
+        A finished/cancelled active slot alone is insufficient for safe exit:
+        the tracked worker may still be draining its nested tasks.
+        """
         with self._lock:
             self._prune_workers_locked()
-            return bool(self._worker_threads)
+            if session_id is None:
+                return bool(self._worker_threads)
+            return any(self._jobs.get(key) is not None
+                       and self._jobs[key].session_id == session_id
+                       for key in self._worker_threads)
 
     def _create_job_unlocked(
         self, job_type: str, session_id: str, *, run_plan_id: str | None = None,
@@ -243,7 +251,30 @@ class JobManager:
                         "Pause or cancel it first."
                     )
             self._prune_workers_locked()
-            if self._worker_threads:
+            # The finishing worker dispatches the next phase synchronously.
+            # Keep it tracked until its thread really exits, while permitting
+            # only that completed plan's own continuation to overlap its final
+            # bookkeeping. External dispatch and review/apply still see it live.
+            current_thread = threading.current_thread()
+            finishing_plan = bool(run_plan_id) and any(
+                worker is current_thread
+                and (prior := self._jobs.get(key)) is not None
+                and prior.state == JobState.COMPLETED
+                and prior.finished_at is not None
+                and prior.run_plan_id == run_plan_id
+                and prior.session_id == session_id
+                for key, worker in self._worker_threads.items()
+            )
+            blocking_workers = any(
+                not (finishing_plan
+                     and (prior := self._jobs.get(key)) is not None
+                     and prior.state == JobState.COMPLETED
+                     and prior.finished_at is not None
+                     and prior.run_plan_id == run_plan_id
+                     and prior.session_id == session_id)
+                for key in self._worker_threads
+            )
+            if blocking_workers:
                 raise RuntimeError("Wait for the previous pipeline worker to exit")
             with Session(get_engine()) as db:
                 remote_live = db.query(BackgroundJob).filter(
@@ -374,8 +405,6 @@ class JobManager:
             job._heartbeat_stop.set()
             if self._active_job_id == job.job_id:
                 self._active_job_id = None
-            if self._worker_threads.get(job.job_id) is threading.current_thread():
-                del self._worker_threads[job.job_id]
         # Release the system wake lock acquired in _create_job.
         from donedatahoarder.core import wake_lock
         wake_lock.release()
@@ -401,6 +430,7 @@ class JobManager:
         use_cache: bool = True,
         run_plan_id: str | None = None,
         expected_index: int | None = None,
+        ollama_host: str = "http://localhost:11434",
     ) -> str:
         """Start an analyze job in a background thread. Returns job_id."""
         job = self._create_job("analyze", session_id, run_plan_id=run_plan_id,
@@ -411,7 +441,8 @@ class JobManager:
                 from donedatahoarder.ai.router import init_ai
                 from donedatahoarder.analyzers.pipeline import analyze_with_progress
 
-                init_ai(backend=backend, text_model=model, vision_model=model)
+                init_ai(backend=backend, text_model=model, vision_model=model,
+                        ollama_host=ollama_host)
 
                 with closing(analyze_with_progress(
                     workers=workers,
@@ -550,6 +581,7 @@ class JobManager:
         scope: str = "per_directory",
         run_plan_id: str | None = None,
         expected_index: int | None = None,
+        ollama_host: str = "http://localhost:11434",
     ) -> str:
         """Start a relate job in a background thread. Returns job_id."""
         job = self._create_job("relate", session_id, run_plan_id=run_plan_id,
@@ -567,7 +599,8 @@ class JobManager:
                     cancel_check=lambda: self._cancel_requested(job),
                 ),
                 step_name="relate",
-                init_ai_kwargs={"backend": backend, "text_model": model, "vision_model": model},
+                init_ai_kwargs={"backend": backend, "text_model": model, "vision_model": model,
+                                "ollama_host": ollama_host},
             )
 
         self._start_worker(job, run)
@@ -580,6 +613,7 @@ class JobManager:
         model: str = "gemma3:12b",
         run_plan_id: str | None = None,
         expected_index: int | None = None,
+        ollama_host: str = "http://localhost:11434",
     ) -> str:
         """Start a propose job in a background thread. Returns job_id."""
         job = self._create_job("propose", session_id, run_plan_id=run_plan_id,
@@ -595,7 +629,8 @@ class JobManager:
                     cancel_check=lambda: self._cancel_requested(job),
                 ),
                 step_name="propose",
-                init_ai_kwargs={"backend": backend, "text_model": model, "vision_model": model},
+                init_ai_kwargs={"backend": backend, "text_model": model, "vision_model": model,
+                                "ollama_host": ollama_host},
             )
 
         self._start_worker(job, run)
@@ -608,6 +643,7 @@ class JobManager:
         model: str = "gemma3:12b",
         run_plan_id: str | None = None,
         expected_index: int | None = None,
+        ollama_host: str = "http://localhost:11434",
     ) -> str:
         """Start an organize job in a background thread. Returns job_id."""
         job = self._create_job("organize", session_id, run_plan_id=run_plan_id,
@@ -623,7 +659,8 @@ class JobManager:
                     cancel_check=lambda: self._cancel_requested(job),
                 ),
                 step_name="organize",
-                init_ai_kwargs={"backend": backend, "text_model": model, "vision_model": model},
+                init_ai_kwargs={"backend": backend, "text_model": model, "vision_model": model,
+                                "ollama_host": ollama_host},
             )
 
         self._start_worker(job, run)
@@ -676,7 +713,8 @@ class JobManager:
                 from donedatahoarder.core.scanner import scan
                 counts = scan(Path(root_path), session_id=session_id, workers=workers,
                               extra_skip_dirs=set(skip_dirs or []),
-                              cancel_check=lambda: self._cancel_requested(job))
+                              cancel_check=lambda: self._cancel_requested(job),
+                              show_progress=False, progress_callback=job.push_progress)
                 job.push_progress(counts)
                 if counts.get("cancelled") or self._cancel_requested(job):
                     self._finish_job(job, JobState.CANCELLED)
@@ -757,6 +795,8 @@ class JobManager:
         step = steps[index]
         options = plan["options"]
         common = {"run_plan_id": plan_id, "expected_index": index}
+        provider_host = ({"ollama_host": options["ollama_host"]}
+                         if options.get("ollama_host") else {})
         sid = plan["session_id"]
         if step == "scan":
             return self.start_scan(sid, options["root_path"],
@@ -770,7 +810,7 @@ class JobManager:
             return self.start_relate(sid, backend=options.get("backend", "ollama"),
                                      model=options.get("propose_model", "gemma3:12b"),
                                      scope=options.get("relate_scope", "per_directory"),
-                                     **common)
+                                     **provider_host, **common)
         if step == "analyze":
             return self.start_analyze(sid, backend=options.get("backend", "ollama"),
                                       model=options.get("analyze_model", "gemma3:12b"),
@@ -778,15 +818,15 @@ class JobManager:
                                       retry_errors=options.get("retry_errors", False),
                                       sequence_sample_stride=options.get("sequence_sample_stride", 0),
                                       use_cache=options.get("use_cache", True),
-                                      **common)
+                                      **provider_host, **common)
         if step == "propose":
             return self.start_propose(sid, backend=options.get("backend", "ollama"),
                                       model=options.get("propose_model", "gemma3:12b"),
-                                      **common)
+                                      **provider_host, **common)
         if step == "organize":
             return self.start_organize(sid, backend=options.get("backend", "ollama"),
                                        model=options.get("propose_model", "gemma3:12b"),
-                                       **common)
+                                       **provider_host, **common)
         return self.start_execute_dry(sid, **common)
 
     def resume_run_plan(self, plan_id: str, *, retry_errors: bool = False) -> str | None:
