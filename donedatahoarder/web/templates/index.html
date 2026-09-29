@@ -4,9 +4,9 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DoneDataHoarder</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=9_responsive">
   <script defer src="/static/vendor/alpine-3.15.12.min.js"></script>
-  <script src="/static/app.js?v=8_review"></script>
+  <script src="/static/app.js?v=9_responsive"></script>
 </head>
 <body x-data x-init="$store.app.tab = 'home'">
 
@@ -16,14 +16,14 @@
 <div class="app-shell">
 
   <!-- Header -->
-  <header class="app-header">
+  <header class="app-header" :class="{ 'has-session': $store.session.active }">
     <h1><button class="brand-button" @click="goHome()" aria-label="DoneDataHoarder home"><span>Done</span>DataHoarder</button></h1>
-    <div class="header-right" style="display:flex; align-items:center; gap:12px;">
+    <div class="header-right">
       <!-- Session info when active -->
       <template x-if="$store.session.active">
-        <div style="display:flex; align-items:center; gap:10px;">
-          <span class="text-sm" style="color:var(--text-dim)">Session:</span>
-          <strong class="text-sm" x-text="$store.session.displayName"></strong>
+        <div class="session-controls">
+          <span class="session-label text-sm">Session:</span>
+          <strong class="session-name text-sm" x-text="$store.session.displayName" :title="$store.session.displayName"></strong>
           <template x-if="$store.session.is_unsaved">
             <span style="color:var(--warning); font-weight:bold;" title="Unsaved changes">*</span>
           </template>
@@ -102,19 +102,19 @@
                      @click="loadSession(s.id)"
                      @mouseenter="$el.style.borderColor='var(--primary)'"
                      @mouseleave="$el.style.borderColor='var(--border)'">
-                  <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                  <div class="home-session-content" style="display:flex; justify-content:space-between; align-items:flex-start;">
                     <div style="flex:1; min-width:0;">
                       <div style="font-weight:600; font-size:1rem;" x-text="s.name || 'Unnamed Session'"></div>
                       <div class="text-dim text-sm" style="margin-top:4px;">
                         <span x-text="s.root_path || 'No folder set'"></span>
                       </div>
-                      <div style="display:flex; gap:16px; margin-top:8px; align-items:center;">
+                      <div class="home-session-meta" style="display:flex; gap:16px; margin-top:8px; align-items:center;">
                         <span class="text-sm">
                           <strong x-text="s.file_count"></strong> files
                         </span>
                         <span class="text-sm text-dim" x-text="'Modified ' + formatDate(s.updated_at)"></span>
                         <!-- Pipeline progress indicators -->
-                        <div style="display:flex; gap:6px; align-items:center;">
+                        <div class="home-session-steps" style="display:flex; gap:6px; align-items:center;">
                           <span class="text-sm" :class="stepClass(s.completed_steps, 'scan')"
                                 x-text="stepIcon(s.completed_steps, 'scan') + ' Scan'"></span>
                           <span class="text-sm" :class="stepClass(s.completed_steps, 'enrich')"
@@ -126,7 +126,7 @@
                         </div>
                       </div>
                     </div>
-                    <div style="flex-shrink:0; display:flex; gap:6px; align-items:center;">
+                    <div class="home-session-actions" style="flex-shrink:0; display:flex; gap:6px; align-items:center;">
                       <template x-if="s.is_unsaved">
                         <span class="badge badge-warning" style="font-size:0.75rem;">Unsaved</span>
                       </template>

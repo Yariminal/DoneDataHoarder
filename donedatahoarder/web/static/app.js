@@ -9,7 +9,10 @@ document.addEventListener('alpine:init', () => {
     const choices = [...dialog.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), a[href]')]
       .filter(el => el.getClientRects().length);
     if (!choices.length) { event.preventDefault(); dialog.focus(); return; }
-    if (event.shiftKey && document.activeElement === choices[0]) {
+    if (document.activeElement === dialog) {
+      event.preventDefault();
+      choices[event.shiftKey ? choices.length - 1 : 0].focus();
+    } else if (event.shiftKey && document.activeElement === choices[0]) {
       event.preventDefault(); choices[choices.length - 1].focus();
     } else if (!event.shiftKey && document.activeElement === choices[choices.length - 1]) {
       event.preventDefault(); choices[0].focus();
@@ -285,7 +288,9 @@ document.addEventListener('alpine:init', () => {
       });
       if (!res.ok) {
         const error = await res.json().catch(() => ({}));
-        throw new Error(error.detail || `${res.status} ${res.statusText}`);
+        const failure = new Error(error.detail || `${res.status} ${res.statusText}`);
+        failure.status = res.status;
+        throw failure;
       }
       return res.json();
     },
@@ -1053,7 +1058,9 @@ document.addEventListener('alpine:init', () => {
         this.$nextTick(() => {
           if (this.duplicateReview !== p) return;
           document.querySelector('.app-shell')?.setAttribute('inert', '');
-          document.querySelector('.duplicate-review-dialog button.btn-outline')?.focus();
+          const dialog = document.querySelector('.duplicate-review-dialog');
+          dialog?.focus({ preventScroll: true });
+          if (dialog) dialog.scrollTop = 0;
         });
       } catch (_) {
         if (sid === Alpine.store('session').current_session_id && requestId === this.duplicateReviewRequestId)
@@ -1121,7 +1128,12 @@ document.addEventListener('alpine:init', () => {
         this.markReviewChanged();
         Alpine.store('app').toast('Approved', 'success');
       } catch (e) {
-        if (sid === Alpine.store('session').current_session_id) Alpine.store('app').toast('Approve failed', 'error');
+        if (sid !== Alpine.store('session').current_session_id || this._sessionId !== sid) return;
+        Alpine.store('app').toast(`Approve failed: ${e.message}`, 'error');
+        if (e.status === 409) {
+          this.markReviewChanged();
+          await this.load();
+        }
       }
     },
 

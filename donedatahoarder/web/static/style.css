@@ -43,12 +43,13 @@ a:hover { text-decoration: underline; }
 /* --- Layout ----------------------------------------------- */
 .app-shell {
   display: grid;
-  grid-template-columns: 220px 1fr;
-  grid-template-rows: 56px 1fr;
+  grid-template-columns: 220px minmax(0, 1fr);
+  grid-template-rows: 56px minmax(0, 1fr);
   grid-template-areas:
     "header header"
     "sidebar main";
   min-height: 100vh;
+  width: 100%;
 }
 
 /* Header */
@@ -61,17 +62,23 @@ a:hover { text-decoration: underline; }
   justify-content: space-between;
   padding: 0 24px;
   position: sticky; top: 0; z-index: 50;
+  min-width: 0; min-height: 56px;
 }
-.app-header h1 { font-size: 1.15rem; font-weight: 700; letter-spacing: -.02em; }
+.app-header h1 { font-size: 1.15rem; font-weight: 700; letter-spacing: -.02em; flex-shrink: 0; }
 .app-header h1 span { color: var(--primary); }
 .brand-button { background: none; border: 0; color: var(--text); font: inherit; cursor: pointer; }
 .brand-button span { color: var(--primary); }
-.header-right { display: flex; align-items: center; gap: 14px; }
+.header-right { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.session-controls { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.session-label { color: var(--text-dim); flex-shrink: 0; }
+.session-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-controls .btn { flex-shrink: 0; }
 .header-right .db-name { color: var(--text-dim); font-size: .82rem; font-family: var(--mono); }
 
 /* Sidebar */
 .sidebar {
   grid-area: sidebar;
+  min-width: 0;
   background: var(--surface);
   border-right: 1px solid var(--border);
   padding: 16px 0;
@@ -109,6 +116,7 @@ a:hover { text-decoration: underline; }
 /* Main */
 .main-content {
   grid-area: main;
+  min-width: 0;
   padding: 24px 28px;
   overflow-y: auto;
   max-width: 1400px;
@@ -141,7 +149,7 @@ a:hover { text-decoration: underline; }
 .card-sub { font-size: .82rem; color: var(--text-dim); margin-top: 2px; }
 
 /* --- Tables ----------------------------------------------- */
-.table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+.table-wrap { overflow-x: auto; max-width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
 table { width: 100%; border-collapse: collapse; font-size: .88rem; }
 thead { background: var(--surface-2); }
 th { text-align: left; padding: 10px 14px; font-weight: 600; color: var(--text-dim); font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; white-space: nowrap; }
@@ -400,16 +408,28 @@ button:focus-visible, a:focus-visible, summary:focus-visible, input:focus-visibl
 
 /* --- Responsive ------------------------------------------- */
 @media (max-width: 768px) {
-  .app-shell { grid-template-columns: 1fr; grid-template-rows: 56px auto 1fr; grid-template-areas: "header" "sidebar" "main"; }
+  .app-shell { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(0, 1fr); grid-template-areas: "header" "sidebar" "main"; }
   .app-header { padding: 0 12px; }
+  .app-header.has-session { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto; gap: 4px; min-height: 88px; padding: 7px 12px; }
+  .app-header.has-session .header-right { width: 100%; }
+  .session-controls { flex: 1; }
+  .session-name { flex: 1; }
   .header-right .db-name { display: none; }
-  .sidebar { display: block; position: sticky; top: 56px; z-index: 40; height: auto; padding: 0; overflow-x: auto; overflow-y: hidden; border-right: 0; border-bottom: 1px solid var(--border); }
+  .sidebar { display: block; position: sticky; top: 88px; z-index: 40; height: auto; max-width: 100%; padding: 0; overflow-x: auto; overflow-y: hidden; border-right: 0; border-bottom: 1px solid var(--border); }
   .sidebar-nav { display: flex; width: max-content; min-width: 100%; }
   .sidebar-nav li { flex: 0 0 auto; }
   .sidebar-nav li button { width: auto; padding: 10px 12px; white-space: nowrap; }
   .sidebar-sep, .sidebar > div:last-child { display: none; }
   .main-content { padding: 16px 12px; min-width: 0; }
-  .cards { grid-template-columns: repeat(2, 1fr); }
+  .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 600px) {
+  .session-label { display: none; }
+  .cards { grid-template-columns: minmax(0, 1fr); }
+  .home-session-content { flex-wrap: wrap; gap: 12px; }
+  .home-session-content > div:first-child { width: 100%; }
+  .home-session-meta, .home-session-steps { flex-wrap: wrap; }
+  .home-session-actions { width: 100%; justify-content: flex-end; }
 }
 
 /* --- Utilities -------------------------------------------- */

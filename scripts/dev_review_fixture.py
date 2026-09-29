@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import argparse
 import tempfile
 from pathlib import Path
 
@@ -21,7 +22,15 @@ from donedatahoarder.db.session import init_db
 
 
 def main() -> None:
-    workspace = Path(tempfile.mkdtemp(prefix="ddh-review-"))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-dir", type=Path,
+                        help="Create the independent fixture in this new directory")
+    args = parser.parse_args()
+    if args.output_dir:
+        workspace = args.output_dir.resolve()
+        workspace.mkdir(parents=True, exist_ok=False)
+    else:
+        workspace = Path(tempfile.mkdtemp(prefix="ddh-review-"))
     root = workspace / "Synthetic Collection"
     root.mkdir()
     db_path = workspace / "review.db"
@@ -59,7 +68,8 @@ def main() -> None:
         # session selections for a future run; fixture descriptions below
         # remain explicitly synthetic and do not claim model inference.
         owner = UserSession(
-            name="Synthetic review demo", root_path=str(root), status=SessionStatus.ACTIVE,
+            name="Synthetic review: September studio archive and project assets",
+            root_path=str(root), status=SessionStatus.ACTIVE,
             backend="ollama", model="gemma4:26b", analyze_model="gemma4:26b",
             propose_model="gemma4:26b", workers=1,
         )
@@ -70,9 +80,10 @@ def main() -> None:
         db.flush()
 
         def row(path: Path, description: str | None, *, outcome="content_verified",
-                source="vision", status=FileStatus.PROPOSED) -> File:
+                source="vision", status=FileStatus.PROPOSED,
+                session_id: str | None = None) -> File:
             content = path.read_bytes()
-            f = File(session_id=owner.id, path=str(path), filename=path.name,
+            f = File(session_id=session_id or owner.id, path=str(path), filename=path.name,
                      extension=path.suffix.lower(), size_bytes=len(content),
                      mime_type="image/png" if path.suffix == ".png" else "text/plain",
                      hash_md5=hashlib.md5(content).hexdigest(),
@@ -128,9 +139,45 @@ def main() -> None:
                      confidence=None, status=ProposalStatus.PENDING,
                      duplicate_group_id=group.id),
         ])
+
+        # A second distinct session exercises the home list and session switcher.
+        # All displayed descriptions are authored fixture text, never AI output.
+        other_root = workspace / "Synthetic Field Notes"
+        other_root.mkdir()
+        note = other_root / "coastal-observations.txt"
+        note.write_text("Synthetic shoreline field note. No real collection data.\n",
+                        encoding="utf-8")
+        photo = other_root / "sample-shore.png"
+        field_image = Image.new("RGB", (520, 320), "#8ab6cc")
+        field_draw = ImageDraw.Draw(field_image)
+        field_draw.polygon([(0, 210), (180, 145), (340, 235), (520, 175),
+                            (520, 320), (0, 320)], fill="#d8c49b")
+        field_image.save(photo)
+        other = UserSession(
+            name="Synthetic coastal survey", root_path=str(other_root),
+            status=SessionStatus.ACTIVE, backend="ollama", model="gemma4:26b",
+            analyze_model="gemma4:26b", propose_model="gemma4:26b", workers=1,
+        )
+        other.stats = {"files_count": 2, "proposals_count": 0,
+                       "duplicates_count": 0, "completed_steps": ["scan"]}
+        db.add(other)
+        db.flush()
+        row(note, "Synthetic shoreline field note", source="text",
+            session_id=other.id)
+        row(photo, "Illustrated sand and water shapes", session_id=other.id)
+
         db.commit()
-        print(json.dumps({"DDH_DB": str(db_path), "session_id": owner.id,
-                          "collection": str(root)}, indent=2))
+        manifest = {
+            "provenance": "Synthetic UI review fixture; descriptions and proposals were authored in this script, not inferred by a model.",
+            "DDH_DB": str(db_path),
+            "session_id": owner.id,
+            "collection": str(root),
+            "other_session_id": other.id,
+            "other_collection": str(other_root),
+        }
+        (workspace / "fixture-manifest.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8")
+        print(json.dumps(manifest, indent=2))
 
 
 if __name__ == "__main__":
