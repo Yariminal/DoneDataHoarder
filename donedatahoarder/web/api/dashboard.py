@@ -9,7 +9,7 @@ from fastapi import APIRouter
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from donedatahoarder.db.models import DuplicateGroup, File, Proposal
+from donedatahoarder.db.models import DupeType, DuplicateGroup, DuplicateMember, File, Proposal, ProposalStatus
 from donedatahoarder.db.session import get_engine
 
 from .schemas import StatsResponse
@@ -71,6 +71,12 @@ def get_stats(session_id: Optional[str] = None):
             prop_q = prop_q.join(File).filter(File.session_id == sid)
         prop_rows = prop_q.group_by(Proposal.status).all()
         proposal_counts = {s.value: c for s, c in prop_rows}
+        pending_q = session.query(Proposal.proposal_type, func.count(Proposal.id)).filter(
+            Proposal.status == ProposalStatus.PENDING
+        )
+        if sid:
+            pending_q = pending_q.join(File).filter(File.session_id == sid)
+        pending_by_type = {kind.value: count for kind, count in pending_q.group_by(Proposal.proposal_type).all()}
 
         # Duplicates
         dupe_q = session.query(func.count(DuplicateGroup.id))
@@ -78,18 +84,19 @@ def get_stats(session_id: Optional[str] = None):
             dupe_q = dupe_q.filter(DuplicateGroup.session_id == sid)
         dupe_count = dupe_q.scalar() or 0
 
-        # Wasted bytes in duplicate groups
-        dupe_wasted = 0
-        grp_q = session.query(DuplicateGroup)
+        # Count each exact-hash non-keeper once. Similarity candidates may be
+        # distinct sequence frames and must never be described as wasted space.
+        exact_candidates = (
+            session.query(File.id.label("file_id"), File.size_bytes.label("bytes"))
+            .join(DuplicateMember, DuplicateMember.file_id == File.id)
+            .join(DuplicateGroup, DuplicateGroup.id == DuplicateMember.group_id)
+            .filter(DuplicateGroup.dupe_type == DupeType.EXACT,
+                    File.id != DuplicateGroup.keep_file_id)
+        )
         if sid:
-            grp_q = grp_q.filter(DuplicateGroup.session_id == sid)
-        groups = grp_q.all()
-        for g in groups:
-            for m in g.members:
-                if m.file_id != g.keep_file_id:
-                    f = session.get(File, m.file_id)
-                    if f:
-                        dupe_wasted += f.size_bytes or 0
+            exact_candidates = exact_candidates.filter(DuplicateGroup.session_id == sid)
+        unique_candidates = exact_candidates.distinct().subquery()
+        dupe_wasted = session.query(func.sum(unique_candidates.c.bytes)).scalar() or 0
 
     return StatsResponse(
         total_files=total_files,
@@ -98,6 +105,7 @@ def get_stats(session_id: Optional[str] = None):
         by_extension=by_extension,
         by_mime_category=by_mime,
         proposal_counts=proposal_counts,
+        pending_by_type=pending_by_type,
         duplicate_groups=dupe_count,
         duplicate_wasted_bytes=dupe_wasted,
     )

@@ -32,3 +32,20 @@ jobs:
 
       - name: Verify CLI entrypoint
         run: ddh --help
+
+  ui-state:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify frontend syntax and session settings
+        run: |
+          node --check donedatahoarder/web/static/app.js
+          node tests/ui_setup_session_state.cjs
+          node tests/ui_analysis_coverage_state.cjs
+          node tests/ui_nonexact_review.cjs
+          node tests/ui_dashboard_state.cjs
+          node tests/ui_review_request_state.cjs
+          node tests/ui_relate_progress_state.cjs

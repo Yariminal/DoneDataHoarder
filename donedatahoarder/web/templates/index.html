@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DoneDataHoarder</title>
   <link rel="stylesheet" href="/static/style.css">
-  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
-  <script src="/static/app.js?v=7_modals"></script>
+  <script defer src="/static/vendor/alpine-3.15.12.min.js"></script>
+  <script src="/static/app.js?v=8_review"></script>
 </head>
 <body x-data x-init="$store.app.tab = 'home'">
 
@@ -17,7 +17,7 @@
 
   <!-- Header -->
   <header class="app-header">
-    <h1 style="cursor:pointer" @click="goHome()"><span>Done</span>DataHoarder</h1>
+    <h1><button class="brand-button" @click="goHome()" aria-label="DoneDataHoarder home"><span>Done</span>DataHoarder</button></h1>
     <div class="header-right" style="display:flex; align-items:center; gap:12px;">
       <!-- Session info when active -->
       <template x-if="$store.session.active">
@@ -130,6 +130,8 @@
                       <template x-if="s.is_unsaved">
                         <span class="badge badge-warning" style="font-size:0.75rem;">Unsaved</span>
                       </template>
+                      <button class="btn btn-outline btn-sm" @click.stop="loadSession(s.id)"
+                              :aria-label="'Open session ' + (s.name || 'Unnamed Session')">Open</button>
                       <button class="btn btn-danger btn-sm" @click.stop="deleteSession(s.id, s.name)"
                               title="Delete session" style="font-size:0.75rem;">Delete</button>
                     </div>
@@ -168,29 +170,49 @@
             <div class="card">
               <div class="card-label">Pending Proposals</div>
               <div class="card-value" x-text="(stats.proposal_counts.pending || 0).toLocaleString()"></div>
+              <button type="button" class="btn btn-outline btn-sm mt-1" x-show="$store.session.current_session_id && stats.proposal_counts.pending" @click="openReviewQueue()">Review pending</button>
             </div>
             <div class="card">
-              <div class="card-label">Duplicate Groups</div>
+              <div class="card-label">Duplicate &amp; similarity groups</div>
               <div class="card-value" x-text="stats.duplicate_groups"></div>
-              <div class="card-sub" x-text="'Wasted: ' + formatBytes(stats.duplicate_wasted_bytes)"></div>
+              <div class="card-sub" x-text="'Exact-hash candidate bytes: ' + formatBytes(stats.duplicate_wasted_bytes)"></div>
+              <div class="text-sm text-dim">Review and live byte checks are still required.</div>
             </div>
           </div>
 
-          <!-- Pipeline progress -->
-          <h3 class="mb-1" style="font-size:1rem;">Pipeline Progress</h3>
+          <!-- Job state and proposal review are separate from indexed file states. -->
+          <div class="card mb-2" role="status" aria-live="polite">
+            <div class="card-label">Processing status</div>
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+              <strong x-text="executionSummary()"></strong>
+              <span class="badge" x-text="executionState()"></span>
+            </div>
+            <p class="text-sm text-dim mt-1" x-text="executionDetail()"></p>
+            <p class="text-sm mt-1" x-show="reviewWaiting()" x-text="reviewWaiting()"></p>
+          </div>
+
+          <div class="card mb-2" x-show="$store.session.current_session_id && pendingReviewTypes().length">
+            <div class="card-label">Pending review by type</div>
+            <div class="pending-review-links">
+              <template x-for="item in pendingReviewTypes()" :key="item.type">
+                <button type="button" class="btn btn-outline btn-sm" @click="openReviewQueue(item.type)"
+                        :aria-label="'Review ' + item.count + ' pending ' + item.label.toLowerCase()"
+                        x-text="item.label + ' · ' + item.count.toLocaleString()"></button>
+              </template>
+            </div>
+          </div>
+
+          <h3 class="mb-1" style="font-size:1rem;">File status breakdown</h3>
+          <p class="text-sm text-dim mb-1" x-text="($store.session.current_session_id ? 'Each indexed file appears once in this session. ' : 'All sessions combined; choose a session for its own totals. ') + 'These are current file states, not pipeline phase progress. Proposed means the suggestion stage checked the file; Skipped means analysis was omitted.'"></p>
           <div class="table-wrap mb-2">
             <table>
-              <thead><tr><th>Status</th><th>Count</th><th style="width:50%">Progress</th></tr></thead>
+              <thead><tr><th>Status</th><th>Count</th><th>Share of indexed files</th></tr></thead>
               <tbody>
-                <template x-for="step in pipelineProgress()" :key="step.label">
+                <template x-for="step in fileStatusDistribution()" :key="step.label">
                   <tr>
                     <td><span class="badge" :class="'badge-' + step.label.toLowerCase()" x-text="step.label"></span></td>
                     <td x-text="step.count.toLocaleString()"></td>
-                    <td>
-                      <div class="progress-bar">
-                        <div class="fill" :class="step.cls" :style="'width:' + step.pct + '%'"></div>
-                      </div>
-                    </td>
+                    <td x-text="step.share"></td>
                   </tr>
                 </template>
               </tbody>
@@ -255,10 +277,15 @@
               <option :value="r.filename" x-text="r.filename + ' (' + new Date(r.saved_at).toLocaleString() + ')'"></option>
             </template>
           </select>
-          <button class="btn btn-outline btn-sm" @click="saveResults('files')" title="Save current results">Save</button>
+          <button class="btn btn-outline btn-sm" @click="saveResults('files')" :disabled="snapshotMode" title="Save this session's files snapshot">Save</button>
         </div>
 
         <span class="text-dim text-sm" x-text="total.toLocaleString() + ' files'"></span>
+      </div>
+
+      <div class="card mb-2 coverage-warning" x-show="snapshotMode" role="status">
+        Historical snapshot, read-only. <span x-text="'Showing ' + snapshotItems.length + ' saved of ' + snapshotSavedTotal + ' files as of ' + snapshotAsOf + '. ' "></span>
+        <button type="button" class="btn btn-outline btn-sm" @click="load()">Refresh live files</button>
       </div>
 
       <!-- Table -->
@@ -296,7 +323,7 @@
                   <div class="text-dim" x-show="f.analysis_outcome && f.analysis_outcome !== 'content_verified'" x-text="`${f.analysis_outcome}: ${f.analysis_reason || f.analysis_evidence_source || 'content not verified'}`"></div>
                   <div style="color:var(--danger)" x-show="f.error_message" x-text="f.error_message"></div>
                 </td>
-                <td><button class="btn btn-ghost btn-sm" @click="viewFile(f.id)">View</button></td>
+                <td><button class="btn btn-ghost btn-sm" :disabled="snapshotMode" @click="viewFile(f.id)">View</button></td>
               </tr>
             </template>
           </tbody>
@@ -312,9 +339,11 @@
 
       <!-- File detail modal -->
       <template x-if="showModal && selectedFile">
-        <div class="modal-backdrop" @click.self="closeModal()">
-          <div class="modal">
-            <button class="modal-close" @click="closeModal()">&#10005;</button>
+        <div class="modal-backdrop" @click.self="closeModal()" @keydown.escape.prevent="closeModal()">
+          <div class="modal" role="dialog" aria-modal="true" :aria-label="selectedFile.filename"
+               tabindex="-1" @keydown.tab="trapDialogTab($event)"
+               x-init="$nextTick(() => $el.querySelector('button')?.focus())">
+            <button class="modal-close" @click="closeModal()" aria-label="Close file details">&#10005;</button>
             <div class="modal-title" x-text="selectedFile.filename"></div>
 
             <template x-if="selectedFile.mime_type && selectedFile.mime_type.startsWith('image/')">
@@ -368,6 +397,11 @@
     <!-- ====================== PROPOSALS ====================== -->
     <section x-show="$store.app.tab === 'proposals'" x-data="proposalReview" x-cloak>
       <div class="page-title">&#9998; Review Proposals</div>
+      <div class="card mb-2 coverage-warning" role="status" x-show="$store.dedupCoverage.sessionId === $store.session.current_session_id && $store.dedupCoverage.incompleteStages.length">
+        <strong>Similarity search coverage is incomplete.</strong>
+        <span x-text="' Capped stages: ' + $store.dedupCoverage.incompleteStages.join(', ') + '; ' + $store.dedupCoverage.deferredLabel + '. Unreviewed pairs were not declared duplicates.'"></span>
+        <div class="text-sm">Exact hash comparison completed separately when its stage succeeded. A search without a cap still does not establish complete similarity recall.</div>
+      </div>
 
       <!-- Toolbar -->
       <div class="toolbar">
@@ -387,6 +421,7 @@
           <option value="rename_folder">Rename folder</option>
           <option value="move">Move</option>
           <option value="add_tags">Tags</option>
+          <option value="update_metadata">Metadata</option>
           <option value="mark_duplicate">Duplicates</option>
         </select>
 
@@ -397,7 +432,7 @@
             <option :value="r.filename" x-text="r.filename + ' (' + new Date(r.saved_at).toLocaleString() + ')'"></option>
           </template>
         </select>
-        <button class="btn btn-outline btn-sm" @click="saveResults('proposals')" title="Save current results">Save</button>
+          <button class="btn btn-outline btn-sm" @click="saveResults('proposals')" :disabled="snapshotMode" title="Save this session's pending proposals snapshot">Save</button>
 
         <div class="spacer"></div>
 
@@ -406,8 +441,13 @@
           <label class="text-sm text-dim">Min confidence:</label>
           <input type="number" class="input input-sm" x-model.number="bulkConfidence"
                  min="0" max="100" style="width:60px;"> <span class="text-sm text-dim">%</span>
-          <button class="btn btn-success btn-sm" @click="bulkApprove()">Approve matching</button>
+          <button class="btn btn-success btn-sm" :disabled="snapshotMode" @click="bulkApprove()">Approve matching</button>
         </div>
+      </div>
+
+      <div class="card mb-2 coverage-warning" x-show="snapshotMode" role="status">
+        Historical pending-proposal snapshot, read-only. <span x-text="'Showing ' + snapshotItems.length + ' saved of ' + snapshotSavedTotal + ' pending proposals as of ' + snapshotAsOf + '. ' "></span>
+        <button type="button" class="btn btn-outline btn-sm" @click="load()">Refresh live review</button>
       </div>
 
       <!-- Table -->
@@ -434,18 +474,23 @@
                   <template x-if="editingId !== p.id">
                     <div>
                       <span class="proposed-name truncate" x-text="p.proposed_value" :title="p.proposed_path || p.proposed_value"></span>
+                      <div class="review-note" x-show="p.proposal_type === 'mark_duplicate' && p.duplicate_evidence?.type !== 'exact'"
+                           style="color:var(--warning)">Similarity only. Approval would move this candidate to trash on commit; compare it with the selected keeper first.</div>
                       <details class="text-sm text-dim mt-1" style="max-width:420px; overflow-wrap:anywhere;">
                         <summary style="cursor:pointer;">Why and full paths</summary>
                         <div><strong>Source:</strong> <span x-text="p.current_path || p.file_path"></span></div>
                         <div><strong>Proposed:</strong> <span x-text="p.proposed_path || p.proposed_value"></span></div>
                         <div x-show="p.reasoning"><strong>Reason:</strong> <span x-text="p.reasoning"></span></div>
                         <div><strong>Analysis:</strong> <span x-text="(p.analysis_outcome || 'unknown (legacy; reanalysis needed)') + ' · ' + (p.analysis_evidence_source || 'unknown source') + (p.analysis_model_tag ? ' · ' + p.analysis_model_tag : '')"></span></div>
+                        <div x-show="p.name_date_source"><strong>Name date source:</strong> <span x-text="p.name_date_source"></span></div>
                         <div x-show="p.analysis_reason"><strong>Limitation:</strong> <span x-text="p.analysis_reason"></span></div>
                         <div x-show="p.protected" style="color:var(--danger)"><strong>Protected:</strong> <span x-text="p.protection_reason"></span></div>
                         <template x-if="p.proposal_type === 'mark_duplicate'">
                           <div class="mt-1">
                             <div x-text="duplicateEvidenceText(p.duplicate_evidence)"></div>
-                            <div x-show="p.duplicate_evidence?.type !== 'exact'" style="color:var(--warning)">Similarity candidate only. Both files require individual inspection; bulk trash approval is disabled.</div>
+                            <div x-show="p.duplicate_evidence?.type !== 'exact'" style="color:var(--warning)">Similarity comparison only. Both files require individual inspection; bulk trash approval is disabled and disposal is not implied.</div>
+                            <div x-show="p.duplicate_evidence?.sequence_comparison" class="review-note"
+                                 x-text="p.duplicate_evidence?.sequence_comparison?.note + ' This is one sampled comparison; other frames were not designated duplicates.'"></div>
                             <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:7px;">
                               <div style="min-width:0;"><strong>Candidate</strong>
                                 <template x-if="hasImage(p.file_id, p.mime_type)"><img :src="'/api/files/' + p.file_id + '/thumbnail?size=180'" loading="lazy" alt="Candidate image" style="display:block;max-width:100%;max-height:180px;margin:5px 0;"></template>
@@ -453,7 +498,7 @@
                                 <div x-text="p.ai_description || 'No content description'"></div>
                               </div>
                               <div style="min-width:0;"><strong>Selected keeper</strong>
-                                <template x-if="p.duplicate_evidence && p.duplicate_evidence.keeper_id && hasImage(p.duplicate_evidence.keeper_id, p.mime_type)"><img :src="'/api/files/' + p.duplicate_evidence.keeper_id + '/thumbnail?size=180'" loading="lazy" alt="Keeper image" style="display:block;max-width:100%;max-height:180px;margin:5px 0;"></template>
+                                <template x-if="p.duplicate_evidence && p.duplicate_evidence.keeper_id && hasImage(p.duplicate_evidence.keeper_id, p.duplicate_evidence.keeper_mime_type)"><img :src="'/api/files/' + p.duplicate_evidence.keeper_id + '/thumbnail?size=180'" loading="lazy" alt="Keeper image" style="display:block;max-width:100%;max-height:180px;margin:5px 0;"></template>
                                 <div style="overflow-wrap:anywhere" x-text="p.duplicate_evidence?.keeper_path || 'Unknown keeper'"></div>
                                 <div x-text="p.duplicate_evidence?.keeper_description || 'No content description'"></div>
                               </div>
@@ -480,13 +525,13 @@
                 <td>
                   <div class="btn-group">
                     <template x-if="p.status === 'pending' || p.status === 'modified'">
-                      <button class="btn btn-success btn-sm" @click="approve(p.id)" title="Approve">&#10003;</button>
+                      <button class="btn btn-success btn-sm" :disabled="snapshotMode" @click="requestApproval(p)" :aria-label="'Approve proposal for ' + p.filename" title="Approve">&#10003;</button>
                     </template>
                     <template x-if="p.status === 'pending' || p.status === 'modified'">
-                      <button class="btn btn-danger btn-sm" @click="reject(p.id)" title="Reject">&#10005;</button>
+                      <button class="btn btn-danger btn-sm" :disabled="snapshotMode" @click="reject(p.id)" :aria-label="'Reject proposal for ' + p.filename" title="Reject">&#10005;</button>
                     </template>
                     <template x-if="p.status === 'pending' || p.status === 'modified'">
-                      <button class="btn btn-outline btn-sm" @click="startEdit(p)" title="Edit">&#9998;</button>
+                      <button class="btn btn-outline btn-sm" :disabled="snapshotMode" @click="startEdit(p)" :aria-label="'Edit proposal for ' + p.filename" title="Edit">&#9998;</button>
                     </template>
                   </div>
                 </td>
@@ -503,11 +548,56 @@
           </div>
         </div>
       </div>
+      <template x-if="duplicateReview">
+        <template x-teleport="body">
+          <div class="modal-backdrop" style="z-index:140;" @click.self="cancelDuplicateReview()"
+               @keydown.escape.prevent="cancelDuplicateReview()">
+            <div class="modal duplicate-review-dialog" role="dialog" aria-modal="true" tabindex="-1"
+                 aria-label="Compare similarity candidate with selected keeper"
+                 @keydown.tab="trapDialogTab($event)"
+                 style="max-width:900px; max-height:90vh; overflow:auto;">
+              <div class="modal-title">Compare candidate and selected keeper</div>
+              <p class="review-note" style="color:var(--warning)">This is an unverified similarity comparison. These files may serve different purposes. Approval will move the candidate to .ddh_trash when you commit; it does not prove the files are interchangeable.</p>
+              <p class="text-sm" x-text="duplicateEvidenceText(duplicateReview.duplicate_evidence)"></p>
+              <p class="text-sm text-dim">File details below come from the current indexed records. Inspect the original files when these previews do not show enough content.</p>
+              <div class="duplicate-comparison-grid">
+                <div style="min-width:0;overflow-wrap:anywhere;">
+                  <strong>Candidate to be moved to trash</strong>
+                  <template x-if="hasImage(duplicateReviewFiles.candidate.id, duplicateReviewFiles.candidate.mime_type)"><img :src="'/api/files/' + duplicateReviewFiles.candidate.id + '/thumbnail?size=400'" loading="lazy" alt="Candidate image" style="display:block;max-width:100%;max-height:300px;margin:8px 0;"></template>
+                  <div x-text="duplicateReviewFiles.candidate.path"></div>
+                  <div class="text-sm" x-text="(duplicateReviewFiles.candidate.mime_type || 'Unknown type') + ' · ' + duplicateReviewFiles.candidate.size_bytes + ' bytes'"></div>
+                  <div class="review-note" x-text="comparisonProvenance(duplicateReviewFiles.candidate)"></div>
+                  <div class="text-sm" x-text="duplicateReviewFiles.candidate.ai_description || 'No content description'"></div>
+                  <pre class="text-sm" x-show="duplicateReviewFiles.candidate.ai_transcript" x-text="duplicateReviewFiles.candidate.ai_transcript" style="white-space:pre-wrap;"></pre>
+                </div>
+                <div style="min-width:0;overflow-wrap:anywhere;">
+                  <strong>Selected keeper that will remain</strong>
+                  <template x-if="hasImage(duplicateReviewFiles.keeper.id, duplicateReviewFiles.keeper.mime_type)"><img :src="'/api/files/' + duplicateReviewFiles.keeper.id + '/thumbnail?size=400'" loading="lazy" alt="Selected keeper image" style="display:block;max-width:100%;max-height:300px;margin:8px 0;"></template>
+                  <div x-text="duplicateReviewFiles.keeper.path"></div>
+                  <div class="text-sm" x-text="(duplicateReviewFiles.keeper.mime_type || 'Unknown type') + ' · ' + duplicateReviewFiles.keeper.size_bytes + ' bytes'"></div>
+                  <div class="review-note" x-text="comparisonProvenance(duplicateReviewFiles.keeper)"></div>
+                  <div class="text-sm" x-text="duplicateReviewFiles.keeper.ai_description || 'No content description'"></div>
+                  <pre class="text-sm" x-show="duplicateReviewFiles.keeper.ai_transcript" x-text="duplicateReviewFiles.keeper.ai_transcript" style="white-space:pre-wrap;"></pre>
+                </div>
+              </div>
+              <div class="duplicate-comparison-actions">
+                <button type="button" class="btn btn-outline" @click="cancelDuplicateReview()">Keep both for now</button>
+                <button type="button" class="btn btn-danger" @click="approveReviewedDuplicate()">Approve candidate for trash on commit</button>
+              </div>
+            </div>
+          </div>
+        </template>
+      </template>
     </section>
 
     <!-- ====================== DUPLICATES ===================== -->
     <section x-show="$store.app.tab === 'duplicates'" x-data="duplicates" x-cloak>
-      <div class="page-title">&#128203; Duplicate Groups</div>
+      <div class="page-title">&#128203; Duplicate &amp; Similarity Review</div>
+      <div class="card mb-2 coverage-warning" role="status" x-show="$store.dedupCoverage.sessionId === $store.session.current_session_id && $store.dedupCoverage.incompleteStages.length">
+        <strong>Similarity search coverage is incomplete.</strong>
+        <span x-text="' Capped stages: ' + $store.dedupCoverage.incompleteStages.join(', ') + '; ' + $store.dedupCoverage.deferredLabel + '. Unreviewed pairs were not declared duplicates.'"></span>
+        <div class="text-sm">Exact hash comparison completed separately when its stage succeeded. A search without a cap still does not establish complete similarity recall.</div>
+      </div>
 
       <!-- Toolbar -->
       <div class="toolbar" style="margin-bottom:12px;">
@@ -518,10 +608,15 @@
             <option :value="r.filename" x-text="r.filename + ' (' + new Date(r.saved_at).toLocaleString() + ')'"></option>
           </template>
         </select>
-        <button class="btn btn-outline btn-sm" @click="saveResults('duplicates')" title="Save current results">Save</button>
+          <button class="btn btn-outline btn-sm" @click="saveResults('duplicates')" :disabled="snapshotMode" title="Save this session's duplicate-group snapshot">Save</button>
       </div>
 
-      <p class="text-dim mb-2" x-text="total + ' duplicate groups found'"></p>
+      <div class="card mb-2 coverage-warning" x-show="snapshotMode" role="status">
+        Historical duplicate-group snapshot, read-only. <span x-text="'Showing ' + snapshotItems.length + ' saved of ' + snapshotSavedTotal + ' groups as of ' + snapshotAsOf + '. ' "></span>
+        <button type="button" class="btn btn-outline btn-sm" @click="load()">Refresh live groups</button>
+      </div>
+
+      <p class="text-dim mb-2" x-text="total + ' comparison groups found'"></p>
 
       <template x-for="g in groups" :key="g.id">
         <div class="dupe-group">
@@ -529,9 +624,12 @@
             <div>
               <span class="badge" :class="'badge-' + g.dupe_type" x-text="g.dupe_type"></span>
               <strong x-text="g.count + ' files'"></strong>
+              <span class="text-sm text-dim" x-show="g.members_truncated" x-text="'Showing ' + g.visible_count + ' members (first 100 plus keeper when needed); review remaining candidate actions in the paged Proposals tab.'"></span>
                   <span class="text-dim text-sm" x-show="g.dupe_type === 'exact'" x-text="'Exact-hash candidate bytes: ' + formatBytes(g.wasted_bytes)"></span>
               <span class="text-dim text-sm" x-text="g.evidence_label"></span>
-                  <span class="text-sm" x-show="g.dupe_type !== 'exact'" style="color:var(--warning)">Similarity candidates; inspect both files. Not evidence of safe disposal.</span>
+              <span class="review-note" x-show="g.sequence_comparison_count"
+                    x-text="g.sequence_comparison_count + ' sampled sequence comparison(s); unreviewed frames are not duplicate decisions.'"></span>
+                  <span class="text-sm" x-show="g.dupe_type !== 'exact'" style="color:var(--warning)">Similarity comparisons; inspect both files. Distinct files can look alike. No disposal decision is implied.</span>
             </div>
           </div>
           <div class="dupe-files">
@@ -552,7 +650,20 @@
                   <div class="text-sm" x-text="keeper(g)?.ai_description || 'No content description'"></div>
                   <div class="text-sm text-dim" x-text="keeper(g) ? formatBytes(keeper(g).size_bytes) : ''"></div>
                   <div class="text-sm text-dim" x-text="evidenceText(g, f)"></div>
-                  <button class="btn btn-outline btn-sm mt-1" @click="setKeeper(g.id, f.id)">Keep candidate instead</button>
+                  <div class="review-note" x-show="f.closest_observed_peer">
+                    <strong>Closest observed direct visual match</strong>
+                    <template x-if="f.closest_observed_peer">
+                      <div>
+                        <template x-if="f.closest_observed_peer.file_id !== g.keep_file_id"><img :src="'/api/files/' + f.closest_observed_peer.file_id + '/thumbnail?size=120'" loading="lazy" alt="Closest observed comparison image" style="display:block;max-width:120px;max-height:120px;margin:5px 0;"></template>
+                        <div class="text-mono text-sm" x-text="f.closest_observed_peer.path"></div>
+                        <div class="text-sm" x-text="'Direct pHash distance ' + f.closest_observed_peer.distance + ' bits · ' + f.closest_observed_peer.comparison_coverage + ' comparison of ' + f.closest_observed_peer.peers_scored + ' / ' + f.closest_observed_peer.total_other_members + ' other members.'"></div>
+                        <div class="text-sm">The selected keeper remains the action target; change it explicitly after reviewing both files.</div>
+                      </div>
+                    </template>
+                  </div>
+                  <div class="review-note" x-show="f.sequence_comparison"
+                       x-text="f.sequence_comparison?.note + ' Frame ' + f.sequence_comparison?.ordinal + ' versus ' + f.sequence_comparison?.keeper_ordinal + '.'"></div>
+                  <button class="btn btn-outline btn-sm mt-1" :disabled="snapshotMode" @click="setKeeper(g.id, f.id)">Keep candidate instead</button>
                 </div>
               </div>
             </template>
@@ -570,13 +681,80 @@
       </template>
 
       <template x-if="groups.length === 0">
-        <p class="text-dim">No duplicate groups found. Run <code>ddh dedup</code> or use the Pipeline tab.</p>
+        <p class="text-dim">No duplicate or similarity groups found. Run Deduplicate from the Pipeline tab.</p>
       </template>
     </section>
 
     <!-- ====================== PIPELINE ======================= -->
     <section x-show="$store.app.tab === 'pipeline'" x-data="pipeline" x-cloak>
       <div class="page-title">&#9881; Pipeline</div>
+      <div class="card mb-2 coverage-warning" role="status" x-show="$store.dedupCoverage.sessionId === $store.session.current_session_id && $store.dedupCoverage.incompleteStages.length">
+        <strong>Similarity search coverage is incomplete.</strong>
+        <span x-text="' Capped stages: ' + $store.dedupCoverage.incompleteStages.join(', ') + '; ' + $store.dedupCoverage.deferredLabel + '. Unreviewed pairs were not declared duplicates.'"></span>
+        <div class="text-sm">Exact hash comparison completed separately when its stage succeeded. A search without a cap still does not establish complete similarity recall.</div>
+      </div>
+
+      <div class="card mb-2 preflight-card" aria-label="Collection estimate and analysis options">
+        <div class="card-label">Before you run</div>
+        <p class="text-sm text-dim">Estimate the selected folder, then choose how numbered visual sequences are analyzed. This reads file metadata; it does not change files.</p>
+        <div class="preflight-controls">
+          <label>Sequence coverage
+            <select class="input" x-model.number="sequenceSampleStride" @change="preflight = null">
+              <option :value="0">Full: analyze every eligible file</option>
+              <option :value="10">Representative: every 10th numbered frame</option>
+            </select>
+          </label>
+          <label class="preflight-check"><input type="checkbox" x-model="useAnalysisCache"> Reuse matching content analyses</label>
+          <button class="btn btn-outline" :disabled="preflightBusy || !getSettings().session_id" @click="loadPreflight()"
+                  x-text="preflightBusy ? 'Estimating…' : 'Estimate collection'"></button>
+        </div>
+        <p class="text-sm" x-show="sequenceSampleStride">Representative mode leaves unsampled frames unanalyzed and eligible for a later full pass. It does not copy descriptions or declare them duplicates.</p>
+        <div class="preflight-result" role="status" aria-live="polite">
+          <p x-show="preflightError" class="text-sm" style="color:var(--danger)" x-text="preflightError"></p>
+          <template x-if="preflight"><div>
+            <strong x-text="preflight.files.toLocaleString() + ' likely indexed files · ' + formatBytes(preflight.logical_bytes) + ' retained size'"></strong>
+            <div class="text-sm" x-text="'Likely files needing AI: ' + preflight.estimated_ai_calls_range.join('–') + ' · estimated inference: ' + preflight.estimated_ai_seconds_range.map(s => (s / 3600).toFixed(1) + ' h').join('–')"></div>
+            <div class="text-sm" x-text="'Indexed bytes: ' + formatBytes(preflight.indexed_logical_bytes) + ' · excluded from index: ' + preflight.excluded_files + ' · possible sampled frames: up to ' + preflight.estimated_sampled_upper.toLocaleString()"></div>
+            <div class="text-sm" x-text="'Inaccessible entries: ' + preflight.inaccessible_entries"></div>
+            <div class="text-sm text-dim">Estimate only. Scan, extraction, model response, and file system speed can change actual totals.</div>
+          </div></template>
+        </div>
+      </div>
+
+      <div class="card mb-2 preflight-card" x-show="analysisCoverage" aria-label="Analysis coverage">
+        <div class="card-label">Analysis coverage</div>
+        <div class="coverage-grid" role="status" aria-live="polite">
+          <div><strong x-text="analysisCoverage?.total_indexed || 0"></strong><span>Indexed</span></div>
+          <div><strong x-text="analysisCoverage?.by_outcome?.content_verified || 0"></strong><span>Content read by AI</span></div>
+          <div><strong x-text="(analysisCoverage?.by_outcome?.context_only || 0) + (analysisCoverage?.by_outcome?.metadata_only || 0)"></strong><span>Limited evidence</span></div>
+          <div><strong x-text="analysisCoverage?.by_outcome?.skipped || 0"></strong><span>No content analysis</span></div>
+          <div><strong x-text="analysisCoverage?.by_outcome?.sampled || 0"></strong><span>Sampled out</span></div>
+          <div><strong x-text="analysisCoverage?.by_outcome?.unprocessed || 0"></strong><span>Not processed</span></div>
+          <div><strong x-text="analysisCoverage?.by_outcome?.unknown_provenance || 0"></strong><span>Legacy result, unverified</span></div>
+          <div><strong x-text="analysisCoverage?.by_outcome?.failed || 0"></strong><span>Failed</span></div>
+        </div>
+        <p class="text-sm text-dim">Skipped files stay indexed and on disk, but have no model analysis. Reading content does not certify the AI's interpretation. Scan exclusions appear in the collection estimate.</p>
+        <div class="text-sm" x-show="analysisCoverage?.skipped_by_extension?.length">Top skipped formats and reasons:</div>
+        <ul class="text-sm" x-show="analysisCoverage?.skipped_by_extension?.length">
+          <template x-for="row in (analysisCoverage?.skipped_by_extension || [])" :key="row.extension + ':' + row.reason">
+            <li x-text="row.extension + ': ' + row.count + ' (' + row.reason.replaceAll('_', ' ') + ')'"></li>
+          </template>
+        </ul>
+        <p class="text-sm" x-show="analysisCoverage?.other_skipped_formats" x-text="(analysisCoverage?.other_skipped_formats || 0) + ' more skipped files in other formats'"></p>
+        <button class="btn btn-outline btn-sm mt-1" @click="loadAnalysisCoverage()">Refresh analysis coverage</button>
+      </div>
+
+      <div class="card mb-2 preflight-card" x-show="organizationCoverage" aria-label="Organization coverage">
+        <div class="card-label">Organization coverage</div>
+        <div class="coverage-grid" role="status" aria-live="polite">
+          <div><strong x-text="organizationCoverage?.project_preserved || 0"></strong><span>In preserved projects</span></div>
+          <div><strong x-text="organizationCoverage?.independent_proposed || 0"></strong><span>Independent moves proposed</span></div>
+          <div><strong x-text="organizationCoverage?.already_ordered || 0"></strong><span>Existing folder retained</span></div>
+          <div><strong x-text="organizationCoverage?.needs_review || 0"></strong><span>Needs review</span></div>
+        </div>
+        <p class="text-sm text-dim">Counts cover indexed files. Existing-folder retention does not verify subject or date. Proposed moves still need approval, preview and commit; project files remain in place.</p>
+        <button class="btn btn-outline btn-sm mt-1" @click="loadOrganizationCoverage()">Refresh coverage</button>
+      </div>
 
       <!-- Current settings summary -->
       <div class="card mb-2" style="max-width:600px">
@@ -739,18 +917,22 @@
           <div class="step-num" :class="{ active: running === 'relate', 'step-done': isStepDone('relate') }" x-text="isStepDone('relate') ? '✓' : '4'"></div>
           <div class="step-info">
             <div class="step-name">Relate</div>
-            <div class="step-desc">LLM groups conceptually-related files (CAD source + backups + exports, photo sets, font families)</div>
-            <!-- Live per-directory progress -->
-            <template x-if="relateProgress && relateProgress.total">
+            <div class="step-desc">Groups related source files, backups, exports and photo sets</div>
+            <!-- Relation units are streamed, so the directory total may be unknown. -->
+            <template x-if="relateProgress">
               <div class="mt-1">
-                <div class="text-sm" style="color:var(--primary); font-weight:600;"
-                     x-text="'Directory: ' + (relateProgress.done || 0) + ' / ' + (relateProgress.total || 0) + (relateProgress.dir ? ' — ' + relateProgress.dir : '')"></div>
-                <div style="margin-top:4px; background:var(--surface-2); border-radius:4px; height:6px; overflow:hidden;">
+                <div class="text-sm" role="status" aria-live="polite" style="color:var(--primary); font-weight:600;"
+                     x-text="relateProgress.total != null ? 'Directories: ' + (relateProgress.directories_done || 0) + ' / ' + relateProgress.total : 'Directories processed: ' + (relateProgress.directories_done || 0) + ' (total unknown)'"></div>
+                <div class="text-dim text-sm mt-1" x-show="relateProgress.phase === 'grouping'"
+                     x-text="'Grouping directory ' + (relateProgress.directory_index || 1) + ': chunk ' + (relateProgress.chunk_active || relateProgress.chunk_done || 0) + ' / ' + (relateProgress.chunk_total || 0) + (relateProgress.chunk_active ? ' in progress' : ' complete')"></div>
+                <div x-show="relateProgress.total != null" style="margin-top:4px; background:var(--surface-2); border-radius:4px; height:6px; overflow:hidden;">
                   <div style="height:100%; background:var(--primary); border-radius:4px; transition:width .3s;"
-                       :style="'width:' + (relateProgress.total ? ((relateProgress.done || 0) / relateProgress.total * 100) : 0) + '%'"></div>
+                       :style="'width:' + (relateProgress.total ? ((relateProgress.directories_done || 0) / relateProgress.total * 100) : 0) + '%'"></div>
                 </div>
                 <div class="text-dim text-sm mt-1"
                      x-text="'Groups: ' + (relateProgress.groups || 0) + ' | LLM: ' + (relateProgress.llm_groups || 0) + ' | Backstop: ' + (relateProgress.backstop_groups || 0)"></div>
+                <div class="text-dim text-sm mt-1" x-show="relateProgress.updated_utc"
+                     x-text="'Last activity: ' + new Date(relateProgress.updated_utc).toLocaleTimeString()"></div>
               </div>
             </template>
             <template x-if="activeJobType === 'relate' && jobState === 'paused'">
@@ -775,7 +957,7 @@
           <div class="step-num" :class="{ active: running === 'analyze', 'step-done': isStepDone('analyze') }" x-text="isStepDone('analyze') ? '✓' : '5'"></div>
           <div class="step-info">
             <div class="step-name">Analyze</div>
-            <div class="step-desc">AI analysis (vision + text) of all files</div>
+            <div class="step-desc">AI analysis of eligible files. Coverage and reuse follow the options above.</div>
             <!-- Live progress counter -->
             <template x-if="analyzeProgress">
               <div class="mt-1">
@@ -785,8 +967,8 @@
                   <div style="height:100%; background:var(--primary); border-radius:4px; transition:width .3s;"
                        :style="'width:' + (analyzeProgress.total ? (analyzeProgress.current / analyzeProgress.total * 100) : 0) + '%'"></div>
                 </div>
-                <div class="text-dim text-sm mt-1"
-                     x-text="'Done: ' + (analyzeProgress.analyzed || 0) + ' | Skipped: ' + (analyzeProgress.skipped || 0) + ' | Errors: ' + (analyzeProgress.errors || 0)"></div>
+                <div class="text-dim text-sm mt-1" role="status" aria-live="polite"
+                     x-text="'Fresh: ' + (analyzeProgress.analyzed || 0) + ' | Cached: ' + (analyzeProgress.cached || 0) + ' | Sampled out: ' + (analyzeProgress.sampled || 0) + ' | Unsupported: ' + (analyzeProgress.skipped || 0) + ' | Errors: ' + (analyzeProgress.errors || 0)"></div>
               </div>
             </template>
             <template x-if="activeJobType === 'analyze' && jobState === 'paused' && !analyzeProgress">
@@ -985,9 +1167,11 @@
 
       <!-- Folder Browser Modal -->
       <template x-if="showBrowser">
-        <div class="modal-backdrop" @click.self="showBrowser = false">
-          <div class="modal" style="max-width:600px;">
-            <button class="modal-close" @click="showBrowser = false">&#10005;</button>
+        <div class="modal-backdrop" @click.self="showBrowser = false" @keydown.escape.prevent="showBrowser = false">
+          <div class="modal" style="max-width:600px;" role="dialog" aria-modal="true"
+               aria-label="Select Folder" tabindex="-1" @keydown.tab="trapDialogTab($event)"
+               x-init="$nextTick(() => $el.querySelector('button')?.focus())">
+            <button class="modal-close" @click="showBrowser = false" aria-label="Close folder browser">&#10005;</button>
             <div class="modal-title">Select Folder</div>
             <div class="mt-1" x-show="!currentPath">
               <p class="text-dim text-sm mb-1">Available Drives:</p>
@@ -1007,8 +1191,10 @@
               </div>
               <div style="border:1px solid var(--border); border-radius:6px; max-height:300px; overflow-y:auto;">
                 <template x-for="folder in folders" :key="folder.path">
-                  <div style="padding:8px 12px; border-bottom:1px solid var(--border); cursor:pointer; display:flex; align-items:center; gap:8px; hover:background:var(--surface-2);"
-                       @click="browsePath(folder.path)" @dblclick="selectFolder(folder.path)">
+                  <div style="padding:8px 12px; border-bottom:1px solid var(--border); cursor:pointer; display:flex; align-items:center; gap:8px;"
+                       role="button" tabindex="0" :aria-label="'Browse folder ' + folder.name"
+                       @click="browsePath(folder.path)" @dblclick="selectFolder(folder.path)"
+                       @keydown.enter.prevent="browsePath(folder.path)" @keydown.space.prevent="browsePath(folder.path)">
                     <span>&#128193;</span>
                     <div style="flex:1;">
                       <div class="text-sm" x-text="folder.name"></div>
@@ -1185,8 +1371,9 @@
      role="presentation"
      @click.self="$store.modal.cancel()"
      @keydown.escape.window="$store.modal.onEscape($event)"
+     @keydown.tab="$store.modal.trapTab($event)"
      @keydown.enter.window="$store.modal.onEnter($event)">
-  <div class="modal" style="max-width:460px;" role="dialog" aria-modal="true"
+  <div class="modal" style="max-width:460px;" role="dialog" aria-modal="true" tabindex="-1"
        :aria-label="$store.modal.title || 'Confirm'">
     <div class="modal-title" x-show="$store.modal.title" x-text="$store.modal.title"></div>
     <p style="white-space:pre-wrap; margin:0 0 16px;" x-text="$store.modal.message"></p>

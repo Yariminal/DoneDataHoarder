@@ -45,6 +45,7 @@ def _add_file(db, session_id: str, name: str, **fields) -> int:
         hash_perceptual=fields.pop("hash_perceptual", None),
         ai_description=fields.pop("ai_description", None),
         ai_tags=json.dumps(tags) if tags is not None else None,
+        analysis_outcome=fields.pop("analysis_outcome", "content_verified"),
         size_bytes=fields.pop("size_bytes", 100),
     )
     db.add(row)

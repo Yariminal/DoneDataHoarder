@@ -6,6 +6,7 @@ even when the filename itself is useless (e.g. "IMG_0042.jpg" or "FINAL2.docx").
 """
 import re
 import threading
+from collections import OrderedDict
 from pathlib import Path
 
 from donedatahoarder.db.models import File
@@ -20,8 +21,15 @@ MAX_PARENT_DEPTH = 4  # how many folder levels to walk up
 
 # Directory listings are stable for a run and expensive on big folders.
 # Keyed by directory, shared by every worker in the process.
-_DIR_FILE_CACHE: dict[Path, tuple[str, ...]] = {}
+_DIR_FILE_CACHE: OrderedDict[Path, tuple[dict[str, tuple[str, ...]], tuple[str, ...]]] = OrderedDict()
 _DIR_FILE_CACHE_LOCK = threading.Lock()
+MAX_CACHED_DIRECTORIES = 128
+MAX_CACHED_EXTENSIONS_PER_DIRECTORY = 128
+
+
+def clear_context_cache() -> None:
+    with _DIR_FILE_CACHE_LOCK:
+        _DIR_FILE_CACHE.clear()
 
 
 def _tokenise(name: str) -> list[str]:
@@ -47,34 +55,45 @@ def _folder_chain(path: Path, max_depth: int = MAX_PARENT_DEPTH) -> list[str]:
     return parts  # nearest-first
 
 
-def _cached_directory_filenames(directory: Path) -> tuple[str, ...]:
-    """File names in ``directory``. Cached for the life of the process.
-
-    Permission errors are cached as an empty listing so a forbidden folder
-    is not restated on every sibling.
-    """
+def _cached_directory_filenames(directory: Path):
+    """Bounded per-extension and fallback samples for sibling context."""
     with _DIR_FILE_CACHE_LOCK:
         cached = _DIR_FILE_CACHE.get(directory)
         if cached is not None:
+            _DIR_FILE_CACHE.move_to_end(directory)
             return cached
+    by_ext: dict[str, list[str]] = {}
+    fallback: list[str] = []
     try:
-        names = tuple(p.name for p in directory.iterdir() if p.is_file())
-    except PermissionError:
-        names = ()
+        for p in directory.iterdir():
+            if not p.is_file():
+                continue
+            name = p.name
+            ext = p.suffix.lower()
+            if ext in by_ext or len(by_ext) < MAX_CACHED_EXTENSIONS_PER_DIRECTORY:
+                sample = by_ext.setdefault(ext, [])
+                if len(sample) < MAX_SIBLINGS + 1:
+                    sample.append(name)
+            if len(fallback) < MAX_SIBLINGS + 1:
+                fallback.append(name)
+    except OSError:
+        pass
+    sampled = ({k: tuple(v) for k, v in by_ext.items()}, tuple(fallback))
     with _DIR_FILE_CACHE_LOCK:
-        return _DIR_FILE_CACHE.setdefault(directory, names)
+        if directory not in _DIR_FILE_CACHE:
+            _DIR_FILE_CACHE[directory] = sampled
+            while len(_DIR_FILE_CACHE) > MAX_CACHED_DIRECTORIES:
+                _DIR_FILE_CACHE.popitem(last=False)
+        return _DIR_FILE_CACHE[directory]
 
 
 def _sibling_summary(path: Path, max_siblings: int = MAX_SIBLINGS) -> str:
     """Summarise nearby files in the same directory."""
-    siblings = [
-        name for name in _cached_directory_filenames(path.parent)
-        if name != path.name
-    ]
-
-    # Sort: prefer files that share the same extension
-    same_ext = [s for s in siblings if Path(s).suffix.lower() == path.suffix.lower()]
-    other = [s for s in siblings if s not in same_ext]
+    by_ext, fallback = _cached_directory_filenames(path.parent)
+    same_ext = [name for name in by_ext.get(path.suffix.lower(), ())
+                if name != path.name]
+    other = [name for name in fallback if name != path.name
+             and Path(name).suffix.lower() != path.suffix.lower()]
     ordered = same_ext[:max_siblings // 2] + other[:max_siblings // 2]
 
     if not ordered:

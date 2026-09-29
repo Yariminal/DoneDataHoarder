@@ -187,15 +187,20 @@ Context about the file:
 
 I've sampled {frame_count} frames from the video. Describe what you observe across all frames.
 
-Return a JSON object:
+Return a JSON object in this shape, replacing the example values:
 {{
   "description": "2-3 sentences describing the video content",
-  "suggested_name": "meaningful filename stem — MUST preserve specific proper nouns (names, places, events) from the original filename. Translate to English if not already. No extension, no date prefix, use_underscores, max 60 chars",
-  "tags": ["tag1", "tag2", ...],
-  "video_type": "one of: home_video, event, tutorial, presentation, screen_recording, movie_clip, music_video, other",
-  "detected_date": "YYYY-MM-DD if inferable, else null",
-  "confidence": 0.0-1.0
+  "suggested_name": "visible_video_subject",
+  "tags": ["specific_subject", "visible_attribute"],
+  "video_type": "event",
+  "detected_date": null,
+  "confidence": 0.8
 }}
+Preserve specific proper nouns from the original filename in suggested_name;
+translate to English, omit extension and date prefix, use_underscores, max
+60 chars. video_type must be one of home_video, event, tutorial, presentation,
+screen_recording, movie_clip, music_video, other. Use YYYY-MM-DD for an
+inferable detected_date, otherwise null. confidence is 0 to 1.
 """
 
 AUDIO_PROMPT = """\
@@ -206,15 +211,20 @@ Context about the file:
 
 {transcript_section}
 
-Return a JSON object:
+Return a JSON object in this shape, replacing the example values:
 {{
   "description": "1-2 sentences describing the audio content",
-  "suggested_name": "meaningful filename stem — MUST preserve specific proper nouns (names, places, events) from the original filename. Translate to English if not already. No extension, use_underscores, max 60 chars",
-  "tags": ["tag1", "tag2", ...],
-  "audio_type": "one of: music, podcast, voice_memo, lecture, meeting_recording, sound_effect, other",
-  "detected_date": "YYYY-MM-DD if inferable, else null",
-  "confidence": 0.0-1.0
+  "suggested_name": "audible_subject_or_event",
+  "tags": ["specific_subject", "audible_attribute"],
+  "audio_type": "voice_memo",
+  "detected_date": null,
+  "confidence": 0.8
 }}
+Preserve specific proper nouns from the original filename in suggested_name;
+translate to English, omit extension, use_underscores, max 60 chars.
+audio_type must be one of music, podcast, voice_memo, lecture,
+meeting_recording, sound_effect, other. Use YYYY-MM-DD for an inferable
+detected_date, otherwise null. confidence is 0 to 1.
 """
 
 

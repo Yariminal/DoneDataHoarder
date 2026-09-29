@@ -15,6 +15,7 @@ class StatsResponse(BaseModel):
     by_extension: list[dict] = []
     by_mime_category: list[dict] = []
     proposal_counts: dict[str, int] = {}
+    pending_by_type: dict[str, int] = {}
     duplicate_groups: int = 0
     duplicate_wasted_bytes: int = 0
 
@@ -69,6 +70,11 @@ class BulkRejectRequest(BaseModel):
 
 class ReviewProposalRequest(BaseModel):
     session_id: str = Field(min_length=1)
+    expected_duplicate_group_id: Optional[int] = None
+    expected_duplicate_type: Optional[str] = None
+    expected_keeper_id: Optional[int] = None
+    expected_candidate_path: Optional[str] = None
+    expected_keeper_path: Optional[str] = None
 
 
 class EditProposalRequest(BaseModel):
@@ -89,6 +95,8 @@ class PipelineRequest(BaseModel):
     session_id: str = ""
     skip_dirs: list[str] = []
     retry_errors: bool = False
+    sequence_sample_stride: int = Field(default=0, ge=0, le=1000)
+    use_cache: bool = True
 
 
 class RunPlanRequest(PipelineRequest):

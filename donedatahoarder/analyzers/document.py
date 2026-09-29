@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import Optional
 from xml.etree import ElementTree
 
-from donedatahoarder.analyzers.base import AnalysisResult, BaseAnalyzer, SYSTEM_PROMPT
+from donedatahoarder.analyzers.base import (
+    AnalysisResult, BaseAnalyzer, EXTRACTOR_VERSION, SYSTEM_PROMPT,
+)
 from donedatahoarder.db.models import File
 
 MAX_CHARS = 3000   # max text chars to send to AI
@@ -51,6 +53,12 @@ MAX_PDF_RENDER_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 MAX_VISION_PAGES = 3
 MAX_PPTX_XML_ENTRY_BYTES = 8 * 1024 * 1024
 MAX_PPTX_XML_TOTAL_BYTES = 16 * 1024 * 1024
+MAX_DOCX_DOCUMENT_XML_BYTES = 8 * 1024 * 1024
+MAX_DOCX_EXPANDED_BYTES = 64 * 1024 * 1024
+MAX_DOCX_PACKAGE_ENTRIES = 1024
+MAX_DOCX_BLOCKS = 2000
+MAX_DOCX_TABLE_DEPTH = 4
+DOCX_EXTRACTOR_VERSION = "extractors-v5-2026-09-28"
 
 DOC_EXTENSIONS = {
     ".pdf", ".docx", ".doc", ".odt",
@@ -59,7 +67,7 @@ DOC_EXTENSIONS = {
     ".txt", ".md", ".rtf",
     ".json", ".xml", ".yaml", ".yml",
     ".html", ".htm",
-    ".ai",   # Adobe Illustrator (PDF-based — text extraction often works)
+    ".ai",   # Adobe Illustrator; only PDF-backed files can be decoded here
     ".mtl",  # Wavefront material library — plain text
 }
 DOC_MIMES = {
@@ -279,15 +287,73 @@ def _render_pdf_first_page_as_jpeg(path: Path) -> bytes | None:
 
 def _extract_docx(path: Path) -> str:
     if _file_too_big(path):
-        return ""
-    try:
-        from docx import Document
-        doc = Document(str(path))
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-    except ImportError:
-        return ""
-    except Exception:
-        return ""
+        raise ExtractionTooLarge("DOCX compressed package exceeds extraction cap")
+    # python-docx expands the OPC package in memory. Reject unusually large
+    # declared parts before it reads them, even when the ZIP itself is small.
+    with zipfile.ZipFile(path) as package:
+        entries = package.infolist()
+        document_xml = package.getinfo("word/document.xml")
+        if (len(entries) > MAX_DOCX_PACKAGE_ENTRIES
+                or document_xml.file_size > MAX_DOCX_DOCUMENT_XML_BYTES
+                or sum(entry.file_size for entry in entries) > MAX_DOCX_EXPANDED_BYTES):
+            raise ExtractionTooLarge("DOCX expanded package exceeds extraction cap")
+
+    from docx import Document
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    doc = Document(str(path))
+    visited = 0
+
+    def blocks(parent, depth: int):
+        nonlocal visited
+        if depth > MAX_DOCX_TABLE_DEPTH:
+            raise ExtractionTooLarge("DOCX nested table depth exceeds extraction cap")
+        element = parent.element if hasattr(parent, "element") else parent._tc
+        body = element.body if hasattr(element, "body") else element
+        for child in body.iterchildren():
+            if not isinstance(child, (CT_P, CT_Tbl)):
+                continue
+            visited += 1
+            if visited > MAX_DOCX_BLOCKS:
+                raise ExtractionTooLarge("DOCX visible blocks exceed extraction cap")
+            if isinstance(child, CT_P):
+                value = Paragraph(child, parent).text.strip()
+                if value:
+                    yield value
+                continue
+            table = Table(child, parent)
+            # Keep XML cell objects alive while traversing the table. Using
+            # id() alone lets Python recycle wrappers between successive rows.
+            seen_cells: set[object] = set()
+            for row in table.rows:
+                visited += 1
+                if visited > MAX_DOCX_BLOCKS:
+                    raise ExtractionTooLarge("DOCX table rows exceed extraction cap")
+                values = []
+                for cell in row.cells:
+                    key = cell._tc
+                    if key in seen_cells:
+                        continue  # merged cell repeated in row/cross-row views
+                    seen_cells.add(key)
+                    value = " / ".join(blocks(cell, depth + 1)).strip()
+                    if value:
+                        values.append(value)
+                if values:
+                    yield " | ".join(values)
+
+    parts = []
+    used = 0
+    for value in blocks(doc, 0):
+        remaining = MAX_CHARS - used
+        if remaining <= 0:
+            break
+        piece = value[:remaining]
+        parts.append(piece)
+        used += len(piece) + 1
+    return "\n".join(parts)[:MAX_CHARS]
 
 
 def _extract_xlsx(path: Path) -> str:
@@ -340,13 +406,24 @@ def _extract_text(path: Path) -> str:
     return ""
 
 
+def _is_pdf_backed_illustrator(path: Path) -> bool:
+    """Recognize only Illustrator files with a PDF header, using a bounded read."""
+    try:
+        with path.open("rb") as stream:
+            return stream.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
 def extract_document(path: Path, mime_type: Optional[str] = None) -> ExtractionResult:
     """Extract a bounded excerpt with an explicit no-content reason."""
     ext = path.suffix.lower()
     mime = mime_type or ""
     if ext in _LEGACY_UNSUPPORTED:
         return ExtractionResult(reason="unsupported_type")
-    if ext == ".pdf" or "pdf" in mime:
+    if ext == ".ai" and not _is_pdf_backed_illustrator(path):
+        return ExtractionResult(reason="unsupported_type")
+    if ext in {".pdf", ".ai"} or "pdf" in mime:
         try:
             import pdfplumber  # noqa: F401
         except ImportError:
@@ -365,7 +442,13 @@ def extract_document(path: Path, mime_type: Optional[str] = None) -> ExtractionR
             import docx  # noqa: F401
         except ImportError:
             return ExtractionResult(reason="missing_dependency", extractor="python-docx")
-        text, extractor = _extract_docx(path), "python-docx"
+        try:
+            text = _extract_docx(path)
+        except ExtractionTooLarge:
+            return ExtractionResult(reason="oversized_content", extractor="python-docx")
+        except Exception:
+            return ExtractionResult(reason="unreadable_content", extractor="python-docx")
+        extractor = "python-docx"
     elif ext == ".xlsx":
         try:
             import openpyxl  # noqa: F401
@@ -404,16 +487,27 @@ rather than summarising each page separately.
 Context about the file:
 {context}
 
-Return a JSON object with these fields:
+Return a JSON object in this shape, replacing the example values:
 {{
-  "description": "1-2 sentences describing what the document is about, synthesised across the attached page(s)",
-  "suggested_name": "meaningful filename stem. Rules: (1) Describe the document's actual content, do NOT repeat the containing folder name. (2) Preserve specific proper nouns (organisation, client, event name, project name) only if visible and uniquely identifying. (3) Translate to English if not already. (4) No extension, no date prefix, use_underscores, max 60 chars",
-  "tags": ["tag1", "tag2", ...]  // 4-8 specific, lowercase, underscore_separated tags describing concrete visible elements (subject, document subtype, visible colour scheme, visible motifs/patterns, disciplines like "architecture" or "structural_engineering" if evident). Skip generic words like "document", "pdf", "page".,
-  "document_type": "one of: invoice, receipt, contract, report, letter, cv_resume, photo, presentation, spreadsheet, notes, form, certificate, manual, menu, flyer, brochure, poster, cover, other",
-  "detected_date": "YYYY-MM-DD only if a specific date is clearly visible on any rendered page — NOT inferred from the filename or folder. Return null if no explicit date is visible.",
-  "language": "ISO 639-1 language code of any visible text (e.g. en, he, fr). If the page is purely graphical with no text, return null.",
-  "confidence": 0.0-1.0
+  "description": "A concise description of the visible document pages.",
+  "suggested_name": "visible_document_subject",
+  "tags": ["specific_subject", "visible_attribute"],
+  "document_type": "brochure",
+  "detected_date": null,
+  "language": null,
+  "confidence": 0.8
 }}
+
+Describe the attached pages together in 1-2 sentences. Name their actual
+content without repeating the folder name; preserve uniquely identifying
+visible proper nouns, translate to English, omit extension and date prefix,
+use_underscores, max 60 chars. Use 4-8 specific lowercase underscore_separated
+tags for concrete visible elements; skip generic words and uncertain tags.
+document_type must be one of invoice, receipt, contract, report, letter,
+cv_resume, photo, presentation, spreadsheet, notes, form, certificate, manual,
+menu, flyer, brochure, poster, cover, other. Use YYYY-MM-DD for detected_date
+only when clearly visible on a page, otherwise null. language is an ISO 639-1
+code for visible text, or null for purely graphical pages. confidence is 0 to 1.
 
 For suggested_name: reflect what the document ACTUALLY shows. Examples:
 - "event_menu_cactus_pattern" for a menu card with cactus illustrations
@@ -433,16 +527,27 @@ Extracted text (first {max_chars} characters):
 {text}
 ---
 
-Based on the filename, folder context, and document content, return a JSON object:
+Based on the filename, folder context, and document content, return a JSON
+object in this shape, replacing the example values:
 {{
-  "description": "1-2 sentences describing what this document is about",
-  "suggested_name": "meaningful filename stem. Rules: (1) Describe the document's actual content/purpose — do NOT repeat the containing folder name. (2) Preserve specific proper nouns (client names, organizations) only if they uniquely identify this document. (3) Translate to English if not already. (4) No extension, no date prefix, use_underscores, max 60 chars",
-  "tags": ["tag1", "tag2", ...]  // 4-8 specific, lowercase tags. RULES: (a) each tag must add information NOT already implied by the filename or folder name; (b) NO generic words like "document", "file", "text", "content"; (c) prefer concrete entities (organisation, client, project, topic, document subtype) over abstract categories; (d) no duplicates or near-duplicates; (e) use_underscores; (f) skip the tag rather than guessing if unsure,
-  "document_type": "one of: invoice, receipt, contract, report, letter, cv_resume, photo, presentation, spreadsheet, notes, form, certificate, manual, other",
-  "detected_date": "YYYY-MM-DD only if a specific date is explicitly written in the document text (e.g. '14 March 2021', 'Date: 2021-03-14') — NOT inferred from the folder name or filename. Return null if no explicit date is found.",
-  "language": "ISO 639-1 language code (e.g. en, he, fr)",
-  "confidence": 0.0-1.0
+  "description": "A concise description of the document content.",
+  "suggested_name": "document_subject_purpose",
+  "tags": ["specific_subject", "document_subtype"],
+  "document_type": "report",
+  "detected_date": null,
+  "language": "en",
+  "confidence": 0.8
 }}
+
+Describe the content in 1-2 sentences. Name its actual purpose without
+repeating the folder name; preserve uniquely identifying proper nouns,
+translate to English, omit extension and date prefix, use_underscores, max
+60 chars. Use 4-8 specific lowercase tags that add information beyond the
+filename or folder; prefer concrete entities and skip generic or uncertain
+tags. document_type must be one of invoice, receipt, contract, report, letter,
+cv_resume, photo, presentation, spreadsheet, notes, form, certificate, manual,
+other. Use YYYY-MM-DD for detected_date only for an explicit date in the text,
+otherwise null. language is an ISO 639-1 code. confidence is 0 to 1.
 
 For suggested_name: reflect the actual content.
 Examples:
@@ -458,6 +563,12 @@ class DocumentAnalyzer(BaseAnalyzer):
     def __init__(self, ai_client):
         self._client = ai_client
 
+    def extractor_version_for(self, file_rec: File) -> str:
+        # Only DOCX body extraction changed. Keep existing PDF, spreadsheet,
+        # plain-text and other analyzer cache identities reusable.
+        return (DOCX_EXTRACTOR_VERSION if Path(file_rec.path).suffix.lower() == ".docx"
+                else EXTRACTOR_VERSION)
+
     def can_handle(self, mime_type: str, extension: str) -> bool:
         if mime_type and mime_type in DOC_MIMES:
             return True
@@ -469,8 +580,9 @@ class DocumentAnalyzer(BaseAnalyzer):
         text = extraction.text
         ext = path.suffix.lower()
 
-        # Vision fallback: PDFs that yield near-zero extractable text are
-        # almost always image-based (scans, menus, flyers, design covers)
+        # Vision fallback: PDFs and PDF-backed Illustrator files that yield
+        # near-zero extractable text are often image-based (scans, menus,
+        # flyers, design covers)
         # OR over-large files where pdfplumber refused to parse (like the
         # 452 MB Solar Dekathlon 15.12.pdf report with 33 pages of text
         # and 3D renderings). Instead of letting the text-only LLM guess
@@ -479,7 +591,9 @@ class DocumentAnalyzer(BaseAnalyzer):
         # signal for naming. _render returns [] on any failure (missing
         # pypdfium2, encrypted / corrupt PDF, render OOM, etc.).
         is_text_empty = not text or len(text.strip()) < 20
-        if is_text_empty and ext == ".pdf":
+        if is_text_empty and (ext == ".pdf" or (
+            ext == ".ai" and _is_pdf_backed_illustrator(path)
+        )):
             pdf_pages = _render_pdf_pages_as_jpegs(path)
             if pdf_pages:
                 vision_result = self._analyze_rendered_pdf(
@@ -543,11 +657,11 @@ class DocumentAnalyzer(BaseAnalyzer):
         pages: list[bytes],
     ) -> AnalysisResult | None:
         """
-        Vision path for text-empty PDFs. Sends up to MAX_VISION_PAGES
+        Vision path for text-empty PDFs, including PDF-backed Illustrator files.
+        Sends up to MAX_VISION_PAGES
         rendered pages to the vision model and returns a full
-        AnalysisResult. Returns None only if the vision call itself
-        raised — caller falls back to the text-only (filename-guess)
-        path in that case.
+        AnalysisResult. Provider failures return a failed result so the
+        pipeline records ERROR without AI evidence.
 
         For single-page inputs we use `image_bytes=` (cheaper / simpler
         path in both the Ollama and Gemini clients). For multi-page we

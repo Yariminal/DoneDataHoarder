@@ -4,6 +4,7 @@ import sqlite3
 import threading
 import zipfile
 
+import pytest
 from sqlalchemy.orm import Session
 
 from donedatahoarder.analyzers import pipeline
@@ -38,6 +39,138 @@ def test_binary_text_and_legacy_office_have_explicit_reasons(tmp_path):
     legacy = tmp_path / "slides.ppt"
     legacy.write_bytes(b"binary")
     assert extract_document(legacy).reason == "unsupported_type"
+
+
+def test_pdf_backed_illustrator_uses_rendered_page_vision(tmp_path, monkeypatch):
+    path = tmp_path / "illustration.ai"
+    path.write_bytes(b"%PDF-1.7\nillustrator content")
+    monkeypatch.setattr(document, "_extract_pdf", lambda _path: "")
+    rendered = []
+
+    def fake_render(given_path, max_pages=document.MAX_VISION_PAGES):
+        rendered.append((given_path, max_pages))
+        return [b"page image"]
+
+    monkeypatch.setattr(document, "_render_pdf_pages_as_jpegs", fake_render)
+
+    class Client:
+        text_model = "gemma4:26b"
+        vision_model = "gemma4:26b"
+
+        def generate_json(self, prompt, **kwargs):
+            assert kwargs["image_bytes"] == b"page image"
+            assert "illustration context" in prompt
+            return {"description": "Illustrated cover", "suggested_name": "illustrated_cover",
+                    "tags": ["cover"], "document_type": "cover", "confidence": 0.8}
+
+        def model_digest(self, model):
+            assert model == self.vision_model
+            return "sha256:vision-model"
+
+    record = File(path=str(path), filename=path.name, extension=".ai",
+                  mime_type="application/postscript")
+    result = document.DocumentAnalyzer(Client()).analyze(record, "illustration context")
+    assert rendered == [(path, document.MAX_VISION_PAGES)]
+    assert result.evidence_source == "vision"
+    assert result.extractor == "pdfium_render"
+    assert result.description == "Illustrated cover"
+    assert result.content_available is True
+
+    monkeypatch.setattr(pipeline, "build_context", lambda _row: "illustration context")
+    init_db(tmp_path / "index.db")
+    with Session(get_engine()) as db:
+        user = UserSession(root_path=str(tmp_path), name="illustrator")
+        db.add(user)
+        db.flush()
+        record.session_id = user.id
+        record.status = FileStatus.ENRICHED
+        record.size_bytes = path.stat().st_size
+        db.add(record)
+        db.commit()
+        file_id = record.id
+
+    client = Client()
+    _, status, _ = pipeline._process_one_file(
+        file_id, get_engine(), [document.DocumentAnalyzer(client)], client,
+        set(), use_cache=False,
+    )
+    assert status == "analyzed"
+    with Session(get_engine()) as db:
+        saved = db.get(File, file_id)
+        assert saved.status == FileStatus.ANALYZED
+        assert saved.analysis_evidence_source == "vision"
+        assert saved.analysis_extractor_version == "pdfium_render/extractors-v4-2026-09-28"
+        assert saved.analysis_prompt_version == "analysis-v3-2026-09-28"
+        assert saved.ai_model == "gemma4:26b"
+        assert saved.analysis_cache_hit is False
+
+
+def test_non_pdf_illustrator_remains_unsupported(tmp_path, monkeypatch):
+    path = tmp_path / "legacy.ai"
+    path.write_bytes(b"%!PS-Adobe-3.0\n%%Creator: Illustrator")
+    monkeypatch.setattr(document, "_render_pdf_pages_as_jpegs",
+                        lambda _path: pytest.fail("non-PDF Illustrator must not render"))
+
+    class Client:
+        def generate_json(self, *_args, **_kwargs):
+            pytest.fail("unsupported Illustrator must not call a model")
+
+    assert extract_document(path, "application/pdf").reason == "unsupported_type"
+    record = File(path=str(path), filename=path.name, extension=".ai",
+                  mime_type="application/pdf")
+    result = document.DocumentAnalyzer(Client()).analyze(record, "context")
+    assert result.outcome == "skipped"
+    assert result.reason == "unsupported_type"
+    assert result.evidence_source == "none"
+
+
+def test_pdf_backed_illustrator_provider_failure_has_no_saved_evidence(tmp_path, monkeypatch):
+    from donedatahoarder.ai.json_utils import LooseDict, generate_json_with_retry
+
+    path = tmp_path / "failed.ai"
+    path.write_bytes(b"%PDF-1.7\nillustrator content")
+    monkeypatch.setattr(document, "_extract_pdf", lambda _path: "")
+    monkeypatch.setattr(document, "_render_pdf_pages_as_jpegs",
+                        lambda _path: [b"page image"])
+    monkeypatch.setattr("donedatahoarder.ai.json_utils.time.sleep", lambda _: None)
+    init_db(tmp_path / "index.db")
+    with Session(get_engine()) as db:
+        user = UserSession(root_path=str(tmp_path), name="illustrator")
+        db.add(user)
+        db.flush()
+        file = File(session_id=user.id, path=str(path), filename=path.name,
+                    extension=".ai", mime_type="application/pdf",
+                    size_bytes=path.stat().st_size, status=FileStatus.ENRICHED)
+        db.add(file)
+        db.commit()
+        file_id = file.id
+
+    attempts = []
+
+    class Client:
+        text_model = "gemma4:26b"
+        vision_model = "gemma4:26b"
+
+        def generate_json(self, prompt, **_kwargs):
+            def malformed_response(**kwargs):
+                attempts.append(kwargs)
+                return '{"description" "missing colon"}'
+
+            return generate_json_with_retry(malformed_response, prompt, LooseDict)
+
+    _, status, _ = pipeline._process_one_file(
+        file_id, get_engine(), [document.DocumentAnalyzer(Client())], Client(),
+        set(), use_cache=False,
+    )
+    assert status == "error"
+    assert len(attempts) == 3
+    with Session(get_engine()) as db:
+        file = db.get(File, file_id)
+        assert file.status == FileStatus.ERROR
+        assert file.analysis_outcome == "failed"
+        assert file.ai_description is None
+        assert file.ai_model is None
+        assert file.analysis_cache_hit is False
 
 
 def test_pptx_uses_presentation_order_and_caps_expanded_xml(tmp_path, monkeypatch):

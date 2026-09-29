@@ -41,6 +41,23 @@ app = typer.Typer(
 console = Console()
 
 
+def _print_duplicate_coverage(stage: str, result: dict) -> None:
+    """Make bounded candidate search visible without inventing a pair count."""
+    if result.get("candidate_coverage") != "bounded_incomplete":
+        return
+    deferred = result.get("candidate_pair_opportunities_deferred")
+    if deferred is None:
+        lower = result.get("candidate_pair_opportunities_deferred_lower_bound")
+        detail = (f"at least {lower:,}; exact count unknown" if lower
+                  else "exact deferred count unknown")
+    else:
+        detail = f"{deferred:,} pair opportunities deferred"
+    console.print(
+        f"[yellow]{stage} candidate search was capped; coverage is incomplete "
+        f"({detail}). Unseen pairs have not been cleared.[/yellow]"
+    )
+
+
 @app.callback()
 def main_callback(
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Enable debug logging to console.", envvar="DDH_LOG_VERBOSE")] = False,
@@ -286,6 +303,8 @@ def analyze(
     limit: Annotated[Optional[int], typer.Option("--limit", help="Max files to analyze.")] = None,
     min_size: Annotated[int, typer.Option("--min-size", help="Skip files smaller than N KB.")] = 1,
     retry_errors: Annotated[bool, typer.Option("--retry-errors", help="Retry files that failed AI inference in a prior analysis run.")] = False,
+    sequence_sample_stride: Annotated[int, typer.Option("--sequence-sample-stride", help="Opt in to analyzing every Nth adjacent numbered image frame; 0 analyzes all.")] = 0,
+    use_cache: Annotated[bool, typer.Option("--cache/--no-cache", help="Reuse verified analysis only when bytes, context, model digest and versions match.")] = True,
 ):
     """[bold magenta]Analyze[/bold magenta] enriched files with AI (vision + text)."""
     _init_db(db)
@@ -299,11 +318,15 @@ def analyze(
 
     from donedatahoarder.analyzers.pipeline import analyze as do_analyze
     counts = do_analyze(workers=workers, limit=limit, min_size_kb=min_size,
-                        session_id=session_id, retry_errors=retry_errors)
+                        session_id=session_id, retry_errors=retry_errors,
+                        sequence_sample_stride=sequence_sample_stride,
+                        use_cache=use_cache)
 
     console.print(
         f"\n[bold green]Analysis complete[/bold green] — "
         f"{counts['analyzed']} analyzed, "
+        f"{counts.get('cached', 0)} cached, "
+        f"{counts.get('sampled', 0)} sampled, "
         f"{counts['skipped']} skipped, "
         f"{counts['errors']} errors"
     )
@@ -324,6 +347,7 @@ def dedup(
 
     from donedatahoarder.core.dedup import (
         find_exact_duplicates, find_perceptual_duplicates,
+        find_text_near_duplicates, find_semantic_duplicates,
         duplicate_summary, generate_dedup_proposals,
     )
 
@@ -339,15 +363,29 @@ def dedup(
             console.print(f"[yellow]Perceptual hashing skipped: {perc['error']}[/yellow]")
         else:
             console.print(
-                f"Near-duplicate images: [bold]{perc['groups']}[/bold] groups, "
-                f"[yellow]{perc['duplicates']}[/yellow] redundant files"
+                f"Similar-image candidates: [bold]{perc['groups']}[/bold] groups, "
+                f"[yellow]{perc['duplicates']}[/yellow] keeper-relative candidates"
             )
+            _print_duplicate_coverage("Perceptual", perc)
+
+    text_matches = find_text_near_duplicates()
+    console.print(
+        f"Similar-text candidates: [bold]{text_matches['groups']}[/bold] groups, "
+        f"[yellow]{text_matches['duplicates']}[/yellow] keeper-relative candidates"
+    )
+    _print_duplicate_coverage("Text", text_matches)
+    semantic = find_semantic_duplicates()
+    console.print(
+        f"Semantic candidates: [bold]{semantic['groups']}[/bold] groups, "
+        f"[yellow]{semantic['duplicates']}[/yellow] keeper-relative candidates"
+    )
+    _print_duplicate_coverage("Semantic", semantic)
 
     # Stage 5 — turn detected groups into actionable MARK_DUPLICATE proposals
     prop_counts = generate_dedup_proposals()
     if prop_counts["created"]:
         console.print(
-            f"\n[bold green]Created {prop_counts['created']} MARK_DUPLICATE proposals[/bold green] "
+            f"\n[bold green]Created {prop_counts['created']} duplicate review proposals[/bold green] "
             f"({prop_counts['groups']} groups, {prop_counts['skipped']} already existed, "
             f"{prop_counts['no_keeper']} missing keeper)"
         )
@@ -356,10 +394,14 @@ def dedup(
         console.print("\n[dim]No new duplicate proposals created.[/dim]")
 
     summary = duplicate_summary()
-    if summary:
-        total_wasted = sum(g["wasted_bytes"] for g in summary)
-        mb = total_wasted / 1024 / 1024
-        console.print(f"\n[bold]Estimated reclaimable space: [green]{mb:.1f} MB[/green][/bold]")
+    exact_bytes = sum(g["wasted_bytes"] for g in summary
+                      if getattr(g["type"], "value", g["type"]) == "exact")
+    if exact_bytes:
+        console.print(
+            f"\n[bold]Bytes represented by non-keeper exact copies: "
+            f"[green]{exact_bytes / 1024 / 1024:.1f} MB[/green][/bold] "
+            "[dim](before dependency and individual review)[/dim]"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -401,8 +443,10 @@ def relate(
             console.print(f"Using latest session: [cyan]{session_id}[/cyan]")
 
     def _cb(d: dict) -> None:
+        progress = (f"{d['done']}/{d['total']}" if d.get("total") is not None
+                    else str(d["done"]))
         console.print(
-            f"  [dim]{d['done']}/{d['total']}[/dim]  "
+            f"  [dim]{progress}[/dim]  "
             f"[bold]{d['groups']}[/bold] groups so far "
             f"([green]{d['llm_groups']} LLM[/green] + "
             f"[yellow]{d['backstop_groups']} backstop[/yellow])"
@@ -835,6 +879,32 @@ def stats(
 # ---------------------------------------------------------------------------
 
 @app.command()
+def preflight(
+    root: Annotated[Path, typer.Argument(help="Collection directory to size without reading file contents.")],
+    mode: Annotated[str, typer.Option("--mode", help="full|representative|metadata_only")] = "full",
+    sequence_sample_stride: Annotated[int, typer.Option("--sequence-sample-stride", help="For representative mode, analyze every Nth confirmed numbered visual frame.")] = 10,
+    model_seconds_per_file: Annotated[float, typer.Option("--model-seconds-per-file", help="Measured baseline seconds per AI call; default 5.")] = 5.0,
+):
+    """Estimate collection time and disk needs from file metadata only."""
+    import json
+    from donedatahoarder.core.preflight import estimate_collection
+
+    try:
+        result = estimate_collection(
+            root, mode=mode, sequence_sample_stride=sequence_sample_stride,
+            model_seconds_per_file=model_seconds_per_file,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2)
+    console.print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# pipeline (run all steps in sequence)
+# ---------------------------------------------------------------------------
+
+@app.command()
 def pipeline(
     root: Annotated[Path, typer.Argument(help="Directory to process end-to-end.")],
     db: Annotated[str, typer.Option("--db", help="SQLite database path.", envvar="DDH_DB")] = "donedatahoarder.db",
@@ -843,6 +913,8 @@ def pipeline(
     model: Annotated[str, typer.Option("--model", help="Model name.", envvar="DDH_MODEL")] = "gemma3:12b",
     workers: Annotated[int, typer.Option("--workers", "-w")] = 1,
     skip_analyze: Annotated[bool, typer.Option("--skip-analyze")] = False,
+    sequence_sample_stride: Annotated[int, typer.Option("--sequence-sample-stride", help="Analyze every Nth numbered image frame; 0 analyzes all.")] = 0,
+    use_cache: Annotated[bool, typer.Option("--cache/--no-cache")] = True,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = True,
 ):
     """
@@ -892,12 +964,19 @@ def pipeline(
 
     # dedup
     from donedatahoarder.core.dedup import (
-        find_exact_duplicates, find_perceptual_duplicates, generate_dedup_proposals,
+        find_exact_duplicates, find_perceptual_duplicates,
+        find_text_near_duplicates, find_semantic_duplicates,
+        generate_dedup_proposals,
     )
     console.print("\n[bold yellow]Step 3/5: Deduplicating…[/bold yellow]")
-    find_exact_duplicates(session_id=session_id)
-    find_perceptual_duplicates(session_id=session_id)
-    generate_dedup_proposals(session_id=session_id)
+    exact = find_exact_duplicates(session_id=session_id)
+    perceptual = find_perceptual_duplicates(session_id=session_id)
+    text_matches = find_text_near_duplicates(session_id=session_id)
+    console.print(f"Exact duplicate groups: {exact['groups']}; "
+                  f"similar-image candidates: {perceptual.get('groups', 0)}; "
+                  f"similar-text candidates: {text_matches['groups']}")
+    _print_duplicate_coverage("Perceptual", perceptual)
+    _print_duplicate_coverage("Text", text_matches)
 
     # analyze
     if not skip_analyze:
@@ -905,11 +984,26 @@ def pipeline(
         try:
             _init_ai(backend, ollama_host, model)
             from donedatahoarder.analyzers.pipeline import analyze as do_analyze
-            do_analyze(workers=workers, session_id=session_id)
+            analysis = do_analyze(workers=workers, session_id=session_id,
+                                  sequence_sample_stride=sequence_sample_stride,
+                                  use_cache=use_cache)
+            console.print(
+                f"Analysis: {analysis.get('analyzed', 0)} fresh, "
+                f"{analysis.get('cached', 0)} cached, "
+                f"{analysis.get('sampled', 0)} sampled, "
+                f"{analysis.get('skipped', 0)} skipped, "
+                f"{analysis.get('errors', 0)} errors"
+            )
         except RuntimeError as exc:
             console.print(f"[yellow]AI analysis skipped: {exc}[/yellow]")
     else:
         console.print("\n[dim]Step 4/5: AI analysis skipped (--skip-analyze)[/dim]")
+
+    semantic = find_semantic_duplicates(session_id=session_id)
+    console.print(f"Semantic similarity candidates: {semantic['groups']} groups")
+    _print_duplicate_coverage("Semantic", semantic)
+    proposals = generate_dedup_proposals(session_id=session_id)
+    console.print(f"Duplicate review proposals created: {proposals['created']}")
 
     # propose
     console.print("\n[bold blue]Step 5/5: Generating proposals…[/bold blue]")

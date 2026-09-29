@@ -736,6 +736,8 @@ def plan_execution(
                            ProposalType.MARK_DUPLICATE)
                   and values[prop.id][0] != indexed_paths.get(prop.file_id)):
                 error = "Proposal source no longer matches the indexed file"
+            elif kind == ProposalType.MOVE and Path(source).name != Path(destination).name:
+                error = "MOVE must preserve the current filename; approve RENAME separately"
             elif not occupied(source):
                 error = f"Source not found: {source}"
             elif source != step_destination and occupied(step_destination):

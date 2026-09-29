@@ -9,8 +9,9 @@ import hashlib
 import json
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from starlette.responses import StreamingResponse
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from donedatahoarder.db.models import (
@@ -31,6 +32,69 @@ from .deps import _mark_session_unsaved, _require_session_id, _resolve_model, re
 from .schemas import ExecuteRequest, PipelineRequest, ResumeRunPlanRequest, RunPlanRequest
 
 router = APIRouter()
+
+
+@router.get("/pipeline/analysis/coverage")
+def get_analysis_coverage(session_id: str):
+    """Summarize persisted analysis outcomes without rereading source files."""
+    sid = _require_session_id(session_id)
+    with Session(get_engine()) as db:
+        if db.get(UserSession, sid) is None:
+            raise HTTPException(404, "Session not found")
+        scope = File.session_id == sid
+        statuses = {
+            status.value: count for status, count in
+            db.query(File.status, func.count(File.id)).filter(scope)
+            .group_by(File.status)
+        }
+        outcomes: dict[str, int] = {}
+        for status, outcome, count in (
+            db.query(File.status, File.analysis_outcome, func.count(File.id))
+            .filter(scope).group_by(File.status, File.analysis_outcome)
+        ):
+            if outcome is None:
+                if status == FileStatus.ERROR:
+                    outcome = "failed"
+                elif status == FileStatus.SKIPPED:
+                    outcome = "skipped"
+                elif status in {FileStatus.PENDING, FileStatus.ENRICHED}:
+                    outcome = "unprocessed"
+                else:
+                    outcome = "unknown_provenance"
+            outcomes[outcome] = outcomes.get(outcome, 0) + count
+        skipped = (scope, File.status == FileStatus.SKIPPED,
+                   or_(File.analysis_outcome.is_(None),
+                       File.analysis_outcome == "skipped"))
+        reasons = {
+            reason or "unspecified": count for reason, count in
+            db.query(File.analysis_reason, func.count(File.id))
+            .filter(*skipped).group_by(File.analysis_reason)
+            .order_by(func.count(File.id).desc()).limit(32)
+        }
+        format_rows = (
+            db.query(File.extension, File.analysis_reason, func.count(File.id))
+            .filter(*skipped).group_by(File.extension, File.analysis_reason)
+            .order_by(func.count(File.id).desc()).limit(20).all()
+        )
+    formats = [
+        {"extension": ext or "(none)", "reason": reason or "unspecified",
+         "count": count}
+        for ext, reason, count in format_rows
+    ]
+    skipped_total = outcomes.get("skipped", 0)
+    return {
+        "total_indexed": sum(statuses.values()),
+        "by_status": statuses,
+        "by_outcome": outcomes,
+        "skip_reasons": reasons,
+        "skipped_by_extension": formats,
+        "other_skipped_formats": skipped_total - sum(row["count"] for row in formats),
+        "note": (
+            "Counts cover indexed files only. Skipped means no model analysis; "
+            "unsupported files remain in the index and on disk. Scan exclusions "
+            "are shown by the collection estimate."
+        ),
+    }
 
 
 def _require_worker_exit(job_manager) -> None:
@@ -339,9 +403,10 @@ def list_relations(session_id: str):
         # Prefetch filenames for every file referenced by any member
         all_file_ids = {m.file_id for g in groups for m in g.members}
         filename_by_id: dict[int, str] = {}
-        if all_file_ids:
+        ids = sorted(all_file_ids)
+        for start in range(0, len(ids), 500):
             for fid, fname in session.query(File.id, File.filename).filter(
-                File.id.in_(all_file_ids)
+                File.id.in_(ids[start:start + 500])
             ):
                 filename_by_id[fid] = fname
 
@@ -364,6 +429,31 @@ def list_relations(session_id: str):
                 ],
             })
         return {"session_id": session_id, "groups": out}
+
+
+@router.get("/pipeline/dedup/coverage")
+def latest_dedup_coverage(session_id: str = Query(...)):
+    """Durable similarity-search coverage from the latest dedup job."""
+    sid = _require_session_id(session_id)
+    with Session(get_engine()) as db:
+        job = (db.query(BackgroundJob)
+               .filter(BackgroundJob.session_id == sid,
+                       BackgroundJob.job_type == "dedup",
+                       BackgroundJob.state == "completed")
+               .order_by(BackgroundJob.started_at.desc(), BackgroundJob.id.desc())
+               .first())
+        if job is None:
+            return {"session_id": sid, "job_state": None, "stages": {}}
+        try:
+            progress = json.loads(job.progress_json or "{}")
+        except (ValueError, TypeError):
+            progress = {}
+        stages = {
+            name: progress.get(name, {})
+            for name in ("exact", "perceptual", "semantic", "text_near")
+        }
+        return {"session_id": sid, "job_state": job.state,
+                "job_id": job.id, "stages": stages}
 
 
 @router.post("/pipeline/analyze")
@@ -389,6 +479,8 @@ def trigger_analyze(body: PipelineRequest):
                 model=model,
                 workers=body.workers,
                 retry_errors=body.retry_errors,
+                sequence_sample_stride=body.sequence_sample_stride,
+                use_cache=body.use_cache,
             )
         return {"job_id": job_id, "status": "started"}
     except RuntimeError as exc:
@@ -439,6 +531,8 @@ def create_run_plan(body: RunPlanRequest):
                 "propose_model": _resolve_model(body.propose_model or body.model, sid, "propose"),
                 "workers": max(1, body.workers),
                 "relate_scope": body.relate_scope or owner.relate_scope or "per_directory",
+                "sequence_sample_stride": body.sequence_sample_stride,
+                "use_cache": body.use_cache,
             }
         try:
             plan_id = job_manager.create_run_plan(sid, body.steps, options)
@@ -523,6 +617,39 @@ def analysis_errors(session_id: str):
             reasons[reason] = reasons.get(reason, 0) + 1
         retryable = sum(count for reason, count in reasons.items() if reason.startswith("provider_"))
     return {"total": len(failures), "retryable": retryable, "reasons": reasons}
+
+
+@router.get("/pipeline/preflight")
+def collection_preflight(session_id: str, mode: str = "full",
+                         sequence_sample_stride: int = 0,
+                         skip_dirs: list[str] = Query(default=[])):
+    """Read-only estimate for the currently selected collection root."""
+    from donedatahoarder.core.preflight import estimate_collection
+
+    sid = _require_session_id(session_id)
+    if mode not in {"full", "representative", "metadata_only"}:
+        raise HTTPException(400, "Unknown preflight mode")
+    if not 0 <= sequence_sample_stride <= 1000:
+        raise HTTPException(400, "Sequence sample stride must be 0–1000")
+    if mode == "representative" and sequence_sample_stride < 2:
+        raise HTTPException(400, "Representative mode requires a stride of at least 2")
+    with Session(get_engine()) as db:
+        owner = db.get(UserSession, sid)
+        if owner is None or not owner.root_path:
+            raise HTTPException(404, "Choose a session folder first")
+        root = Path(owner.root_path).resolve()
+    if not root.is_dir():
+        raise HTTPException(404, "Session folder is unavailable")
+    try:
+        return estimate_collection(root, mode=mode,
+                                   sequence_sample_stride=sequence_sample_stride,
+                                   extra_skip_dirs=set(skip_dirs))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(403, f"Cannot read selected folder: {exc}") from exc
+    except OSError as exc:
+        raise HTTPException(503, f"Cannot estimate selected folder: {exc}") from exc
 
 @router.get("/pipeline/jobs/active")
 def get_active_job():
@@ -883,3 +1010,61 @@ def get_organize_trees(session_id: str):
         raise
     except Exception as exc:
         raise HTTPException(500, f"Tree build failed: {str(exc)}")
+
+
+@router.get("/pipeline/organize/coverage")
+def get_organize_coverage(session_id: str):
+    """Partition indexed files into preserved, proposed, ordered and review."""
+    from collections import defaultdict
+    from donedatahoarder.core.dependency_protection import cached_protection_index
+    from donedatahoarder.proposals.organizer.core import (
+        _inside_project, _loose_source, _project_roots,
+    )
+    from donedatahoarder.proposals.organizer.tree import _file_category
+
+    sid = _require_session_id(session_id)
+    with Session(get_engine()) as db:
+        owner = db.get(UserSession, sid)
+        if owner is None or not owner.root_path:
+            raise HTTPException(404, "Session folder unavailable")
+        root = Path(owner.root_path).resolve()
+        if not root.is_dir():
+            raise HTTPException(404, "Session folder unavailable")
+        protection = cached_protection_index(root)
+        query = db.query(File).filter(File.session_id == sid)
+        project_roots = _project_roots(root, query.yield_per(1000), protection)
+        categories: dict[Path, set[str]] = defaultdict(set)
+        for file_rec in query.yield_per(1000):
+            categories[Path(file_rec.path).parent].add(
+                _file_category(file_rec.mime_type, file_rec.extension)
+            )
+        move_ids = {
+            file_id for file_id, destination in
+            db.query(Proposal.file_id, Proposal.proposed_value)
+            .join(File, File.id == Proposal.file_id)
+            .filter(File.session_id == sid, Proposal.proposal_type == ProposalType.MOVE,
+                    Proposal.status.in_([ProposalStatus.PENDING, ProposalStatus.MODIFIED,
+                                         ProposalStatus.APPROVED, ProposalStatus.APPLIED]))
+            if destination and Path(destination).is_relative_to(root / "Independent_Files")
+        }
+        counts = {"project_preserved": 0, "independent_proposed": 0,
+                  "already_ordered": 0, "needs_review": 0, "total_indexed": 0}
+        for file_rec in query.yield_per(1000):
+            source = Path(file_rec.path)
+            counts["total_indexed"] += 1
+            if _inside_project(source, project_roots):
+                counts["project_preserved"] += 1
+            elif file_rec.id in move_ids:
+                counts["independent_proposed"] += 1
+            elif source.is_relative_to(root / "Independent_Files") or (
+                source.parent != root and not _loose_source(
+                    file_rec, root, categories, project_roots
+                )
+            ):
+                counts["already_ordered"] += 1
+            else:
+                counts["needs_review"] += 1
+    return {**counts, "note": (
+        "Existing-folder retention is structural, not a verification of subject or date. "
+        "Proposed moves require review, preview and commit; preserved projects remain in place."
+    )}

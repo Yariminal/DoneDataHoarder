@@ -1,6 +1,9 @@
 """Bounded Ollama requests used by the relation grouping step."""
 
 import json
+import importlib
+from pathlib import Path
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -11,9 +14,11 @@ from donedatahoarder.ai import ollama_client
 from donedatahoarder.ai.json_utils import extract_json
 from donedatahoarder.ai.ollama_client import OllamaClient
 from donedatahoarder.core.relate import (
-    _call_llm_for_group, _llm_cross_script_cluster, _numbered_frame_groups, relate,
+    _call_llm_for_group, _link_singletons_to_folder_groups,
+    _llm_cross_script_cluster, _numbered_frame_groups, relate,
 )
-from donedatahoarder.db.models import Base, File, FileStatus, RelationGroup, UserSession
+from donedatahoarder.db.models import Base, File, FileStatus, RelationGroup, RelationMember, UserSession
+from donedatahoarder.db.session import init_db
 
 
 def _files(count):
@@ -190,6 +195,7 @@ def test_relate_persists_one_group_for_503_frames_without_chunking_them(monkeypa
     engine = create_engine(f"sqlite:///{tmp_path / 'frames.db'}")
     Base.metadata.create_all(engine)
     monkeypatch.setattr("donedatahoarder.core.relate.get_engine", lambda: engine)
+    monkeypatch.setattr("donedatahoarder.db.session.get_engine", lambda: engine)
     with Session(engine) as db:
         user = UserSession(root_path=str(tmp_path))
         db.add(user)
@@ -216,6 +222,187 @@ def test_relate_persists_one_group_for_503_frames_without_chunking_them(monkeypa
         group = db.query(RelationGroup).filter_by(session_id=session_id).one()
         assert len(group.members) == 503
         assert group.reason.startswith("Numbered image sequence")
+
+
+def test_unsupported_shx_stays_indexed_and_in_structural_companions_but_not_llm(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'shx.db'}")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr("donedatahoarder.core.relate.get_engine", lambda: engine)
+    monkeypatch.setattr("donedatahoarder.db.session.get_engine", lambda: engine)
+    with Session(engine) as db:
+        owner = UserSession(root_path=str(tmp_path))
+        db.add(owner)
+        db.flush()
+        sid = owner.id
+        for name, status, outcome, reason in (
+            ("101.shx", FileStatus.SKIPPED, "skipped", "unsupported_type"),
+            ("101.dwg", FileStatus.SKIPPED, "skipped", "unsupported_type"),
+            ("101.bak", FileStatus.SKIPPED, "skipped", "unsupported_type"),
+            ("notes.docx", FileStatus.ANALYZED, "content_verified", None),
+            ("plan.pdf", FileStatus.ANALYZED, "content_verified", None),
+        ):
+            db.add(File(session_id=sid, path=str(tmp_path / name), filename=name,
+                        extension=Path(name).suffix, status=status,
+                        analysis_outcome=outcome, analysis_reason=reason))
+        db.commit()
+
+    prompts = []
+    events = []
+
+    class Client:
+        def generate_json(self, prompt, **_kwargs):
+            prompts.append(prompt)
+            return []
+
+    summary = relate(sid, client=Client(), progress_cb=events.append)
+    assert len(prompts) == 1
+    assert "101.shx" not in prompts[0]
+    assert "101.dwg" in prompts[0] and "101.bak" in prompts[0]
+    assert summary["backstop_groups"] == 1
+    assert any(event["phase"] == "grouping" and event["chunk_done"] == 1
+               and event["total"] is None and event["updated_utc"] for event in events)
+    assert events[-1]["phase"] == "finalizing"
+    assert any(event["phase"] == "directory_complete" for event in events)
+    with Session(engine) as db:
+        shx = db.query(File).filter_by(filename="101.shx").one()
+        assert shx.status == FileStatus.SKIPPED
+        assert shx.analysis_reason == "unsupported_type"
+        group = db.query(RelationGroup).one()
+        member_ids = {member.file_id for member in group.members}
+        assert {row.filename for row in db.query(File).filter(File.id.in_(member_ids))} == {
+            "101.shx", "101.dwg", "101.bak",
+        }
+
+
+def test_relate_emits_each_model_chunk_and_omits_unsupported_shx_from_cross_script(
+        monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'chunks.db'}")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr("donedatahoarder.core.relate.get_engine", lambda: engine)
+    monkeypatch.setattr("donedatahoarder.db.session.get_engine", lambda: engine)
+    with Session(engine) as db:
+        owner = UserSession(root_path=str(tmp_path))
+        db.add(owner)
+        db.flush()
+        sid = owner.id
+        for number in range(202):
+            name = f"note_{number:03}.txt"
+            db.add(File(session_id=sid, path=str(tmp_path / name), filename=name,
+                        extension=".txt", status=FileStatus.ANALYZED,
+                        analysis_outcome="content_verified"))
+        for number in range(6):
+            name = f"font_{number:03}.shx"
+            db.add(File(session_id=sid, path=str(tmp_path / name), filename=name,
+                        extension=".shx", status=FileStatus.SKIPPED,
+                        analysis_outcome="skipped", analysis_reason="unsupported_type"))
+        db.commit()
+
+    group_prompts = []
+    cross_prompts = []
+    events = []
+
+    class Client:
+        def generate_json(self, prompt, **_kwargs):
+            group_prompts.append(prompt)
+            return []
+
+        def generate(self, prompt, **_kwargs):
+            cross_prompts.append(prompt)
+            return "[]"
+
+    relate(sid, client=Client(), progress_cb=events.append)
+    grouping = [event for event in events if event["phase"] == "grouping"]
+    assert [(event["chunk_done"], event["chunk_active"]) for event in grouping] == [
+        (0, 1), (1, None), (1, 2), (2, None), (2, 3), (3, None),
+    ]
+    assert all(event["chunk_total"] == 3 and event["done"] == 0 for event in grouping)
+    assert len(group_prompts) == 3
+    assert cross_prompts
+    assert all(".shx" not in prompt for prompt in group_prompts + cross_prompts)
+
+
+def test_relate_heartbeat_preserves_last_measured_progress(monkeypatch):
+    module = importlib.import_module("donedatahoarder.core.relate")
+    release = Event()
+
+    def fake_relate(*, progress_cb, **_kwargs):
+        progress_cb({"phase": "grouping", "done": 2, "directories": 3,
+                     "directory_index": 3, "chunk_done": 0, "chunk_active": 1,
+                     "chunk_total": 2, "groups": 4,
+                     "updated_utc": "2026-01-01T00:00:00+00:00"})
+        assert release.wait(5)
+        progress_cb({"phase": "directory_complete", "done": 3,
+                     "directories": 3, "groups": 5,
+                     "updated_utc": "2026-01-01T00:00:03+00:00"})
+        return {"directories": 3, "groups": 5}
+
+    monkeypatch.setattr(module, "relate", fake_relate)
+    monkeypatch.setattr("donedatahoarder.ai.router.get_client", lambda: None)
+    progress = module.relate_with_progress("fixture-session")
+    try:
+        assert next(progress)["phase"] == "starting"
+        measured = next(progress)
+        assert measured["directories_done"] == 2
+        assert measured["chunk_active"] == 1
+        heartbeat = next(progress)
+        assert heartbeat["heartbeat"] is True
+        assert heartbeat["directories_done"] == 2
+        assert heartbeat["groups"] == 4
+        assert heartbeat["updated_utc"] == measured["updated_utc"]
+        assert heartbeat["heartbeat_utc"] != measured["updated_utc"]
+        release.set()
+        complete = next(progress)
+        assert complete["phase"] == "directory_complete"
+        assert complete["directories_done"] == 3
+        terminal = next(progress)
+        assert terminal["done"] is True
+        assert terminal["directories_done"] == 3
+        assert terminal["groups"] == 5
+    finally:
+        release.set()
+        progress.close()
+
+
+def test_closing_relate_generator_waits_for_blocked_writer(monkeypatch):
+    module = importlib.import_module("donedatahoarder.core.relate")
+    from donedatahoarder.core.jobs import job_manager
+
+    release = Event()
+    closing_started = Event()
+    closed = Event()
+    post_model_write = Event()
+
+    def fake_relate(*, progress_cb, **_kwargs):
+        progress_cb({"phase": "grouping", "done": 0, "directories": 1,
+                     "groups": 0, "chunk_active": 1})
+        assert release.wait(5)
+        progress_cb({"phase": "grouping", "done": 0, "directories": 1,
+                     "groups": 0, "chunk_done": 1})
+        post_model_write.set()
+        return {"directories": 1, "groups": 1}
+
+    monkeypatch.setattr(module, "relate", fake_relate)
+    monkeypatch.setattr("donedatahoarder.ai.router.get_client", lambda: None)
+    progress = module.relate_with_progress("fixture-session")
+    assert next(progress)["phase"] == "starting"
+    assert next(progress)["phase"] == "grouping"
+
+    def close_progress():
+        closing_started.set()
+        progress.close()
+        closed.set()
+
+    closer = Thread(target=close_progress, daemon=True)
+    try:
+        closer.start()
+        assert closing_started.wait(1)
+        assert not closed.wait(0.1)
+        assert job_manager.has_live_workers()
+    finally:
+        release.set()
+        closer.join(timeout=5)
+    assert closed.is_set()
+    assert not post_model_write.is_set()
 
 
 def test_relate_rejects_content_identity_claim_without_matching_hashes():
@@ -249,3 +436,74 @@ def test_cross_script_rejects_generic_numeric_names_across_formats():
                                 "filenames": [file.filename for file in files]}])
 
     assert _llm_cross_script_cluster(Client(), files) == []
+
+
+def test_singleton_linkage_uses_bounded_indexes_and_earliest_match(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'singletons.db'}")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        user = UserSession(root_path=str(tmp_path))
+        db.add(user)
+        db.flush()
+        groups = [RelationGroup(session_id=user.id, label=label, confidence=0.8,
+                                dir_path=str(tmp_path))
+                  for label in ("drawing_1080p", "project_archive", "project_108", "fonts_archive")]
+        db.add_all(groups)
+        db.flush()
+        files = [File(session_id=user.id, path=str(tmp_path / name), filename=name,
+                      status=FileStatus.ENRICHED)
+                 for name in ("108_project_notes.txt", "108_random_notes.txt",
+                              "font_notes.txt", "109_misc.txt")]
+        db.add_all(files)
+        db.commit()
+
+        assert _link_singletons_to_folder_groups(db, user.id) == 3
+        assignments = dict(db.query(File.filename, RelationMember.group_id)
+                           .join(RelationMember, RelationMember.file_id == File.id).all())
+        assert assignments == {
+            "108_project_notes.txt": groups[1].id,  # first alpha match wins
+            "108_random_notes.txt": groups[2].id,   # not drawing_1080p
+            "font_notes.txt": groups[3].id,          # fonts -> font
+        }
+
+
+def test_relate_keeps_frame_companions_in_their_own_directories_on_rerun(tmp_path):
+    engine = init_db(tmp_path / "relation.db")
+    with Session(engine) as db:
+        user = UserSession(root_path=str(tmp_path))
+        db.add(user)
+        db.flush()
+        session_id = user.id
+        for directory in ("project_A", "project_B"):
+            parent = tmp_path / directory
+            db.add_all([
+                File(session_id=session_id, path=str(parent / f"{number:05}.jpg"),
+                     filename=f"{number:05}.jpg", extension=".jpg",
+                     status=FileStatus.ENRICHED)
+                for number in range(28, 36)
+            ])
+            db.add(File(session_id=session_id, path=str(parent / "frame_notes.txt"),
+                        filename="frame_notes.txt", extension=".txt",
+                        status=FileStatus.ENRICHED))
+        db.commit()
+
+    class EmptyClient:
+        def generate_json(self, *_args, **_kwargs):
+            return []
+
+        def generate(self, *_args, **_kwargs):
+            return "[]"
+
+    for _ in range(2):
+        summary = relate(session_id, client=EmptyClient())
+        assert summary == {"directories": 2, "groups": 2, "members": 18,
+                           "llm_groups": 0, "backstop_groups": 2}
+        with Session(engine) as db:
+            companions = (db.query(File.path, RelationGroup.dir_path)
+                          .join(RelationMember, RelationMember.file_id == File.id)
+                          .join(RelationGroup, RelationGroup.id == RelationMember.group_id)
+                          .filter(File.session_id == session_id,
+                                  File.filename == "frame_notes.txt").all())
+            assert len(companions) == 2
+            assert all(str(Path(path).parent) == group_dir
+                       for path, group_dir in companions)

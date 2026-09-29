@@ -16,8 +16,8 @@ You are a file analysis assistant helping to organize a personal archive.
 Your job is to analyze files and return structured metadata to help rename and categorize them.
 Be concise, factual, and consistent. Always respond in valid JSON.
 """
-PROMPT_VERSION = "analysis-v2-2026-09-27"
-EXTRACTOR_VERSION = "extractors-v2-2026-09-27"
+PROMPT_VERSION = "analysis-v3-2026-09-28"
+EXTRACTOR_VERSION = "extractors-v4-2026-09-28"
 
 # Tags the LLM commonly emits that carry no information for organisation.
 # Lower-cased, with spaces normalised to underscores.
@@ -110,6 +110,7 @@ class AnalysisResult:
         reason: str | None = None,
         content_chars: int | None = None,
         extractor: str = "none",
+        model_called: bool = True,
     ):
         self.description = description
         self.tags = tags or []
@@ -124,6 +125,7 @@ class AnalysisResult:
         self.reason = reason
         self.content_chars = content_chars
         self.extractor = extractor
+        self.model_called = model_called
 
     def to_dict(self) -> dict:
         return {
@@ -206,6 +208,7 @@ class BaseAnalyzer(ABC):
             # descriptions backed by actual content.
             description = result.description or ""
             confidence = result.confidence
+            did_infer = result.model_called and result.outcome != "skipped"
             if not result.content_available and result.outcome != "skipped" and description:
                 if not description.startswith(AnalysisResult.UNVERIFIED_PREFIX):
                     description = AnalysisResult.UNVERIFIED_PREFIX + description
@@ -218,13 +221,14 @@ class BaseAnalyzer(ABC):
             folder_name = _Path(f.path).parent.name if f.path else None
             cleaned_tags = _clean_tags(result.tags, f.filename, folder_name)
             f.ai_tags = json.dumps(cleaned_tags)
-            f.ai_confidence = confidence
-            did_infer = result.outcome != "skipped"
+            f.ai_confidence = confidence if did_infer else None
             f.ai_model = model_name if did_infer else None
             f.analysis_model_tag = model_name if did_infer else None
             f.analysis_model_digest = model_digest if did_infer else None
             f.analysis_prompt_version = PROMPT_VERSION if did_infer else None
-            f.analysis_extractor_version = f"{result.extractor}/{EXTRACTOR_VERSION}"
+            version_for = getattr(self, "extractor_version_for", None)
+            extractor_version = version_for(f) if version_for else EXTRACTOR_VERSION
+            f.analysis_extractor_version = f"{result.extractor}/{extractor_version}"
             f.analysis_evidence_source = result.evidence_source
             f.analysis_outcome = result.outcome or (
                 "content_verified" if result.content_available
@@ -234,10 +238,12 @@ class BaseAnalyzer(ABC):
             )
             f.analysis_reason = result.reason
             f.analysis_content_chars = result.content_chars
+            f.analysis_detected_date = result.detected_date if did_infer else None
+            f.analysis_cache_hit = False
             f.ai_transcript = result.transcript or None
             # AI-detected dates are hints only — never overwrite real EXIF dates,
             # and only use as date_best if no real filesystem date exists either.
-            if result.detected_date and not f.date_exif and not f.date_best:
+            if did_infer and result.detected_date and not f.date_exif and not f.date_best:
                 f.date_best = result.detected_date
                 # Do NOT set date_exif — that column is reserved for real EXIF metadata
             f.status = FileStatus.SKIPPED if result.outcome == "skipped" else FileStatus.ANALYZED

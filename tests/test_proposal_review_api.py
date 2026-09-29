@@ -1,10 +1,13 @@
 """Review decisions and commit previews stay inside the selected session."""
 
 from pathlib import Path
+from datetime import datetime
 import hashlib
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from threading import Event, Thread
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -59,6 +62,82 @@ def _status(proposal_id: int) -> ProposalStatus:
         return db.get(Proposal, proposal_id).status
 
 
+def test_dashboard_pending_review_counts_are_scoped_and_bounded(review_db):
+    client, (one, two), (root_one, root_two) = review_db
+    _proposal(one, root_one, "rename.txt", proposal_type=ProposalType.RENAME)
+    _proposal(one, root_one, "move.txt", proposal_type=ProposalType.MOVE)
+    _proposal(one, root_one, "done.txt", status=ProposalStatus.APPROVED,
+              proposal_type=ProposalType.RENAME)
+    _proposal(two, root_two, "other.txt", proposal_type=ProposalType.MARK_DUPLICATE)
+
+    first = client.get(f"/api/stats?session_id={one}")
+    assert first.status_code == 200
+    assert first.json()["proposal_counts"] == {"pending": 2, "approved": 1}
+    assert first.json()["pending_by_type"] == {"rename": 1, "move": 1}
+    second = client.get(f"/api/stats?session_id={two}")
+    assert second.json()["pending_by_type"] == {"mark_duplicate": 1}
+    assert client.get("/api/stats").json()["pending_by_type"] == {
+        "rename": 1, "move": 1, "mark_duplicate": 1,
+    }
+
+
+def test_saved_results_require_explicit_session_owner(review_db, tmp_path, monkeypatch):
+    from donedatahoarder.web import results_manager
+
+    monkeypatch.setattr(results_manager, "RESULTS_DIR", tmp_path / "saved-results")
+    client, (one, two), (root_one, root_two) = review_db
+    first = _proposal(one, root_one, "first.txt")
+    _proposal(two, root_two, "second.txt")
+    with Session(get_engine()) as db:
+        file_id = db.get(Proposal, first).file_id
+        group = DuplicateGroup(session_id=one, dupe_type=DupeType.EXACT,
+                               group_hash="snapshot-group", keep_file_id=file_id)
+        db.add(group)
+        db.flush()
+        db.add(DuplicateMember(group_id=group.id, file_id=file_id))
+        db.commit()
+
+    assert client.post("/api/results/save/files").status_code == 422
+    for kind in ("files", "proposals", "duplicates"):
+        saved = client.post(f"/api/results/save/{kind}", params={"session_id": one, "name": "review"})
+        assert saved.status_code == 200, saved.text
+        filename = saved.json()["filename"]
+        own = client.get(f"/api/results/load/{filename}",
+                         params={"session_id": one, "result_type": kind})
+        assert own.status_code == 200
+        assert own.json()["session_id"] == one
+        assert len(own.json()["data"]["items"]) == 1
+        assert client.get(f"/api/results/load/{filename}",
+                          params={"session_id": two, "result_type": kind}).status_code == 404
+        assert client.get(f"/api/results/load/{filename}",
+                          params={"session_id": one, "result_type": "files" if kind != "files" else "proposals"}).status_code == 404
+        listed = client.get("/api/results/list", params={"session_id": one, "result_type": kind})
+        assert [item["filename"] for item in listed.json()] == [filename]
+        assert client.get("/api/results/list", params={"session_id": two, "result_type": kind}).json() == []
+
+    legacy = results_manager.RESULTS_DIR / "legacy.json"
+    legacy.write_text(json.dumps({"type": "files", "saved_at": "old", "data": {"items": []}}),
+                      encoding="utf-8")
+    assert client.get("/api/results/load/legacy.json",
+                      params={"session_id": one, "result_type": "files"}).status_code == 409
+    assert "legacy.json" not in [row["filename"] for row in client.get(
+        "/api/results/list", params={"session_id": one, "result_type": "files"}).json()]
+
+    def bounded_groups(page, per_page, session_id):
+        assert (page, per_page, session_id) == (1, 100, one)
+        return {"items": [{"id": number} for number in range(100)], "total": 125}
+
+    monkeypatch.setattr("donedatahoarder.web.api.results.list_duplicates", bounded_groups)
+    capped = client.post("/api/results/save/duplicates",
+                         params={"session_id": one, "name": "capped"})
+    assert capped.status_code == 200
+    assert "100 of 125" in capped.json()["message"]
+    retained = client.get(f"/api/results/load/{capped.json()['filename']}",
+                          params={"session_id": one, "result_type": "duplicates"}).json()
+    assert len(retained["data"]["items"]) == 100
+    assert retained["data"]["total"] == 125
+
+
 def test_bulk_review_only_changes_selected_session(review_db):
     client, (one, two), (root_one, root_two) = review_db
     first = _proposal(one, root_one, "first.txt")
@@ -95,6 +174,31 @@ def test_bulk_rename_requires_verified_content_but_allows_individual_review(revi
     assert _status(proposal_id) == ProposalStatus.PENDING
     assert client.post(f"/api/proposals/{proposal_id}/approve", json={"session_id": sid}).status_code == 200
     assert _status(proposal_id) == ProposalStatus.APPROVED
+
+
+def test_proposal_date_labels_distinguish_source_and_legacy_dates(review_db):
+    client, (sid, _), (root, _) = review_db
+    cases = [
+        ("report.docx", "2018-01-17_policy_report.docx", None,
+         datetime(2018, 1, 17), "Matches filesystem modified date; event date unverified"),
+        ("IMG_1234.jpg", "2020-05-06_family_photo.jpg", datetime(2020, 5, 6),
+         datetime(2026, 9, 28), "Stored photo EXIF metadata; capture date unverified"),
+        ("notes_2021.10.12.docx", "2021-10-12_meeting_notes.docx", None,
+         datetime(2019, 5, 1), "Original filename date identifier; event date unverified"),
+        ("unknown.txt", "2017-02-03_unknown.txt", None,
+         datetime(2019, 5, 1), "Unverified date in proposed name"),
+    ]
+    for source_name, proposed_name, exif, modified, _ in cases:
+        proposal_id = _proposal(sid, root, source_name, destination=str(root / proposed_name))
+        with Session(get_engine()) as db:
+            file = db.get(File, db.get(Proposal, proposal_id).file_id)
+            file.date_exif = exif
+            file.date_modified = modified
+            db.commit()
+    response = client.get(f"/api/proposals?session_id={sid}&per_page=10")
+    assert response.status_code == 200
+    labels = {item["filename"]: item["name_date_source"] for item in response.json()["items"]}
+    assert labels == {source_name: expected for source_name, _, _, _, expected in cases}
 
 
 def test_review_mutations_and_preview_reject_concurrent_writer(review_db):
@@ -205,6 +309,127 @@ def test_cancel_endpoint_reports_cancelling_until_worker_exit(review_db, monkeyp
     assert response.json() == {"status": "cancelling", "job_id": "synthetic-job"}
 
 
+def test_relate_numeric_directory_progress_keeps_job_live(review_db, monkeypatch):
+    from donedatahoarder.core.jobs import JobState, job_manager
+
+    _, (session_id, _), _ = review_db
+    entered = Event()
+    release = Event()
+    second_entered = Event()
+    release_second = Event()
+
+    def fake_relate(*, progress_cb, **_kwargs):
+        progress_cb({"phase": "directory_complete", "done": 1,
+                     "directories": 1, "groups": 1})
+        entered.set()
+        assert release.wait(5)
+        progress_cb({"phase": "directory_complete", "done": 2,
+                     "directories": 2, "groups": 2})
+        second_entered.set()
+        assert release_second.wait(12)
+        return {"directories": 2, "groups": 2}
+
+    monkeypatch.setattr("donedatahoarder.ai.router.init_ai", lambda **_kwargs: None)
+    monkeypatch.setattr("donedatahoarder.ai.router.get_client", lambda: None)
+    monkeypatch.setattr("donedatahoarder.core.relate.relate", fake_relate)
+    job_id = job_manager.start_relate(session_id)
+    try:
+        assert entered.wait(5)
+        deadline = time.monotonic() + 5
+        while job_manager.get_job(job_id).progress.get("directories_done") != 1:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        job = job_manager.get_job(job_id)
+        assert job.progress["done"] == 1
+        assert job.state == JobState.RUNNING
+        assert job_manager.get_active().job_id == job_id
+        assert job_manager.has_live_workers()
+        # A newly attached SSE subscriber must not treat numeric count as terminal.
+        stream = job_manager.subscribe(job_id)
+        assert next(stream)["done"] == 1
+        # Reproduce the valid initial-snapshot/queued-update race explicitly.
+        job.push_progress(job.progress.copy())
+        release.set()
+        assert second_entered.wait(5)
+        deadline = time.monotonic() + 8
+        for _ in range(6):
+            update = next(stream)
+            assert update.get("done") is not True
+            if update.get("done") == 2:
+                break
+            assert update.get("done") == 1 or update.get("heartbeat") is True
+            assert time.monotonic() < deadline
+        else:
+            pytest.fail("SSE stream did not reach the second numeric directory update")
+        assert job_manager.get_job(job_id).state == JobState.RUNNING
+        release_second.set()
+        deadline = time.monotonic() + 8
+        for _ in range(6):
+            update = next(stream)
+            if update.get("done") is True:
+                break
+            assert update.get("done") in (1, 2) or update.get("heartbeat") is True
+            assert time.monotonic() < deadline
+        else:
+            pytest.fail("SSE stream did not reach Boolean completion")
+        stream.close()
+    finally:
+        release.set()
+        release_second.set()
+    deadline = time.monotonic() + 5
+    while job_manager.get_job(job_id).state == JobState.RUNNING:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert job_manager.get_job(job_id).state == JobState.COMPLETED
+    assert job_manager.get_job(job_id).progress["directories_done"] == 2
+
+
+def test_relate_cancel_waits_for_blocked_model_worker(review_db, monkeypatch):
+    from donedatahoarder.core.jobs import JobState, job_manager
+
+    _, (session_id, _), _ = review_db
+    entered = Event()
+    release = Event()
+    after_model = Event()
+
+    def fake_relate(*, progress_cb, **_kwargs):
+        progress_cb({"phase": "grouping", "done": 0, "directories": 1,
+                     "chunk_active": 1, "groups": 0})
+        entered.set()
+        assert release.wait(8)
+        # This callback must abort before any post-model write can occur.
+        progress_cb({"phase": "grouping", "done": 0, "directories": 1,
+                     "chunk_done": 1, "groups": 0})
+        after_model.set()
+        return {"directories": 1, "groups": 1}
+
+    monkeypatch.setattr("donedatahoarder.ai.router.init_ai", lambda **_kwargs: None)
+    monkeypatch.setattr("donedatahoarder.ai.router.get_client", lambda: None)
+    monkeypatch.setattr("donedatahoarder.core.relate.relate", fake_relate)
+    job_id = job_manager.start_relate(session_id)
+    try:
+        assert entered.wait(5)
+        job_manager.force_cancel(job_id)
+        deadline = time.monotonic() + 5
+        while job_manager.get_job(job_id).progress.get("phase") != "cancelling":
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert job_manager.get_job(job_id).progress["heartbeat"] is True
+        assert job_manager.get_job(job_id).state == JobState.CANCELLING
+        assert job_manager.get_active().job_id == job_id
+        assert job_manager.has_live_workers()
+        with pytest.raises(RuntimeError, match="running|worker|lease|live|cancelling"):
+            job_manager._create_job("test", session_id)
+    finally:
+        release.set()
+    deadline = time.monotonic() + 5
+    while job_manager.get_job(job_id).state == JobState.CANCELLING:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert job_manager.get_job(job_id).state == JobState.CANCELLED
+    assert not after_model.is_set()
+
+
 @pytest.mark.parametrize("state", ["paused", "running"])
 def test_session_delete_waits_for_foreign_live_worker_but_allows_other_session(review_db, state):
     from donedatahoarder.core.job_store import process_started_at
@@ -271,7 +496,32 @@ def test_near_duplicate_requires_individual_review_not_bulk(review_db):
     response = client.post("/api/proposals/bulk-approve", json={"session_id": sid})
     assert response.json()["approved"] == 0
     assert response.json()["skipped_near_duplicate"] == 1
-    assert client.post(f"/api/proposals/{victim_id}/approve", json={"session_id": sid}).status_code == 200
+    review = client.get(f"/api/proposals?session_id={sid}").json()["items"][0]
+    evidence = review["duplicate_evidence"]
+    comparison = {
+        "session_id": sid,
+        "expected_duplicate_group_id": evidence["group_id"],
+        "expected_duplicate_type": evidence["type"],
+        "expected_keeper_id": evidence["keeper_id"],
+        "expected_candidate_path": review["file_path"],
+        "expected_keeper_path": evidence["keeper_path"],
+    }
+    assert client.post(f"/api/proposals/{victim_id}/approve", json={"session_id": sid}).status_code == 409
+    assert client.post(f"/api/proposals/{victim_id}/approve", json={
+        **comparison, "expected_keeper_id": -1,
+    }).status_code == 409
+    with Session(get_engine()) as db:
+        other = File(session_id=sid, path=str(root / "other.png"), filename="other.png")
+        db.add(other)
+        db.flush()
+        db.get(DuplicateGroup, evidence["group_id"]).keep_file_id = other.id
+        db.commit()
+    assert client.post(f"/api/proposals/{victim_id}/approve", json=comparison).status_code == 409
+    with Session(get_engine()) as db:
+        db.get(DuplicateGroup, evidence["group_id"]).keep_file_id = evidence["keeper_id"]
+        assert db.get(Proposal, victim_id).status == ProposalStatus.PENDING
+        db.commit()
+    assert client.post(f"/api/proposals/{victim_id}/approve", json=comparison).status_code == 200
     with Session(get_engine()) as db:
         assert db.get(Proposal, victim_id).review_kind == "individual"
     listed = client.get(f"/api/proposals?session_id={sid}&status=approved").json()["items"]

@@ -1,6 +1,9 @@
 """The all-in-one CLI command must keep each collection's work separate."""
 
 from pathlib import Path
+from io import StringIO
+
+from rich.console import Console
 
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
@@ -62,3 +65,25 @@ def test_pipeline_scopes_every_stage_to_its_new_collection(tmp_path, monkeypatch
         assert new_files[0].status in {FileStatus.ENRICHED, FileStatus.PROPOSED}
         assert db.query(Proposal).join(File).filter(File.session_id == new_id).count() >= 1
     assert new_id in result.output
+
+
+def test_cli_marks_bounded_candidate_coverage_without_inventing_a_count(monkeypatch):
+    output = StringIO()
+    monkeypatch.setattr(cli, "console", Console(file=output, width=120,
+                                                force_terminal=False,
+                                                color_system=None))
+    cli._print_duplicate_coverage("Perceptual", {
+        "candidate_coverage": "bounded_incomplete",
+        "candidate_pair_opportunities_deferred": None,
+        "candidate_pair_opportunities_deferred_lower_bound": 1,
+    })
+    cli._print_duplicate_coverage("Text", {
+        "candidate_coverage": "bounded_incomplete",
+        "candidate_pair_opportunities_deferred": 12_345,
+    })
+    cli._print_duplicate_coverage("Semantic", {"candidate_coverage": "complete"})
+    rendered = output.getvalue()
+    assert "exact count unknown" in rendered
+    assert "12,345 pair opportunities deferred" in rendered
+    assert "coverage is incomplete" in rendered
+    assert "Semantic" not in rendered

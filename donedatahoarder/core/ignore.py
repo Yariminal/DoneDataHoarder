@@ -39,6 +39,7 @@ class DdhIgnore:
         """
         self.root = root.resolve()
         self.patterns: list[tuple[str, bool]] = []  # (pattern, is_negation)
+        self.load_error: str | None = None
         self._load_ignore_file()
 
     def _load_ignore_file(self) -> None:
@@ -68,9 +69,10 @@ class DdhIgnore:
                         continue
 
                     self.patterns.append((pattern, is_negation))
-        except (IOError, OSError):
-            # If we can't read the file, just proceed without ignore patterns
-            pass
+        except (IOError, OSError, UnicodeError) as exc:
+            # The scan retains its historical behavior; inventory reporting
+            # must disclose that exclusion decisions may be incomplete.
+            self.load_error = str(exc)
 
     def should_ignore(self, path: Path, is_dir: bool = False) -> bool:
         """

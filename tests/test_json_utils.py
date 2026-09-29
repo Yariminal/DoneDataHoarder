@@ -8,12 +8,14 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from donedatahoarder.ai.json_utils import (
+    LooseDict,
     extract_json,
     generate_json_with_retry,
     validate_json,
     _fix_json_escapes,
     _strip_markdown_fences,
 )
+from donedatahoarder.ai.ollama_client import OllamaClient
 
 
 class DummySchema(BaseModel):
@@ -97,6 +99,48 @@ class TestExtractJson:
     def test_multiple_objects_takes_first(self):
         raw = '{"a":1} {"b":2}'
         assert extract_json(raw) == {"a": 1}
+
+    def test_quoted_braces_and_brackets_do_not_end_outer_object(self):
+        expected = {"text": 'a } ] and an escaped " quote', "tags": ["one"]}
+        assert extract_json("Here is the result: " + json.dumps(expected)) == expected
+
+    @pytest.mark.parametrize("raw", [
+        '{"description", "subject", "tags": ["one", "two"], "confidence":',
+        '[{"description": "subject"}, {"tags": ["one"]}',
+        '{"description": ["one", "two"}',
+        '[{"description": "subject"]}',
+    ])
+    def test_incomplete_or_mismatched_outer_container_never_yields_nested_value(self, raw):
+        with pytest.raises(ValueError):
+            extract_json(raw)
+
+    def test_missing_object_key_colons_are_repaired_without_changing_values(self):
+        raw = (
+            '{"name", "comma, colon: and escaped \\"quote\\"", '
+            '"nested": [{"left", true}, {"right", null}], '
+            '"count": 2}'
+        )
+        assert extract_json(raw) == {
+            "name": 'comma, colon: and escaped "quote"',
+            "nested": [{"left": True}, {"right": None}],
+            "count": 2,
+        }
+
+    @pytest.mark.parametrize("raw", [
+        '{"name", "unfinished", "count":',
+        '{"name", "valid"} {"trailing":',
+        '{"name", "first", "name": "second"}',
+        '{"name", "value", "count": [1,,2]}',
+        '{"name", "value", "count": 2,}',
+        '{"name": "first", "name": "second"}',
+        '{"outer": {"key": 1, "key": 2}}',
+        '{"name", "value", "count": NaN}',
+        '{"name", "bad\\q", "count": 1}',
+        '{"a", 1, "b", 2, "c", 3, "d", 4, "e", 5}',
+    ])
+    def test_recovery_rejects_truncation_duplicates_and_unrelated_syntax(self, raw):
+        with pytest.raises(ValueError):
+            extract_json(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +246,122 @@ class TestGenerateJsonWithRetry:
             response_format={"type": "json_object"},
         )
         assert received.get("response_format") == {"type": "json_object"}
+
+    def test_malformed_vision_json_retries_with_syntax_feedback_and_same_image(self, monkeypatch):
+        monkeypatch.setattr("donedatahoarder.ai.json_utils.time.sleep", lambda _: None)
+        client = OllamaClient(text_model="gemma4:26b", vision_model="gemma4:26b")
+        calls = []
+
+        def fake_vision(prompt, **kwargs):
+            calls.append((prompt, kwargs))
+            if len(calls) == 1:
+                return '{"name" "visible_subject", "count": 1}'
+            return '{"name": "visible_subject", "count": 1}'
+
+        monkeypatch.setattr(client, "generate_with_image", fake_vision)
+        result = client.generate_json(
+            "Describe the attached image in the archive", image_bytes=b"image bytes",
+            model_cls=DummySchema,
+        )
+
+        assert result == {"name": "visible_subject", "count": 1}
+        assert len(calls) == 2
+        assert all("Describe the attached image in the archive" in prompt for prompt, _ in calls)
+        assert "invalid JSON syntax" in calls[1][0]
+        assert "colon after every key" in calls[1][0]
+        assert all(kwargs["image_bytes"] == b"image bytes" for _, kwargs in calls)
+        assert all(kwargs["response_format"] == {"type": "json_object"} for _, kwargs in calls)
+
+    def test_unambiguous_vision_separator_recovers_in_one_call(self, monkeypatch, caplog):
+        client = OllamaClient(text_model="gemma4:26b", vision_model="gemma4:26b")
+        calls = []
+
+        def fake_vision(prompt, **kwargs):
+            calls.append((prompt, kwargs))
+            return '{"name", "visible_subject", "count": 1}'
+
+        monkeypatch.setattr(client, "generate_with_image", fake_vision)
+        with caplog.at_level("INFO", logger="donedatahoarder.ai.json_utils"):
+            result = client.generate_json(
+                "Describe the attached image", image_bytes=b"image bytes",
+                model_cls=DummySchema,
+            )
+
+        assert result == {"name": "visible_subject", "count": 1}
+        assert len(calls) == 1
+        assert calls[0][1]["image_bytes"] == b"image bytes"
+        assert "1 mechanical object-key separator repair(s)" in caplog.text
+
+    def test_repair_never_substitutes_for_schema_validation(self, monkeypatch, caplog):
+        monkeypatch.setattr("donedatahoarder.ai.json_utils.time.sleep", lambda _: None)
+        calls = []
+
+        def fake_generate(**kwargs):
+            calls.append(kwargs)
+            return '{"name", "valid", "count": "not an integer"}'
+
+        with caplog.at_level("INFO", logger="donedatahoarder.ai.json_utils"):
+            with pytest.raises(RuntimeError, match="after 3 attempts"):
+                generate_json_with_retry(fake_generate, "original request", DummySchema)
+        assert len(calls) == 3
+        assert "mechanical object-key separator repair" not in caplog.text
+
+    def test_truncated_outer_object_cannot_be_accepted_as_loose_nested_array(self, monkeypatch):
+        monkeypatch.setattr("donedatahoarder.ai.json_utils.time.sleep", lambda _: None)
+        calls = []
+
+        def fake_generate(**kwargs):
+            calls.append(kwargs)
+            return '{"description", "subject", "tags": ["one", "two"], "confidence":'
+
+        with pytest.raises(RuntimeError, match="after 3 attempts"):
+            generate_json_with_retry(fake_generate, "original request", LooseDict)
+        assert len(calls) == 3
+
+    def test_type_validation_retry_reports_field_without_accepting_bad_value(self, monkeypatch):
+        monkeypatch.setattr("donedatahoarder.ai.json_utils.time.sleep", lambda _: None)
+        calls = []
+
+        def fake_generate(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return '{"name": "ok", "count": "not a number"}'
+            return '{"name": "ok", "count": 2}'
+
+        result = generate_json_with_retry(fake_generate, "original request", DummySchema)
+        assert result.count == 2
+        assert len(calls) == 2
+        assert "original request" in calls[1]["prompt"]
+        assert "field count" in calls[1]["prompt"]
+
+    def test_malformed_json_exhaustion_stays_failed(self, monkeypatch):
+        monkeypatch.setattr("donedatahoarder.ai.json_utils.time.sleep", lambda _: None)
+        calls = []
+
+        def fake_generate(**kwargs):
+            calls.append(kwargs)
+            return '{"name" "visible_subject", "count": 1}'
+
+        with pytest.raises(RuntimeError, match="after 3 attempts"):
+            generate_json_with_retry(fake_generate, "original request", DummySchema)
+        assert len(calls) == 3
+
+
+def test_analyzer_output_examples_are_valid_json():
+    from donedatahoarder.analyzers.archive import ARCHIVE_PROMPT
+    from donedatahoarder.analyzers.document import DOC_PROMPT, PDF_VISION_PROMPT
+    from donedatahoarder.analyzers.image import VISION_PROMPT
+    from donedatahoarder.analyzers.threedmodel import THREED_PROMPT
+    from donedatahoarder.analyzers.video import AUDIO_PROMPT, VIDEO_PROMPT
+
+    templates = (VISION_PROMPT, PDF_VISION_PROMPT, DOC_PROMPT,
+                 VIDEO_PROMPT, AUDIO_PROMPT, THREED_PROMPT, ARCHIVE_PROMPT)
+    marker = "object in this shape, replacing the example values:\n"
+    for template in templates:
+        example = template.split(marker, 1)[1].lstrip().replace("{{", "{").replace("}}", "}")
+        parsed, _ = json.JSONDecoder().raw_decode(example)
+        assert isinstance(parsed, dict)
+        assert isinstance(parsed["confidence"], float)
 
 
 # ---------------------------------------------------------------------------

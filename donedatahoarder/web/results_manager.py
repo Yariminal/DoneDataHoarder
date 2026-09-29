@@ -5,6 +5,7 @@ Allows users to manually save result sets from any tab (Files, Proposals, Duplic
 and reload them later for comparison or review without re-running operations.
 """
 import json
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -18,7 +19,8 @@ def init_results_dir() -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def save_results(result_type: str, data: Dict[str, Any], name: Optional[str] = None) -> str:
+def save_results(result_type: str, data: Dict[str, Any], name: Optional[str] = None,
+                 session_id: str = "") -> str:
     """
     Save a result snapshot to disk.
 
@@ -38,12 +40,16 @@ def save_results(result_type: str, data: Dict[str, Any], name: Optional[str] = N
 
     # Sanitize filename
     name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
-    filename = f"{name}.json"
+    if not session_id:
+        raise ValueError("A session is required for saved results")
+    owner_key = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
+    filename = f"{name}_{result_type}_{owner_key}.json"
     filepath = RESULTS_DIR / filename
 
     # Add metadata
     payload = {
         "type": result_type,
+        "session_id": session_id,
         "saved_at": datetime.now().isoformat(),
         "data": data,
     }
@@ -114,6 +120,7 @@ def list_saved_results() -> List[Dict[str, str]]:
             results.append({
                 "filename": filepath.name,
                 "type": payload.get("type", "unknown"),
+                "session_id": payload.get("session_id"),
                 "saved_at": payload.get("saved_at", ""),
             })
         except (json.JSONDecodeError, IOError):

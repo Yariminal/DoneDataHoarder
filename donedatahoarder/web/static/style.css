@@ -64,6 +64,8 @@ a:hover { text-decoration: underline; }
 }
 .app-header h1 { font-size: 1.15rem; font-weight: 700; letter-spacing: -.02em; }
 .app-header h1 span { color: var(--primary); }
+.brand-button { background: none; border: 0; color: var(--text); font: inherit; cursor: pointer; }
+.brand-button span { color: var(--primary); }
 .header-right { display: flex; align-items: center; gap: 14px; }
 .header-right .db-name { color: var(--text-dim); font-size: .82rem; font-family: var(--mono); }
 
@@ -351,6 +353,30 @@ tr:hover td { background: rgba(255,255,255,.02); }
   font-size: .86rem;
 }
 .dupe-file.keeper { border: 1px solid var(--success); }
+
+.preflight-card { max-width: 900px; }
+.preflight-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 12px 0; }
+.preflight-controls > label:first-child { display: grid; gap: 5px; min-width: min(100%, 290px); font-size: .85rem; }
+.preflight-check { display: flex; align-items: center; gap: 7px; min-height: 38px; font-size: .85rem; }
+.preflight-result { border-left: 3px solid var(--primary); padding-left: 12px; min-height: 1.5em; overflow-wrap: anywhere; }
+.coverage-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin: 10px 0; }
+.coverage-grid > div { background: var(--surface-2); border-radius: 6px; padding: 8px 10px; display: grid; }
+.coverage-grid strong { color: var(--primary); font-size: 1.2rem; }
+.coverage-grid span { color: var(--text-dim); font-size: .78rem; }
+.review-note { display: block; padding: 5px 8px; margin-top: 6px; border-left: 3px solid var(--warning); background: var(--surface-2); color: var(--text); font-size: .78rem; line-height: 1.4; }
+.pending-review-links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.duplicate-comparison-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 14px 0; }
+.duplicate-comparison-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+.duplicate-comparison-grid pre { overflow-wrap: anywhere; }
+button:focus-visible, a:focus-visible, summary:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }
+@media (max-width: 600px) {
+  .preflight-controls { display: grid; align-items: stretch; }
+  .preflight-controls > label:first-child { min-width: 0; }
+  .dupe-file { grid-template-columns: 1fr !important; }
+  .duplicate-comparison-grid { grid-template-columns: minmax(0, 1fr); }
+  .duplicate-comparison-actions { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .duplicate-comparison-actions .btn { width: 100%; white-space: normal; }
+}
 .keeper-star { color: var(--success); font-weight: 700; }
 
 /* --- Toast ------------------------------------------------ */
@@ -374,8 +400,15 @@ tr:hover td { background: rgba(255,255,255,.02); }
 
 /* --- Responsive ------------------------------------------- */
 @media (max-width: 768px) {
-  .app-shell { grid-template-columns: 1fr; grid-template-areas: "header" "main"; }
-  .sidebar { display: none; }
+  .app-shell { grid-template-columns: 1fr; grid-template-rows: 56px auto 1fr; grid-template-areas: "header" "sidebar" "main"; }
+  .app-header { padding: 0 12px; }
+  .header-right .db-name { display: none; }
+  .sidebar { display: block; position: sticky; top: 56px; z-index: 40; height: auto; padding: 0; overflow-x: auto; overflow-y: hidden; border-right: 0; border-bottom: 1px solid var(--border); }
+  .sidebar-nav { display: flex; width: max-content; min-width: 100%; }
+  .sidebar-nav li { flex: 0 0 auto; }
+  .sidebar-nav li button { width: auto; padding: 10px 12px; white-space: nowrap; }
+  .sidebar-sep, .sidebar > div:last-child { display: none; }
+  .main-content { padding: 16px 12px; min-width: 0; }
   .cards { grid-template-columns: repeat(2, 1fr); }
 }
 
@@ -391,3 +424,8 @@ tr:hover td { background: rgba(255,255,255,.02); }
 .gap-2 { gap: 16px; }
 .flex { display: flex; }
 .items-center { align-items: center; }
+.coverage-warning {
+  border-left: 4px solid var(--warning);
+  background: var(--warning-bg);
+  line-height: 1.5;
+}

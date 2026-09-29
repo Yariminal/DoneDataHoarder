@@ -1,0 +1,20 @@
+{
+  "description": "Authored mixed-library regression labels, fixed before planner execution; not an independent holdout or population estimate.",
+  "files": [
+    {"path": "Downloads/Project_Nova/scene.obj", "mime": "model/obj", "role": "preserve_project", "expected_move": null, "content": "mtllib scene.mtl\n"},
+    {"path": "Downloads/Project_Nova/scene.mtl", "mime": "text/plain", "role": "preserve_project", "expected_move": null, "content": "newmtl matte\n"},
+    {"path": "Downloads/Project_Nova/renders/hero.png", "mime": "image/png", "role": "preserve_project", "expected_move": null, "content": "synthetic image"},
+    {"path": "Downloads/Client_Folder/brief.pdf", "mime": "application/pdf", "role": "retain_named", "expected_move": null, "content": "synthetic brief"},
+    {"path": "Downloads/Client_Folder/notes.docx", "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "role": "retain_named", "expected_move": null, "content": "synthetic notes"},
+    {"path": "Web_Bundle/index.html", "mime": "text/html", "role": "retain_linked", "expected_move": null, "content": "<link rel=\"stylesheet\" href=\"style.css\"><img src=\"logo.png\">"},
+    {"path": "Web_Bundle/style.css", "mime": "text/css", "role": "retain_linked", "expected_move": null, "content": "body { color: black; }"},
+    {"path": "Web_Bundle/logo.png", "mime": "image/png", "role": "retain_linked", "expected_move": null, "content": "synthetic logo"},
+    {"path": "loose_report.pdf", "mime": "application/pdf", "role": "eligible", "expected_move": "Independent_Files/Documents/loose_report.pdf", "content": "synthetic report"},
+    {"path": "Downloads/meeting_minutes.pdf", "mime": "application/pdf", "role": "eligible", "expected_move": "Independent_Files/Documents/meeting_minutes.pdf", "content": "synthetic minutes"},
+    {"path": "Inbox/invoice_alpha.pdf", "mime": "application/pdf", "role": "eligible", "expected_move": "Independent_Files/Documents/Invoice/invoice_alpha.pdf", "content": "synthetic invoice alpha"},
+    {"path": "Inbox/invoice_beta.pdf", "mime": "application/pdf", "role": "eligible", "expected_move": "Independent_Files/Documents/Invoice/invoice_beta.pdf", "content": "synthetic invoice beta"},
+    {"path": "Inbox/holiday.png", "mime": "image/png", "role": "eligible", "expected_move": "Independent_Files/Images/2024/holiday.png", "exif_date": "2024-05-20T12:00:00", "content": "synthetic holiday image"},
+    {"path": "level-3.10.pdf", "mime": "application/pdf", "role": "eligible", "expected_move": "Independent_Files/Documents/level-3.10.pdf", "modified_date": "2023-02-03T12:00:00", "content": "synthetic drawing note"},
+    {"path": "Inbox/unknown.bin", "mime": "application/octet-stream", "role": "needs_review", "expected_move": null, "content": "synthetic unknown"}
+  ]
+}

@@ -21,6 +21,10 @@ MEDIA_EXTENSIONS = {
     ".webp", ".heic", ".heif", ".mp4", ".mov", ".avi", ".mkv",
     ".wmv", ".m4v", ".3gp", ".mp3", ".m4a", ".flac", ".wav",
 }
+PHOTO_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif",
+    ".webp", ".heic", ".heif",
+}
 DOC_EXTENSIONS = {
     ".pdf", ".docx", ".doc", ".odt", ".xlsx", ".xls",
     ".pptx", ".ppt", ".txt", ".md", ".rtf",
@@ -322,24 +326,41 @@ def _month_prefix(dt: Optional[datetime]) -> str:
     return dt.strftime("%Y-%m")
 
 
+_SOURCE_DATE_RE = re.compile(r"(?<!\d)(?:19|20)\d{2}[-_.]\d{1,2}[-_.]\d{1,2}(?!\d)")
+
+
+def _source_filename_date(stem: str) -> str | None:
+    """Retain a valid full date already present in the filename as identity."""
+    for match in _SOURCE_DATE_RE.finditer(stem):
+        try:
+            parsed = datetime.strptime(re.sub(r"[_.]", "-", match.group()), "%Y-%m-%d")
+        except ValueError:
+            continue
+        return parsed.strftime("%Y-%m-%d")
+    return None
+
+
 def _is_meaningful_date(file_rec) -> bool:
+    """Only stored photo EXIF metadata supports an automatic date prefix.
+
+    A copied file can retain an old mtime and receive a new birthtime. Their
+    difference says nothing about a document's event or creation date.
     """
-    Check if the file has a meaningful date (EXIF, or filesystem date that
-    isn't just the scan/extract timestamp).
-    """
-    # EXIF date is always meaningful
-    if file_rec.date_exif:
-        return True
-    # If date_modified is within 48h of date_created, it was likely
-    # mass-copied/extracted — the date is noise, not signal.
-    if file_rec.date_modified and file_rec.date_created:
-        delta = abs((file_rec.date_modified - file_rec.date_created).total_seconds())
-        if delta < 60:  # modified and created within 1 minute = freshly extracted
-            return False
-    # If we have a modified date that's at least different from created, it's meaningful
-    if file_rec.date_modified:
-        return True
-    return False
+    date = getattr(file_rec, "date_exif", None)
+    extension = Path(file_rec.path).suffix.casefold()
+    return isinstance(date, datetime) and extension in PHOTO_EXTENSIONS and 1970 <= date.year <= 2100
+
+
+def _name_date_provenance(file_rec, proposed_stem: str) -> str:
+    """Explain a date token without asserting that it is an event date."""
+    original_date = _source_filename_date(Path(file_rec.path).stem)
+    if original_date and original_date in proposed_stem:
+        return " Date identifier retained from original filename; event date unverified."
+    if _is_meaningful_date(file_rec):
+        capture_date = _date_prefix(file_rec.date_exif)
+        if capture_date in proposed_stem:
+            return " Photo date prefix from stored EXIF metadata; capture date unverified."
+    return ""
 
 
 def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str]:
@@ -419,7 +440,14 @@ def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str
     # Try AI's suggested_name first — it's the most specific and preserves proper nouns
     # (e.g. "liberman_house_final_submission", "greece_partnership_agreement")
     if file_rec.ai_suggested_name:
-        stem_from_desc = _safe(file_rec.ai_suggested_name)
+        # A single render can support the subject without establishing a
+        # precise silhouette. Drop speculative single-letter geometry while
+        # retaining useful color/material/object words.
+        suggestion = re.sub(
+            r"(?i)(?:^|[\s_-])(?:l|u|v|t|s|c|z)[\s_-]?shap(?:e|ed)(?=$|[\s_-])",
+            " ", file_rec.ai_suggested_name,
+        )
+        stem_from_desc = _safe(suggestion)
 
     # Fallback: try tags (more specific than a free-text description)
     if not stem_from_desc and tags_str:
@@ -441,7 +469,8 @@ def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str
                     return True
                 return False
 
-            specific_tags = [t.lower().replace(" ", "_") for t in tags if not _is_generic(t)]
+            specific_tags = [t.lower().replace(" ", "_") for t in tags if not _is_generic(t)
+                             and not re.fullmatch(r"[luvtscz][_-]?shap(?:e|ed)", t.lower().replace(" ", "_"))]
 
             if specific_tags:
                 # Use first 2-3 most relevant tags for more descriptive names
@@ -454,7 +483,10 @@ def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str
 
     # Fallback: use description if tags didn't work or were empty
     if not stem_from_desc and desc:
-        words = re.sub(r"[^a-zA-Z0-9\s]", " ", desc).split()
+        broad_desc = re.sub(
+            r"(?i)\b(?:l|u|v|t|s|c|z)[\s-]?shap(?:e|ed)\b", " ", desc,
+        )
+        words = re.sub(r"[^a-zA-Z0-9\s]", " ", broad_desc).split()
         stem_from_desc = "_".join(w.lower() for w in words[:6] if len(w) > 2)
         stem_from_desc = _deduplicate_stem_words(stem_from_desc)
         stem_from_desc = _safe(stem_from_desc)
@@ -486,22 +518,18 @@ def build_new_name(file_rec: File, root_path: str | None = None) -> Optional[str
     stem_from_desc = _strip_context_echo(stem_from_desc, echo_block)
     stem_from_desc = _deduplicate_stem_words(stem_from_desc)
 
-    # Only use date prefix if the date is meaningful (not just a copy/extract timestamp).
-    # Prefer real hardware sources (EXIF > filesystem) over AI-inferred date_best,
-    # because date_best may contain LLM-guessed dates that can be wrong.
-    has_good_date = _is_meaningful_date(file_rec)
-    dt = (file_rec.date_exif or file_rec.date_modified) if has_good_date else None
-
-    if ext in MEDIA_EXTENSIONS:
-        # Photos/videos: full timestamp if available, otherwise date only
-        date_part = _date_prefix(dt, include_time=True)
-        stem = f"{date_part}_{stem_from_desc}" if date_part else stem_from_desc
-    elif ext in DOC_EXTENSIONS:
-        # Documents: date only (no time component), consistent with media format
-        date_part = _date_prefix(dt, include_time=False)
-        stem = f"{date_part}_{stem_from_desc}" if date_part else stem_from_desc
-    else:
-        stem = stem_from_desc
+    # A model-suggested date is not source provenance. Remove full-date tokens
+    # from AI text, then add back only an original filename identifier or a
+    # plausible stored photo EXIF timestamp. Never infer document dates from
+    # filesystem mtime/birthtime or date_best fallback.
+    stem_from_desc = _SOURCE_DATE_RE.sub("", stem_from_desc)
+    stem_from_desc = re.sub(r"[-_]{2,}", "_", stem_from_desc).strip("_-")
+    if not stem_from_desc:
+        return None
+    source_date = _source_filename_date(path.stem)
+    capture_date = file_rec.date_exif if _is_meaningful_date(file_rec) else None
+    date_part = source_date or _date_prefix(capture_date, include_time=True)
+    stem = f"{date_part}_{stem_from_desc}" if date_part else stem_from_desc
 
     # Clean up double underscores
     stem = re.sub(r"_+", "_", stem).strip("_")
@@ -567,6 +595,12 @@ def _ensure_prefix(stem: str, original_stem: str) -> str:
     prefix = _extract_distinguishing_prefix(original_stem)
     if not prefix:
         return stem
+    # A dotted date prefix is normalized to ISO format by build_new_name.
+    # Those spellings carry the same source identifier; do not add both.
+    leading_date = _SOURCE_DATE_RE.match(original_stem)
+    source_date = _source_filename_date(leading_date.group()) if leading_date else None
+    if source_date and (stem == source_date or stem.startswith(f"{source_date}_")):
+        return stem
     # Check if stem already has the prefix in any form
     dot_form = prefix.replace("_", ".")
     if (stem.startswith(f"{prefix}_") or
@@ -581,6 +615,7 @@ def _resolve_collision(
     proposed_path: Path,
     original_path: Path,
     reserved_names: set[Path] | None = None,
+    next_suffixes: dict[Path, int] | None = None,
 ) -> Path:
     """
     Resolve filename collisions, preferring an informative discriminator
@@ -607,6 +642,8 @@ def _resolve_collision(
         proposed_path: The desired target path
         original_path: The current file path (allow renaming to self)
         reserved_names: Set of paths already proposed in this batch
+        next_suffixes: Optional per-batch next counter for a target basename.
+            Keep it with the same reservation set; never persist it across runs.
 
     Returns:
         A non-conflicting path.
@@ -614,7 +651,7 @@ def _resolve_collision(
     reserved = reserved_names or set()
 
     # If no conflict, return as-is
-    if (not proposed_path.exists() and proposed_path not in reserved) or proposed_path == original_path:
+    if (proposed_path not in reserved and not proposed_path.exists()) or proposed_path == original_path:
         return proposed_path
 
     stem = proposed_path.stem
@@ -628,14 +665,17 @@ def _resolve_collision(
     stem_has_date = bool(re.match(r"^\d{4}-\d{2}-\d{2}", stem))
     if prefix and not stem.startswith(f"{prefix}_") and not stem_has_date:
         candidate = parent / f"{prefix}_{stem}{ext}"
-        if (not candidate.exists() and candidate not in reserved) or candidate == original_path:
+        if (candidate not in reserved and not candidate.exists()) or candidate == original_path:
             return candidate
         # Prefixed collision too → base future counters on the prefixed stem
         stem = f"{prefix}_{stem}"
 
-    counter = 1
+    suffix_key = parent / f"{stem}{ext}"
+    counter = next_suffixes.get(suffix_key, 1) if next_suffixes is not None else 1
     while True:
         candidate = parent / f"{stem}_{counter}{ext}"
-        if (not candidate.exists() and candidate not in reserved) or candidate == original_path:
+        if (candidate not in reserved and not candidate.exists()) or candidate == original_path:
+            if next_suffixes is not None:
+                next_suffixes[suffix_key] = counter + 1
             return candidate
         counter += 1

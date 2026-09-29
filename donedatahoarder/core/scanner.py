@@ -7,6 +7,7 @@ All writes are batched (BATCH_SIZE) to keep SQLite happy on large drives.
 Respects .ddhignore files in the root directory (gitignore-style patterns).
 """
 import os
+import stat
 import sys
 from datetime import datetime
 from donedatahoarder.timeutils import utcnow
@@ -58,13 +59,10 @@ SKIP_DIRS: set[str] = {
     "lost+found",
 }
 
-# File extensions that carry no useful content
+# Transient files are outside the collection index. Archived SQLite sidecars
+# may be required to recover user data; only this app's active DB is excluded.
 SKIP_EXTENSIONS: set[str] = {
-    ".lnk", ".url", ".tmp", ".part",
-    ".sys", ".dll", ".exe", ".com",
-    ".ini", ".dat", ".log",
-    ".db", ".db-shm", ".db-wal",
-    ".ctb", ".3dmbak", ".plt",
+    ".tmp", ".part",
 }
 
 # Filenames that should always be skipped (macOS/Windows metadata, etc.)
@@ -72,14 +70,65 @@ SKIP_FILENAMES: set[str] = {
     ".DS_Store", "Thumbs.db", "desktop.ini", "._.DS_Store",
 }
 
-# Subset of SKIP_EXTENSIONS that is safe to physically move to trash during
-# post-execute cleanup. SKIP_EXTENSIONS exists to keep files out of the AI
-# pipeline — it includes .exe, .db, .ini, .dat, .log, which are legitimate
-# archive content that must never be swept off disk automatically.
-JUNK_FILE_EXTENSIONS: set[str] = {".tmp", ".part", ".ctb", ".plt"}
+# Cleanup, when explicitly invoked, must never treat CAD plot resources as junk.
+JUNK_FILE_EXTENSIONS: set[str] = {".tmp", ".part"}
 
 # Filename prefixes that indicate system/metadata files (macOS AppleDouble)
 SKIP_FILENAME_PREFIXES: tuple[str, ...] = ("._",)
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    """Reject symlinks and Windows junction/reparse entries without following."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return True
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _active_database_files() -> set[Path]:
+    """Keep this application's live SQLite files out of a selected root."""
+    try:
+        database = get_engine().url.database
+    except RuntimeError:
+        database = os.environ.get("DDH_DB")
+    if not database:
+        return set()
+    path = Path(database).resolve()
+    return {path, Path(f"{path}-wal"), Path(f"{path}-shm"),
+            Path(f"{path}-journal")}
+
+
+def directory_exclusion(name: str, path: Path, skip: set[str], ddhignore) -> str | None:
+    """Return the scanner's first exclusion reason for a directory."""
+    if name in skip:
+        return "scanner_skip_directory"
+    if name.startswith("."):
+        return "scanner_dot_directory"
+    if _is_link_or_reparse(path):
+        return "link_or_reparse"
+    if ddhignore.should_ignore(path, is_dir=True):
+        return "ddhignore_directory"
+    return None
+
+
+def file_exclusion(name: str, path: Path, active_database_files: set[Path],
+                   ddhignore) -> str | None:
+    """Return the scanner's first exclusion reason for a file."""
+    if name in SKIP_FILENAMES or name.startswith(SKIP_FILENAME_PREFIXES):
+        return "system_metadata_name"
+    if Path(name).suffix.lower() in SKIP_EXTENSIONS:
+        return "transient_extension"
+    if _is_link_or_reparse(path):
+        return "link_or_reparse"
+    if path.resolve() in active_database_files:
+        return "active_database"
+    if ddhignore.should_ignore(path, is_dir=False):
+        return "ddhignore_file"
+    return None
 
 
 def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[Path]:
@@ -92,34 +141,34 @@ def walk_files(root: Path, extra_skip_dirs: set[str] | None = None) -> Iterator[
     - extra_skip_dirs parameter
     """
     skip = SKIP_DIRS | (extra_skip_dirs or set())
+    active_database_files = _active_database_files()
+    if _is_link_or_reparse(root):
+        return
     ddhignore = load_ddhignore(root)
 
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    def _walk_error(exc: OSError) -> None:
+        logger.warning("Cannot read directory during scan", extra={
+            "path": getattr(exc, "filename", None), "error": str(exc),
+        })
+
+    for dirpath, dirnames, filenames in os.walk(
+        root, followlinks=False, onerror=_walk_error,
+    ):
         dirpath_obj = Path(dirpath)
 
         # Prune unwanted dirs in-place so os.walk won't descend into them
         dirnames_filtered = []
         for d in dirnames:
-            if d in skip or d.startswith("."):
-                continue
-            # Check .ddhignore patterns
             dir_path = dirpath_obj / d
-            if ddhignore.should_ignore(dir_path, is_dir=True):
+            if directory_exclusion(d, dir_path, skip, ddhignore):
                 continue
             dirnames_filtered.append(d)
 
         dirnames[:] = dirnames_filtered
 
         for name in filenames:
-            # Skip by filename pattern (system metadata, macOS AppleDouble, etc.)
-            if name in SKIP_FILENAMES or name.startswith(SKIP_FILENAME_PREFIXES):
-                continue
-            # Skip by extension
-            if Path(name).suffix.lower() in SKIP_EXTENSIONS:
-                continue
-            # Check .ddhignore patterns
             file_path = dirpath_obj / name
-            if ddhignore.should_ignore(file_path, is_dir=False):
+            if file_exclusion(name, file_path, active_database_files, ddhignore):
                 continue
             yield file_path
 
@@ -296,6 +345,8 @@ def _scan_unlocked(
     """
     import concurrent.futures
 
+    if _is_link_or_reparse(root):
+        raise ValueError("Collection root is a symlink, junction, or unreadable")
     engine = get_engine()
 
     with Session(engine) as session:
@@ -385,6 +436,9 @@ def _scan_unlocked(
                     existing.analysis_prompt_version = None
                     existing.analysis_extractor_version = None
                     existing.analysis_content_chars = None
+                    existing.analysis_context_hash = None
+                    existing.analysis_detected_date = None
+                    existing.analysis_cache_hit = False
                     existing.analyzed_at = None
                     existing.enriched_at = None
                     existing.error_message = record.get("error_message")

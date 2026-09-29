@@ -9,9 +9,10 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from sqlalchemy.orm import Session
 
-from donedatahoarder.core.dependency_protection import ProtectionIndex
+from donedatahoarder.core.dependency_protection import ProtectionIndex, cached_protection_index
+from donedatahoarder.core.dedup import sequence_comparison_metadata
 from donedatahoarder.db.models import (
-    DuplicateGroup, File, Proposal, ProposalStatus, ProposalType, UserSession,
+    DupeType, DuplicateGroup, File, Proposal, ProposalStatus, ProposalType, UserSession,
 )
 from donedatahoarder.db.session import get_engine
 
@@ -149,12 +150,30 @@ def list_proposals(
             if f and f.session_id not in protection_by_session:
                 owner = session.get(UserSession, f.session_id)
                 root = Path(owner.root_path) if owner and owner.root_path else None
-                protection_by_session[f.session_id] = ProtectionIndex(root) if root and root.is_dir() else None
+                protection_by_session[f.session_id] = cached_protection_index(root) if root and root.is_dir() else None
             protection = protection_by_session.get(f.session_id) if f else None
             target = Path(p.current_value or f.path) if f else None
             decision = protection.assess(target) if protection and target else None
             current_name = Path(p.current_value).name if p.current_value else (f.filename if f else "")
             proposed_name = Path(p.proposed_value).name if p.proposed_value and p.proposal_type == ProposalType.RENAME else p.proposed_value
+            name_date_source = None
+            if f and p.proposal_type == ProposalType.RENAME and p.proposed_value:
+                from donedatahoarder.proposals.namer.naming import (
+                    _is_meaningful_date, _source_filename_date,
+                )
+                proposed_date = _source_filename_date(Path(p.proposed_value).stem)
+                if proposed_date:
+                    original_date = _source_filename_date(Path(f.path).stem)
+                    if original_date == proposed_date:
+                        name_date_source = "Original filename date identifier; event date unverified"
+                    elif (_is_meaningful_date(f)
+                          and f.date_exif.strftime("%Y-%m-%d") == proposed_date):
+                        name_date_source = "Stored photo EXIF metadata; capture date unverified"
+                    elif (f.date_modified
+                          and f.date_modified.strftime("%Y-%m-%d") == proposed_date):
+                        name_date_source = "Matches filesystem modified date; event date unverified"
+                    else:
+                        name_date_source = "Unverified date in proposed name"
             duplicate_evidence = None
             group_id = getattr(p, "duplicate_group_id", None)
             if f and p.proposal_type == ProposalType.MARK_DUPLICATE and group_id:
@@ -167,6 +186,8 @@ def list_proposals(
                         "type": group.dupe_type.value,
                         "keeper_id": keeper.id if keeper else None,
                         "keeper_path": keeper.path if keeper else None,
+                        "keeper_mime_type": keeper.mime_type if keeper else None,
+                        "keeper_size_bytes": keeper.size_bytes if keeper else None,
                         "keeper_description": keeper.ai_description if keeper else None,
                         "keeper_analysis_outcome": getattr(keeper, "analysis_outcome", None) if keeper else None,
                         "exact_bytes": stored_sha256_match(f, keeper),
@@ -174,6 +195,7 @@ def list_proposals(
                         "similarity_score": membership.similarity_score if membership else None,
                         "distance_to_keeper": getattr(membership, "distance_to_keeper", None) if membership else None,
                         "perceptual_bits": len(f.hash_perceptual) * 4 if f.hash_perceptual else None,
+                        "sequence_comparison": sequence_comparison_metadata(f, keeper),
                     }
             items.append({
                 "id": p.id,
@@ -194,6 +216,7 @@ def list_proposals(
                 "analysis_reason": getattr(f, "analysis_reason", None) if f else None,
                 "analysis_evidence_source": getattr(f, "analysis_evidence_source", None) if f else None,
                 "analysis_model_tag": getattr(f, "analysis_model_tag", None) if f else None,
+                "name_date_source": name_date_source,
                 "duplicate_evidence": duplicate_evidence,
                 "review_kind": getattr(p, "review_kind", None),
                 "protected": bool(decision and decision.protected),
@@ -214,6 +237,20 @@ def approve_proposal(proposal_id: int, body: ReviewProposalRequest):
             protected = _protected_reason(p, file, _protection_index(user_session))
             if protected:
                 raise HTTPException(409, f"Protected resource: {protected}")
+            if p.proposal_type == ProposalType.MARK_DUPLICATE:
+                group = session.get(DuplicateGroup, p.duplicate_group_id) if p.duplicate_group_id else None
+                if group is None or group.session_id != file.session_id:
+                    raise HTTPException(409, "Duplicate evidence group changed")
+                if group.dupe_type != DupeType.EXACT:
+                    keeper = session.get(File, group.keep_file_id) if group.keep_file_id else None
+                    if (keeper is None or keeper.session_id != file.session_id
+                            or body.expected_duplicate_group_id != group.id
+                            or body.expected_duplicate_type != group.dupe_type.value
+                            or body.expected_keeper_id != keeper.id
+                            or body.expected_candidate_path != file.path
+                            or body.expected_keeper_path != keeper.path
+                            or p.current_value != file.path or p.proposed_value != keeper.path):
+                        raise HTTPException(409, "Duplicate comparison changed; review this pair again")
             p.status = ProposalStatus.APPROVED
             p.review_kind = "individual"
             session.commit()

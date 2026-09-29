@@ -71,25 +71,18 @@ def _propagate_moves_to_skipped_siblings(session_id: str) -> int:
             return 0
 
         # Pull SKIPPED siblings — these are the files we want to rescue.
-        skipped_files = (
-            db.query(File)
-            .filter(
-                File.session_id == session_id,
-                File.status == FileStatus.SKIPPED,
-            )
-            .all()
+        skipped_query = db.query(File).filter(
+            File.session_id == session_id,
+            File.status == FileStatus.SKIPPED,
         )
-        if not skipped_files:
-            return 0
-
-        skipped_ids = [f.id for f in skipped_files]
+        skipped_files = skipped_query.yield_per(1000)
 
         # Pre-load existing MOVE proposals so we don't double-propose.
         existing_moves: set[int] = {
             file_id
             for (file_id,) in db.query(Proposal.file_id).filter(
                 Proposal.proposal_type == ProposalType.MOVE,
-                Proposal.file_id.in_(skipped_ids),
+                Proposal.file_id.in_(skipped_query.with_entities(File.id)),
             )
         }
 
@@ -334,9 +327,8 @@ def _emit_relation_group_moves(session_id: str, root_path: str) -> int:
       appended.
     - Files that already have a MOVE or RENAME_FOLDER proposal are skipped
       so we don't double-propose.
-    - The destination filename is the CURRENT filename (or the one the Namer
-      proposed, if there's a pending RENAME). This keeps Namer and Organizer
-      proposals composable at execute time.
+    - MOVE keeps the current filename. A separately selected RENAME can be
+      composed with it at execute time.
 
     Returns the number of MOVE proposals created.
     """
@@ -363,37 +355,26 @@ def _emit_relation_group_moves(session_id: str, root_path: str) -> int:
             all_file_ids.update(m.file_id for m in g.members)
         if not all_file_ids:
             return 0
+        member_ids = (
+            db.query(RelationMember.file_id)
+            .join(RelationGroup, RelationMember.group_id == RelationGroup.id)
+            .filter(RelationGroup.session_id == session_id,
+                    RelationGroup.confidence >= _MIN_CONF)
+        )
 
         file_by_id: dict[int, File] = {
             f.id: f
-            for f in db.query(File).filter(File.id.in_(all_file_ids)).all()
+            for f in db.query(File).filter(File.id.in_(member_ids)).all()
         }
 
         # Files that already have a MOVE proposal — leave them alone.
         existing_moves: set[int] = {
             fid
             for (fid,) in db.query(Proposal.file_id).filter(
-                Proposal.file_id.in_(all_file_ids),
+                Proposal.file_id.in_(member_ids),
                 Proposal.proposal_type == ProposalType.MOVE,
             )
         }
-
-        # Pending RENAME proposals by file_id so the MOVE target uses the
-        # renamed filename (preserves Namer's work when both apply at execute).
-        rename_by_file: dict[int, str] = {}
-        for p in (
-            db.query(Proposal)
-            .filter(
-                Proposal.file_id.in_(all_file_ids),
-                Proposal.proposal_type == ProposalType.RENAME,
-                Proposal.status.in_([
-                    ProposalStatus.PENDING,
-                    ProposalStatus.APPLIED,
-                ]),
-            )
-        ):
-            if p.proposed_value:
-                rename_by_file[p.file_id] = Path(p.proposed_value).name
 
         # Reserved dest paths across all groups — avoids two clusters in the
         # same parent from trying to move a file into colliding subfolders.
@@ -434,21 +415,11 @@ def _emit_relation_group_moves(session_id: str, root_path: str) -> int:
                     # Group spans multiple dirs on disk (e.g. folder-rename
                     # already reshuffled some members) — leave alone.
                     continue
-                # Destination filename: prefer pending RENAME's value if any,
-                # otherwise the current basename.
-                dst_filename = rename_by_file.get(member.id, src_path.name)
-                dst_path = target_dir / dst_filename
-                # Resolve dest-level collisions (two members mapped to same
-                # filename after rename) by appending `_2`, `_3`, …
-                if dst_path in reserved_dests:
-                    stem, suffix = dst_path.stem, dst_path.suffix
-                    k = 2
-                    while True:
-                        cand = target_dir / f"{stem}_{k}{suffix}"
-                        if cand not in reserved_dests:
-                            dst_path = cand
-                            break
-                        k += 1
+                dst_path = target_dir / src_path.name
+                # A collision needs review; MOVE must not silently rename a
+                # member by adding a suffix.
+                if dst_path in reserved_dests or dst_path.exists():
+                    continue
                 reserved_dests.add(dst_path)
 
                 if str(src_path) == str(dst_path):
@@ -539,13 +510,15 @@ def _backstop_mojibake_folders(session_id: str, root_path: str) -> int:
         # Existing RENAME_FOLDER proposals (any status) for these folders —
         # skip anything already handled by the LLM or previously applied.
         already: set[str] = set()
-        existing_rows = db.query(Proposal.current_value).filter(
-            Proposal.proposal_type == ProposalType.RENAME_FOLDER,
-            Proposal.current_value.in_(list(mojibake_folders.keys())),
-        ).all()
-        for (cv,) in existing_rows:
-            if cv:
-                already.add(cv)
+        keys = list(mojibake_folders)
+        for start in range(0, len(keys), 500):
+            existing_rows = db.query(Proposal.current_value).filter(
+                Proposal.proposal_type == ProposalType.RENAME_FOLDER,
+                Proposal.current_value.in_(keys[start:start + 500]),
+            )
+            for (cv,) in existing_rows:
+                if cv:
+                    already.add(cv)
 
         import re
         for src_abs, recovered_name in mojibake_folders.items():

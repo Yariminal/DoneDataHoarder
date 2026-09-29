@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -22,6 +24,8 @@ from .backstops import (
     _backstop_nonlatin_folders,
     _emit_relation_group_moves,
     _propagate_moves_to_skipped_siblings,
+    _file_category,
+    _folder_content_label,
 )
 from .prompts import REORG_SYSTEM_PROMPT
 from .text_utils import _normalize_folder_name
@@ -32,6 +36,95 @@ _DESTINATION_GENERIC = {
     "file", "files", "document", "documents", "image", "images", "photo",
     "photos", "group", "collection", "archive", "folder", "project", "new",
 }
+_PROJECT_EXTENSIONS = {
+    ".ai", ".psd", ".blend", ".blend1", ".fbx", ".obj", ".mtl",
+    ".dwg", ".dxf", ".bak", ".shx", ".3ds", ".skp", ".rvt",
+    ".indd", ".prproj", ".aep", ".unity", ".uproject", ".3dm",
+    ".3dmbak", ".max", ".sln", ".csproj", ".xcodeproj",
+}
+_PROJECT_MARKERS = {"package.json", "pyproject.toml", "requirements.txt",
+                    "project.json", "makefile", "composer.json",
+                    "cargo.toml", "go.mod"}
+_PROJECT_MANIFEST_SUFFIXES = {
+    ".sln", ".slnx", ".csproj", ".fsproj", ".vbproj", ".vcxproj",
+}
+_COLLECTION_FOLDERS = {"downloads", "inbox", "loose", "misc", "mixed", "unsorted",
+                       "to_sort", "new folder", "files", "documents", "stuff", "temp"}
+
+
+def _project_roots(root: Path, files, protection) -> set[Path]:
+    """Find the nearest directory with a manifest or related editable assets.
+
+    A lone PSD in Downloads is not enough to freeze the whole Downloads tree.
+    The resource itself remains protected by ProtectionIndex.
+    """
+    markers: set[Path] = set()
+    resources: dict[Path, list[Path]] = defaultdict(list)
+    child_dirs: dict[Path, set[Path]] = defaultdict(set)
+    checked_git: set[Path] = set()
+    if (root / ".git").is_dir():
+        return {root}
+    for file_rec in files:
+        source = Path(file_rec.path)
+        try:
+            relative = source.relative_to(root)
+        except ValueError:
+            continue
+        if (source.name.casefold() in _PROJECT_MARKERS
+                or source.suffix.casefold() in _PROJECT_MANIFEST_SUFFIXES):
+            markers.add(source.parent)
+        if (source.name.casefold() == "project.pbxproj"
+                and source.parent.suffix.casefold() == ".xcodeproj"):
+            markers.add(source.parent.parent)
+        if len(relative.parts) < 2:
+            continue
+        parent = source.parent
+        if parent not in checked_git:
+            checked_git.add(parent)
+            if (parent / ".git").is_dir():
+                markers.add(parent)
+        if source.suffix.casefold() in _PROJECT_EXTENSIONS:
+            resources[parent].append(source)
+        for ancestor in source.parents:
+            if ancestor == root or root not in ancestor.parents:
+                break
+            child_dirs[ancestor.parent].add(ancestor)
+    result = set(markers)
+    for folder, paths in resources.items():
+        stems = Counter(path.stem.casefold() for path in paths)
+        has_bundle = any(count >= 2 for count in stems.values())
+        has_structure = any(child.name.casefold() in {"assets", "textures", "renders", "src", "source"}
+                            for child in child_dirs.get(folder, set()))
+        if folder.name.casefold() not in _COLLECTION_FOLDERS and (has_bundle or has_structure):
+            result.add(folder)
+    return result
+
+
+def _inside_project(source: Path, project_roots: set[Path]) -> bool:
+    return source in project_roots or any(parent in project_roots for parent in source.parents)
+
+
+def _loose_source(file_rec: File, root: Path,
+                  parent_categories: dict[Path, set[str]],
+                  project_roots: set[Path]) -> bool:
+    """Only a root file or an explicitly generic folder chain is standalone.
+
+    A named folder containing several file types can still be a coherent
+    document project. Category variety alone is not evidence of independence.
+    """
+    source = Path(file_rec.path)
+    if _inside_project(source, project_roots):
+        return False
+    if source.parent == root:
+        return True
+    try:
+        relative = source.relative_to(root)
+    except ValueError:
+        return False
+    if len(relative.parts) < 2:
+        return False
+    return all(part.casefold() in _COLLECTION_FOLDERS
+               for part in relative.parts[:-1])
 
 
 def _words(value: str) -> set[str]:
@@ -42,8 +135,9 @@ def _words(value: str) -> set[str]:
 
 
 def _organizer_move_allowed(file_rec: File, destination: Path, root: Path,
-                            protected_index, sequence_ids: set[int]) -> bool:
-    """Require project and subject evidence before proposing a file move."""
+                            protected_index, sequence_ids: set[int],
+                            project_roots: set[Path] | None = None) -> bool:
+    """Keep project subtrees intact; only collect loose independent files."""
     source = Path(file_rec.path)
     try:
         source_relative = source.relative_to(root)
@@ -52,24 +146,136 @@ def _organizer_move_allowed(file_rec: File, destination: Path, root: Path,
         return False
     if file_rec.id in sequence_ids or protected_index.assess(source).protected:
         return False
+    if project_roots and _inside_project(source, project_roots):
+        return False
     if not dest_relative.parts or not source_relative.parts:
         return False
-    # A move between existing top-level projects needs explicit human editing.
-    if len(source_relative.parts) > 1 and source_relative.parts[0].casefold() != dest_relative.parts[0].casefold():
+    if destination.name != source.name:
         return False
-    source_context = _words(str(source_relative.parent)) | _words(source.stem)
-    dest_context = _words(str(dest_relative.parent))
-    new_subjects = dest_context - source_context - _DESTINATION_GENERIC
-    if not new_subjects:
-        return True
-    verified = (
-        getattr(file_rec, "analysis_outcome", None) == "content_verified"
-        and getattr(file_rec, "analysis_evidence_source", None) in {"text", "vision"}
-    )
-    if not verified:
+    if not _loose_source(file_rec, root, {}, project_roots or set()):
         return False
-    observed = source_context | _words(file_rec.ai_description or "") | _words(file_rec.ai_tags or "")
-    return new_subjects <= observed
+    if len(source_relative.parts) > 1:
+        if (dest_relative.parts[0].casefold() == source_relative.parts[0].casefold()
+                and len(dest_relative.parts) > len(source_relative.parts)):
+            source_context = _words(str(source_relative.parent)) | _words(source.stem)
+            new_subjects = (_words(str(dest_relative.parent)) - source_context
+                            - _DESTINATION_GENERIC)
+            if not new_subjects:
+                return True
+            verified = (getattr(file_rec, "analysis_outcome", None) == "content_verified"
+                        and getattr(file_rec, "analysis_evidence_source", None) in {"text", "vision"})
+            observed = source_context | _words(file_rec.ai_description or "") | _words(file_rec.ai_tags or "")
+            return verified and new_subjects <= observed
+    if dest_relative.parts[0].casefold() != "independent_files":
+        return False
+    if len(dest_relative.parts) < 3 or len(dest_relative.parts) > 5:
+        return False
+    category = _file_category(file_rec.mime_type, file_rec.extension)
+    label = _folder_content_label({category: 1}) if category != "other" else None
+    if not label or dest_relative.parts[1].casefold() != label.casefold():
+        return False
+    folders = list(dest_relative.parts[2:-1])
+    if folders and folders[0].isdigit():
+        if folders.pop(0) != _standalone_year(file_rec):
+            return False
+    return not folders or (len(folders) == 1 and
+                           folders[0].casefold() == (_standalone_subject(file_rec) or "").casefold())
+
+
+def _standalone_subject(file_rec: File) -> str | None:
+    """Choose a broad topic only from filename or the file's own analysis."""
+    generic = _DESTINATION_GENERIC | {
+        "final", "copy", "draft", "untitled", "scan", "img", "dsc", "edited",
+        "export", "backup", "version", "original", "independent", "file",
+    }
+    stem = Path(file_rec.path).stem
+    filename_words = [w.casefold() for w in re.findall(r"[^\W_]+", stem)
+                      if len(w) >= 4 and not any(c.isdigit() for c in w)]
+    words = [w for w in filename_words if w not in generic]
+    if not words and getattr(file_rec, "analysis_outcome", None) == "content_verified":
+        try:
+            import json
+            tags = json.loads(file_rec.ai_tags or "[]")
+        except (ValueError, TypeError):
+            tags = []
+        if isinstance(tags, list):
+            words = [str(tag).casefold() for tag in tags
+                     if isinstance(tag, str) and re.fullmatch(r"[\w -]{4,24}", tag)
+                     and str(tag).casefold() not in generic]
+    return words[0].title().replace(" ", "_") if words else None
+
+
+def _standalone_year(file_rec: File) -> str | None:
+    # EXIF is source evidence. Filesystem mtimes on extracted collections are
+    # often an extraction timestamp, so they are deliberately not used here.
+    dt = getattr(file_rec, "date_exif", None)
+    return str(dt.year) if dt and 1970 <= dt.year <= 2100 else None
+
+
+def _emit_standalone_moves(session_id: str, root_path: str) -> int:
+    """Offer type/date/topic organization for independent loose files.
+
+    A topic level appears only when at least two files share it. Each move
+    remains a separate proposal; no project directory is traversed or moved.
+    """
+    from donedatahoarder.core.dependency_protection import ProtectionIndex
+
+    root = Path(root_path).resolve()
+    protection = ProtectionIndex(root)
+    made = 0
+    with Session(get_engine()) as db:
+        query = db.query(File).filter(File.session_id == session_id)
+        projects = _project_roots(root, query.yield_per(1000), protection)
+        parent_categories: dict[Path, set[str]] = defaultdict(set)
+        for f in query.yield_per(1000):
+            parent_categories[Path(f.path).parent].add(_file_category(f.mime_type, f.extension))
+        subjects = Counter(
+            _standalone_subject(f) for f in query.yield_per(1000)
+            if _loose_source(f, root, parent_categories, projects)
+        )
+        existing = {fid for (fid,) in db.query(Proposal.file_id).join(File, Proposal.file_id == File.id)
+                    .filter(File.session_id == session_id,
+                            Proposal.proposal_type == ProposalType.MOVE,
+                            Proposal.status.in_([ProposalStatus.PENDING, ProposalStatus.APPROVED,
+                                                 ProposalStatus.MODIFIED])).all()}
+        reserved: set[str] = set()
+        for f in query.yield_per(1000):
+            if not _loose_source(f, root, parent_categories, projects):
+                continue
+            if f.id in existing or f.status not in {FileStatus.ANALYZED, FileStatus.PROPOSED}:
+                continue
+            if protection.assess(Path(f.path)).protected:
+                continue
+            category = _file_category(f.mime_type, f.extension)
+            if category == "other":
+                continue
+            label = _folder_content_label({category: 1})
+            if not label:
+                continue
+            pieces = ["Independent_Files", label]
+            if year := _standalone_year(f):
+                pieces.append(year)
+            subject = _standalone_subject(f)
+            if subject and subjects[subject] >= 2:
+                pieces.append(subject)
+            destination = root.joinpath(*pieces, Path(f.path).name)
+            if destination.exists() or str(destination).casefold() in reserved:
+                continue
+            if not _organizer_move_allowed(f, destination, root, protection, set(), projects):
+                continue
+            reserved.add(str(destination).casefold())
+            db.add(Proposal(
+                file_id=f.id, proposal_type=ProposalType.MOVE,
+                current_value=f.path, proposed_value=str(destination),
+                reasoning="Independent loose file grouped by file type"
+                          + (", EXIF year" if year else "")
+                          + (", shared filename or verified topic" if subject and subjects[subject] >= 2 else "")
+                          + ". Review before applying.",
+                confidence=0.55, status=ProposalStatus.PENDING,
+            ))
+            made += 1
+        db.commit()
+    return made
 
 
 def _folder_rename_keeps_identity(source: Path, destination: Path) -> bool:
@@ -120,6 +326,10 @@ def _suppress_unsafe_organizer_proposals(session_id: str, root_path: str) -> dic
     reasons: dict[str, int] = {}
     examples: list[dict[str, str]] = []
     with Session(get_engine()) as db:
+        project_roots = _project_roots(
+            root, db.query(File).filter(File.session_id == session_id).yield_per(1000),
+            protected_index,
+        )
         sequence_ids = {
             fid for (fid,) in (
                 db.query(RelationMember.file_id)
@@ -129,8 +339,14 @@ def _suppress_unsafe_organizer_proposals(session_id: str, root_path: str) -> dic
             )
         }
         sequence_dirs = {
-            Path(path).parent for (path,) in db.query(File.path).filter(File.id.in_(sequence_ids))
-        } if sequence_ids else set()
+            Path(path).parent for (path,) in (
+                db.query(File.path)
+                .join(RelationMember, RelationMember.file_id == File.id)
+                .join(RelationGroup, RelationMember.group_id == RelationGroup.id)
+                .filter(RelationGroup.session_id == session_id,
+                        RelationGroup.label.like("frame_sequence_%"))
+            )
+        }
         proposals = (
             db.query(Proposal, File)
             .join(File, Proposal.file_id == File.id)
@@ -150,7 +366,8 @@ def _suppress_unsafe_organizer_proposals(session_id: str, root_path: str) -> dic
                 source = Path(file_rec.path)
                 protection = protected_index.assess(source)
                 allowed = bool(proposal.proposed_value) and _organizer_move_allowed(
-                    file_rec, Path(proposal.proposed_value), root, protected_index, sequence_ids
+                    file_rec, Path(proposal.proposed_value), root, protected_index,
+                    sequence_ids, project_roots,
                 )
                 destination = Path(proposal.proposed_value or "")
                 grouping = _grouping_move_key(proposal)
@@ -163,7 +380,11 @@ def _suppress_unsafe_organizer_proposals(session_id: str, root_path: str) -> dic
                 reason = (
                     "Numbered frame sequence must keep its folder and order" if file_rec.id in sequence_ids
                     else f"Protected resource: {protection.reason}" if protection.protected
+                    else "MOVE must preserve the current filename"
+                    if destination.name != source.name
                     else "Grouping would repeat the existing folder name" if redundant_nesting
+                    else "Named source folder is not a loose collection"
+                    if not _loose_source(file_rec, root, {}, project_roots)
                     else "Destination project or subject lacks source evidence"
                 )
             else:
@@ -178,10 +399,12 @@ def _suppress_unsafe_organizer_proposals(session_id: str, root_path: str) -> dic
                     # references or a numbered frame sequence.
                     allowed = (
                         len(relative.parts) > 1
+                        and not _inside_project(source, project_roots)
+                        and not any(source in project.parents for project in project_roots)
                         and not protection.protected
                         and bool(proposal.proposed_value)
-                        and _folder_rename_keeps_identity(source, Path(proposal.proposed_value or ""))
-                        and folder_destinations.get(str(Path(proposal.proposed_value or "")).casefold(), 0) == 1
+                        and _folder_rename_keeps_identity(source, Path(proposal.proposed_value))
+                        and folder_destinations.get(str(Path(proposal.proposed_value)).casefold(), 0) == 1
                         and not any(directory == source or source in directory.parents
                                     for directory in sequence_dirs)
                     )
@@ -277,24 +500,14 @@ def _generate_reorg_proposals_impl(session_id: str) -> dict:
     # re-running Organize always starts from a clean slate.  Applied/rejected
     # proposals are preserved — we only discard ones the user hasn't acted on yet.
     with Session(engine) as db:
-        stale_ids = [
-            p_id for (p_id,) in (
-                db.query(Proposal.id)
-                .join(File, Proposal.file_id == File.id)
-                .filter(
-                    File.session_id == session_id,
-                    Proposal.status == ProposalStatus.PENDING,
-                    Proposal.proposal_type.in_([
-                        ProposalType.MOVE,
-                        ProposalType.RENAME_FOLDER,
-                    ]),
-                )
-            )
-        ]
-        if stale_ids:
-            db.query(Proposal).filter(
-                Proposal.id.in_(stale_ids)
-            ).delete(synchronize_session=False)
+        file_ids = db.query(File.id).filter(File.session_id == session_id)
+        db.query(Proposal).filter(
+            Proposal.file_id.in_(file_ids),
+            Proposal.status == ProposalStatus.PENDING,
+            Proposal.proposal_type.in_([
+                ProposalType.MOVE, ProposalType.RENAME_FOLDER,
+            ]),
+        ).delete(synchronize_session=False)
         db.commit()
 
     # Phase 1: Build folder summary tree
@@ -650,6 +863,11 @@ def _generate_reorg_proposals_impl(session_id: str) -> dict:
         counts["suppression_examples"] = suppressed["examples"]
         counts["move"] -= suppressed["move"]
         counts["rename_folder"] -= suppressed["rename_folder"]
+
+    standalone_moves = _emit_standalone_moves(session_id, root_path)
+    if standalone_moves:
+        counts["standalone_moves"] = standalone_moves
+        counts["move"] += standalone_moves
 
     return counts
 

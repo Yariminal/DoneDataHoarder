@@ -31,18 +31,23 @@ Archive contents ({count} entries{truncated}):
 {manifest}
 ---
 
-Based on the archive name, folder context, and its contents, return a JSON object:
+Based on the archive name, folder context, and its contents, return a JSON
+object in this shape, replacing the example values:
 {{
-  "description": "1-2 sentences describing what this archive contains and its likely purpose",
-  "suggested_name": "meaningful filename stem — MUST preserve specific proper nouns (project names, \
-product names, event names) from the filename and contents. \
-No extension, no date prefix, use_underscores, max 60 chars",
-  "tags": ["tag1", "tag2", ...],
-  "archive_type": "one of: project_backup, software_installer, assets_pack, photos_album, \
-documents_bundle, source_code, game_files, fonts_pack, plugins_pack, other",
-  "detected_date": "YYYY-MM-DD if a date is clearly present in filenames or paths, else null",
-  "confidence": 0.0-1.0
+  "description": "A concise description of the archive contents and purpose.",
+  "suggested_name": "specific_archive_contents",
+  "tags": ["specific_project", "archive_contents"],
+  "archive_type": "assets_pack",
+  "detected_date": null,
+  "confidence": 0.8
 }}
+Describe contents and likely purpose in 1-2 sentences. In suggested_name,
+preserve specific project, product or event names from filename and contents;
+omit extension and date prefix, use_underscores, max 60 chars. archive_type
+must be one of project_backup, software_installer, assets_pack, photos_album,
+documents_bundle, source_code, game_files, fonts_pack, plugins_pack, other.
+Use YYYY-MM-DD for detected_date only if clearly present in filenames or paths,
+otherwise null. confidence is 0 to 1.
 """
 
 
@@ -64,10 +69,9 @@ class ArchiveAnalyzer(BaseAnalyzer):
 
         try:
             with zipfile.ZipFile(path, "r") as zf:
-                entries = zf.namelist()
-                total_entries = len(entries)
-                for entry in entries[:MAX_ENTRIES]:
-                    manifest_lines.append(entry)
+                total_entries = len(zf.filelist)
+                for entry in zf.filelist[:MAX_ENTRIES]:
+                    manifest_lines.append(entry.filename[:512])
                 if total_entries > MAX_ENTRIES:
                     truncated = True
         except zipfile.BadZipFile:

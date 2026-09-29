@@ -22,9 +22,11 @@ from __future__ import annotations
 import logging
 import re
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
 from donedatahoarder.ai.json_utils import extract_json
@@ -38,6 +40,49 @@ logger = logging.getLogger(__name__)
 # LLM groups at 0.8, backstop at 0.3 — consumers can filter on confidence.
 LLM_CONFIDENCE = 0.8
 BACKSTOP_CONFIDENCE = 0.3
+MAX_RELATION_UNIT_FILES = 20_000
+
+
+def _unsupported_shx(file: File) -> bool:
+    """Keep opaque SHX resources available to structural grouping, not the LLM."""
+    return (file.status == FileStatus.SKIPPED
+            and (file.extension or "").lower() == ".shx"
+            and file.analysis_outcome == "skipped"
+            and file.analysis_reason == "unsupported_type")
+
+
+def _unsupported_shx_clause():
+    """SQL equivalent for the bounded cross-script singleton query."""
+    return and_(
+        File.status == FileStatus.SKIPPED,
+        func.lower(func.coalesce(File.extension, "")) == ".shx",
+        func.coalesce(File.analysis_outcome, "") == "skipped",
+        func.coalesce(File.analysis_reason, "") == "unsupported_type",
+    )
+
+
+def _iter_relation_units(reader: Session, session_id: str, scope: str):
+    """Stream files with a hard cap on one relation unit's ORM objects."""
+    query = reader.query(File).filter(
+        File.session_id == session_id, File.status != FileStatus.ERROR,
+    )
+    if scope == "per_directory":
+        parent = func.substr(File.path, 1,
+                             func.length(File.path) - func.length(File.filename) - 1)
+        query = query.order_by(parent, File.id)
+    else:
+        query = query.order_by(File.id)
+    current_dir = None
+    unit: list[File] = []
+    for file in query.yield_per(500):
+        directory = str(Path(file.path).parent) if scope == "per_directory" else "<whole tree>"
+        if unit and (directory != current_dir or len(unit) >= MAX_RELATION_UNIT_FILES):
+            yield current_dir, unit, current_dir if scope == "per_directory" else None
+            unit = []
+        current_dir = directory
+        unit.append(file)
+    if unit:
+        yield current_dir, unit, current_dir if scope == "per_directory" else None
 
 # Cap on filenames sent to the LLM in one call to avoid prompt AND response
 # overruns. Smaller dirs get one call; larger dirs get chunked (see _chunk).
@@ -517,14 +562,24 @@ def _call_llm_for_group(
 
 def _wipe_existing_groups(session: Session, session_id: str) -> int:
     """Delete all existing RelationGroups for this session. Idempotent re-run."""
-    existing = session.query(RelationGroup).filter(
-        RelationGroup.session_id == session_id,
-    ).all()
-    n = len(existing)
-    for g in existing:
-        session.delete(g)
-    session.commit()
-    return n
+    removed = 0
+    while True:
+        ids = [row[0] for row in session.query(RelationGroup.id).filter(
+            RelationGroup.session_id == session_id,
+        ).order_by(RelationGroup.id).limit(500)]
+        if not ids:
+            break
+        # Explicit child deletion also works for tests/legacy databases that
+        # opened SQLite without foreign_keys=ON.
+        session.query(RelationMember).filter(
+            RelationMember.group_id.in_(ids),
+        ).delete(synchronize_session=False)
+        session.query(RelationGroup).filter(
+            RelationGroup.id.in_(ids),
+        ).delete(synchronize_session=False)
+        session.commit()
+        removed += len(ids)
+    return removed
 
 
 def _save_groups(
@@ -712,31 +767,55 @@ def _link_singletons_to_folder_groups(
     """
     linked = 0
 
-    # Get singleton files (not in any RelationMember)
-    all_files = session.query(File).filter(File.session_id == session_id).all()
-    file_ids_in_groups = {
-        m.file_id for m in session.query(RelationMember.file_id)
-        .filter(
-            RelationMember.group_id.in_(
-                session.query(RelationGroup.id).filter(
-                    RelationGroup.session_id == session_id
-                )
-            )
-        )
-    }
-    singletons = [f for f in all_files if f.id not in file_ids_in_groups]
-
-    if not singletons:
-        return 0
-
-    # Get candidate groups (confidence >= 0.5)
-    candidate_groups = session.query(RelationGroup).filter(
+    # Keep singleton selection in SQL; large collections must not materialize
+    # every File ORM row just to identify ungrouped records.
+    assigned = (
+        session.query(RelationMember.file_id)
+        .join(RelationGroup, RelationMember.group_id == RelationGroup.id)
+        .filter(RelationGroup.session_id == session_id)
+    )
+    # Build O(1) lookup tables before streaming singleton rows. Preserve the
+    # old first-matching-group rule by retaining each key's earliest row.
+    # Per-directory groups can only receive files from that directory.
+    # Cross-directory groups use a None directory key and remain eligible
+    # across the tree when they were explicitly discovered as such.
+    numeric_tokens: dict[tuple[str | None, str], tuple[int, int]] = {}
+    numeric_digits: dict[tuple[str | None, str], tuple[int, int]] = {}
+    alpha_tokens: dict[tuple[str | None, str], tuple[int, int]] = {}
+    candidate_groups = session.query(
+        RelationGroup.id, RelationGroup.label, RelationGroup.scope, RelationGroup.dir_path,
+    ).filter(
         RelationGroup.session_id == session_id,
         RelationGroup.confidence >= 0.5,
-    ).all()
+    ).order_by(RelationGroup.id).yield_per(500)
+    group_count = 0
+    for group_count, group in enumerate(candidate_groups, start=1):
+        label = group.label.lower()
+        choice = (group_count, group.id)
+        if group.scope == "per_directory":
+            if not group.dir_path:
+                continue
+            directory = group.dir_path
+        elif group.scope == "cross_directory":
+            directory = None
+        else:
+            continue
+        for token in label.split("_"):
+            if token.isdigit():
+                numeric_tokens.setdefault((directory, token), choice)
+        digits = re.sub(r"\D", "", label)
+        if digits:
+            numeric_digits.setdefault((directory, digits), choice)
+        first_token = label.split("_", 1)[0]
+        if len(first_token) >= 4:
+            alpha_tokens.setdefault((directory, _singularize(first_token)), choice)
 
-    if not candidate_groups:
+    if not group_count:
         return 0
+
+    singletons = session.query(File.id, File.filename, File.path).filter(
+        File.session_id == session_id, ~File.id.in_(assigned),
+    ).yield_per(500)
 
     # For each singleton, try to link it
     for singleton in singletons:
@@ -747,43 +826,31 @@ def _link_singletons_to_folder_groups(
         numeric_prefix = numeric_match.group(1) if numeric_match else None
 
         # Extract first alpha token >= 4 chars
-        alpha_match = re.search(r"\b([a-z]{4,})\b", stem)
+        # Underscores and digits separate words in filenames even though
+        # regex \b treats underscores as word characters.
+        alpha_match = re.search(r"(?:^|[^a-z])([a-z]{4,})(?=[^a-z]|$)", stem)
         alpha_token = alpha_match.group(1) if alpha_match else None
+        keys = (str(Path(singleton.path).parent), None)
 
-        for group in candidate_groups:
-            group_label = group.label.lower()
-
-            # Numeric prefix match: the prefix must appear as a whole token
-            # in the label ("_108_" boundary), or equal the label's digits
-            # with separators stripped ("108" vs "project_10_8" -> "108").
-            # Plain substring matching would falsely link "108" to labels
-            # like "drawings_1080p".
-            matched = False
-            if numeric_prefix:
-                bounded_label = f"_{group_label}_"
-                label_digits = re.sub(r"\D", "", group_label)
-                if (
-                    f"_{numeric_prefix}_" in bounded_label
-                    or (label_digits and label_digits == numeric_prefix)
-                ):
-                    matched = True
-
-            # Alpha token match: compare against the label's first token with
-            # naive plural normalization so "fonts" links to
-            # "font_configurations".
-            if not matched and alpha_token:
-                first_label_token = group_label.split("_", 1)[0]
-                if len(first_label_token) >= 4 and _singularize(first_label_token) == _singularize(alpha_token):
-                    matched = True
-
-            if matched:
-                session.add(RelationMember(
-                    group_id=group.id,
-                    file_id=singleton.id,
-                    role=RelationRole.SIBLING,
-                ))
-                linked += 1
-                break
+        options = []
+        if numeric_prefix:
+            for directory in keys:
+                options.extend(choice for choice in (
+                    numeric_tokens.get((directory, numeric_prefix)),
+                    numeric_digits.get((directory, numeric_prefix)),
+                ) if choice is not None)
+        if alpha_token:
+            for directory in keys:
+                choice = alpha_tokens.get((directory, _singularize(alpha_token)))
+                if choice is not None:
+                    options.append(choice)
+        if options:
+            session.add(RelationMember(
+                group_id=min(options)[1],
+                file_id=singleton.id,
+                role=RelationRole.SIBLING,
+            ))
+            linked += 1
 
     if linked:
         session.commit()
@@ -814,8 +881,8 @@ def _relate_impl(
                 LLM call. Overrides the client's default text_model. Use this
                 when the caller needs a reasoning-capable model regardless of
                 which model was last initialised via init_ai().
-        progress_cb: optional callback invoked with {"dir": str, "done": N, "total": M}
-                     after each directory is processed.
+        progress_cb: optional callback after each model chunk and directory.
+                     Directory totals may be unknown while streaming.
 
     Returns:
         Summary dict: {"directories": int, "groups": int, "members": int,
@@ -850,50 +917,31 @@ def _relate_impl(
         if wiped:
             logger.info("Wiped %d stale RelationGroups for session %s", wiped, session_id)
 
-        # Pull all scanned-or-later files (we work on filenames, not content,
-        # so PENDING / ENRICHED / ANALYZED / PROPOSED / SKIPPED all qualify;
-        # APPLIED files already moved on disk but the DB still holds their
-        # identity — we include them so re-runs don't lose groupings).
-        files = (
-            session.query(File)
-            .filter(File.session_id == session_id)
-            .filter(File.status != FileStatus.ERROR)
-            .all()
-        )
-        if not files:
-            return summary
-
-        # Bucket by directory
-        dir_buckets: dict[str, list[File]] = defaultdict(list)
-        for f in files:
-            dir_buckets[str(Path(f.path).parent)].append(f)
-
-        # Recognize a full numbered frame sequence before the 100-file LLM
-        # chunks. This gives one stable identity to the entire directory.
-        sequence_file_ids: set[int] = set()
-        for directory, directory_files in dir_buckets.items():
-            sequence_groups, placed_ids = _numbered_frame_groups(directory_files)
+        # A separate read cursor avoids retaining all ORM rows while groups
+        # are committed. SQLite WAL permits the writer to advance alongside it.
+        with Session(engine) as reader:
+          for dir_label, unit_files, dir_path in _iter_relation_units(
+              reader, session_id, scope,
+          ):
+            summary["directories"] += 1
+            sequence_groups, placed_ids = _numbered_frame_groups(unit_files)
             if sequence_groups:
-                fn_to_id = {file.filename: file.id for file in directory_files}
+                fn_to_id = {file.filename: file.id for file in unit_files}
                 saved = _save_groups(session, sequence_groups, session_id,
-                                     "per_directory", directory, fn_to_id)
+                                     "per_directory", dir_label if scope == "per_directory" else None,
+                                     fn_to_id)
                 summary["groups"] += saved
+                summary["backstop_groups"] += saved
                 summary["members"] += sum(len(group["members"]) for group in sequence_groups)
-                sequence_file_ids.update(placed_ids)
-
-        # Determine the call pattern based on scope
-        if scope == "cross_directory":
-            remaining = [file for file in files if file.id not in sequence_file_ids]
-            call_units = [("<whole tree>", remaining, None)] if len(remaining) >= 2 else []
-        else:
-            call_units = [
-                (d, [file for file in fs if file.id not in sequence_file_ids], d)
-                for d, fs in dir_buckets.items()
-                if len([file for file in fs if file.id not in sequence_file_ids]) >= 2
-            ]
-
-        summary["directories"] = len(call_units)
-        for i, (dir_label, dir_files, dir_path) in enumerate(call_units):
+            dir_files = [file for file in unit_files if file.id not in placed_ids]
+            semantic_files = [file for file in dir_files if not _unsupported_shx(file)]
+            if len(dir_files) < 2:
+                if progress_cb:
+                    progress_cb({"phase": "directory_complete", "dir": dir_label,
+                                 "done": summary["directories"], "total": None,
+                                 "updated_utc": datetime.now(timezone.utc).isoformat(),
+                                 **summary})
+                continue
             # Map filename (basename) → file_id for this unit.
             # For per_directory scope, filenames are unique within the dir.
             # For cross_directory, collisions across dirs are possible — the
@@ -906,12 +954,30 @@ def _relate_impl(
             llm_groups: list[dict] = []
             if client is not None:
                 # Chunk very large dirs into multiple LLM calls
-                for chunk in _chunk(dir_files, MAX_FILES_PER_CALL):
-                    if len(chunk) < 2:
-                        continue
+                chunks = [chunk for chunk in _chunk(semantic_files, MAX_FILES_PER_CALL)
+                          if len(chunk) >= 2]
+                for chunk_number, chunk in enumerate(chunks, 1):
+                    if progress_cb:
+                        progress_cb({
+                            "phase": "grouping", "done": summary["directories"] - 1,
+                            "directory_index": summary["directories"], "total": None,
+                            "chunk_done": chunk_number - 1,
+                            "chunk_active": chunk_number, "chunk_total": len(chunks),
+                            "updated_utc": datetime.now(timezone.utc).isoformat(),
+                            **summary,
+                        })
                     llm_groups.extend(
                         _call_llm_for_group(client, dir_label, chunk, model=model)
                     )
+                    if progress_cb:
+                        progress_cb({
+                            "phase": "grouping", "done": summary["directories"] - 1,
+                            "directory_index": summary["directories"], "total": None,
+                            "chunk_done": chunk_number, "chunk_total": len(chunks),
+                            "chunk_active": None,
+                            "updated_utc": datetime.now(timezone.utc).isoformat(),
+                            **summary,
+                        })
 
             # A numeric prefix alone is not evidence that two LLM chunks or
             # CAD and image files share one project. Keep their groups apart.
@@ -940,33 +1006,50 @@ def _relate_impl(
 
             if progress_cb:
                 progress_cb({
+                    "phase": "directory_complete",
                     "dir": dir_label,
-                    "done": i + 1,
-                    "total": len(call_units),
+                    "done": summary["directories"],
+                    "total": None,
+                    "updated_utc": datetime.now(timezone.utc).isoformat(),
                     **summary,
                 })
 
         # Cross-script clustering pass: for singletons (files not in any group yet),
         # run an LLM pass to find Hebrew↔English equivalents and semantic synonyms.
         if client is not None:
-            placed_ids = {
-                m.file_id for m in session.query(RelationMember)
-                .filter(
-                    RelationMember.group_id.in_(
-                        session.query(RelationGroup.id).filter(
-                            RelationGroup.session_id == session_id
-                        )
-                    )
-                )
-            }
-            singletons = [f for f in files if f.id not in placed_ids]
+            assigned = (
+                session.query(RelationMember.file_id)
+                .join(RelationGroup, RelationMember.group_id == RelationGroup.id)
+                .filter(RelationGroup.session_id == session_id)
+            )
+            singletons = session.query(File).filter(
+                File.session_id == session_id, File.status != FileStatus.ERROR,
+                ~File.id.in_(assigned), ~_unsupported_shx_clause(),
+            ).order_by(File.id).limit(2001).all()
 
             if 5 <= len(singletons) <= 2000:
                 cross_script_groups: list[dict] = []
-                for chunk in _chunk(singletons, MAX_FILES_PER_CALL):
+                chunks = list(_chunk(singletons, MAX_FILES_PER_CALL))
+                for chunk_number, chunk in enumerate(chunks, 1):
+                    if progress_cb:
+                        progress_cb({
+                            "phase": "cross_script", "done": summary["directories"],
+                            "total": None, "chunk_done": chunk_number - 1,
+                            "chunk_active": chunk_number, "chunk_total": len(chunks),
+                            "updated_utc": datetime.now(timezone.utc).isoformat(),
+                            **summary,
+                        })
                     cross_script_groups.extend(
                         _llm_cross_script_cluster(client, chunk, model=model)
                     )
+                    if progress_cb:
+                        progress_cb({
+                            "phase": "cross_script", "done": summary["directories"],
+                            "total": None, "chunk_done": chunk_number,
+                            "chunk_active": None, "chunk_total": len(chunks),
+                            "updated_utc": datetime.now(timezone.utc).isoformat(),
+                            **summary,
+                        })
 
                 if cross_script_groups:
                     _deduplicate_labels(cross_script_groups)
@@ -982,12 +1065,19 @@ def _relate_impl(
                         len(g["members"]) for g in cross_script_groups
                     )
 
+        if progress_cb:
+            progress_cb({"phase": "finalizing", "done": summary["directories"],
+                         "total": None,
+                         "updated_utc": datetime.now(timezone.utc).isoformat(),
+                         **summary})
+
         # Singleton-to-folder linkage: attach remaining singletons to existing
         # groups based on numeric prefix or alpha token matching.
         try:
             linked = _link_singletons_to_folder_groups(session, session_id)
             if linked:
                 logger.info("Linked %d singletons to folder groups", linked)
+                summary["members"] += linked
         except Exception:
             # Best-effort — don't break the pipeline
             logger.warning("Singleton-to-folder linkage failed", exc_info=True)
@@ -1046,7 +1136,26 @@ def relate_with_progress(
     sentinel_done = object()
     sentinel_error = object()
     final_summary: dict = {}
+    stop_requested = threading.Event()
+    last_progress: dict = {
+        "phase": "starting", "directories": 0, "directories_done": 0,
+        "done": 0, "total": None, "groups": 0,
+        "updated_utc": datetime.now(timezone.utc).isoformat(),
+    }
     error_holder: list = [None]
+
+    def _signal(value: object) -> None:
+        """Deliver a terminal sentinel even if closing stopped queue consumption."""
+        while True:
+            try:
+                progress_queue.put_nowait(value)
+                return
+            except queue.Full:
+                try:
+                    progress_queue.get_nowait()
+                except queue.Empty:
+                    # The consumer made room between the two queue calls.
+                    pass
 
     def _progress_cb(progress: dict) -> None:
         """Invoked on worker thread per directory by relate()."""
@@ -1054,15 +1163,21 @@ def relate_with_progress(
         if pause_event is not None:
             pause_event.wait()
         # Cancel: raise to abort relate()'s loop
-        if cancel_check and cancel_check():
+        if stop_requested.is_set() or (cancel_check and cancel_check()):
             raise _RelateCancelled()
         try:
-            progress_queue.put_nowait({"phase": "running", **progress})
+            progress_queue.put_nowait({
+                "phase": "running", **progress,
+                "directories_done": progress.get("done", progress.get("directories", 0)),
+            })
         except queue.Full:
             # Drop oldest to make room
             try:
                 progress_queue.get_nowait()
-                progress_queue.put_nowait({"phase": "running", **progress})
+                progress_queue.put_nowait({
+                    "phase": "running", **progress,
+                    "directories_done": progress.get("done", progress.get("directories", 0)),
+                })
             except (queue.Empty, queue.Full):
                 pass
 
@@ -1086,15 +1201,16 @@ def relate_with_progress(
                 progress_cb=_progress_cb,
             )
             final_summary.update(summary)
-            progress_queue.put(sentinel_done)
+            _signal(sentinel_done)
         except _RelateCancelled:
-            progress_queue.put(sentinel_done)  # treat as graceful end
+            _signal(sentinel_done)  # treat as graceful end
         except Exception as exc:
             error_holder[0] = exc
-            progress_queue.put(sentinel_error)
+            _signal(sentinel_error)
 
-    # Initial yield so subscribers see the job has started
-    yield {"phase": "starting", "directories": 0, "groups": 0}
+    # Initial yield so subscribers see the job has started before the first
+    # potentially slow directory or model chunk completes.
+    yield dict(last_progress)
 
     # Suppress Rich/log output from inside relate()
     import contextlib
@@ -1109,28 +1225,35 @@ def relate_with_progress(
         from donedatahoarder.core.jobs import job_manager
         job_manager.start_tracked_worker(worker)
 
-        while True:
-            try:
-                msg = progress_queue.get(timeout=2.0)
-            except queue.Empty:
-                # Periodic cancel check while waiting for first progress
-                if cancel_check and cancel_check():
-                    yield {"cancelled": True, **final_summary}
-                    return
-                # Heartbeat to keep SSE alive
-                yield {"phase": "running", "heartbeat": True, **final_summary}
-                continue
+        try:
+            while True:
+                try:
+                    msg = progress_queue.get(timeout=2.0)
+                except queue.Empty:
+                    # Cancellation remains pending until the model call and
+                    # nested writer have exited. The next callback aborts it.
+                    cancelling = bool(cancel_check and cancel_check())
+                    yield {**last_progress,
+                           "phase": "cancelling" if cancelling else last_progress["phase"],
+                           "heartbeat": True,
+                           "heartbeat_utc": datetime.now(timezone.utc).isoformat()}
+                    continue
 
-            if msg is sentinel_done:
-                break
-            if msg is sentinel_error:
-                # Re-raise so JobManager marks the job FAILED
-                raise error_holder[0] if error_holder[0] else RuntimeError("relate failed")
+                if msg is sentinel_done:
+                    break
+                if msg is sentinel_error:
+                    # Re-raise so JobManager marks the job FAILED
+                    raise error_holder[0] if error_holder[0] else RuntimeError("relate failed")
 
-            yield msg
-
-        # Wait for worker to finish (it should already have)
-        worker.join(timeout=5.0)
+                last_progress = msg
+                yield msg
+        finally:
+            # Closing a generator must not detach a writer from the lease.
+            # Stop at its next callback, unpause it, and wait for it to exit.
+            stop_requested.set()
+            if pause_event is not None:
+                pause_event.set()
+            worker.join()
 
     # Detect cancellation: if cancel_check was true, we raised _RelateCancelled
     # mid-iteration; the worker put sentinel_done. We still need to surface that.
@@ -1138,4 +1261,5 @@ def relate_with_progress(
         yield {"cancelled": True, **final_summary}
         return
 
-    yield {"done": True, **final_summary}
+    yield {**final_summary, "directories_done": final_summary.get("directories", 0),
+           "total": final_summary.get("directories", 0), "done": True}

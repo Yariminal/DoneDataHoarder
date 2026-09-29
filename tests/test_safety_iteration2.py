@@ -448,7 +448,8 @@ def test_plan_projects_rename_move_keeper_and_collision(tmp_path, monkeypatch):
     source.write_bytes(b"A")
     victim_path = root / "victim.txt"
     victim_path.write_bytes(b"V")
-    occupied = root / "occupied.txt"
+    occupied = root / "occupied" / "victim.txt"
+    occupied.parent.mkdir()
     occupied.write_bytes(b"O")
     with Session(get_engine()) as db:
         source_file = File(session_id=sid, path=str(source), filename=source.name,

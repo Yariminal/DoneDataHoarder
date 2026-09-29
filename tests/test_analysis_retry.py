@@ -118,4 +118,5 @@ def test_cli_forwards_scoped_retry(tmp_path, monkeypatch):
     assert received == [{
         "workers": 1, "limit": None, "min_size_kb": 1,
         "session_id": "collection-id", "retry_errors": True,
+        "sequence_sample_stride": 0, "use_cache": True,
     }]

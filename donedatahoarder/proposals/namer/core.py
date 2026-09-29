@@ -16,10 +16,12 @@ from donedatahoarder.db.models import (
 from donedatahoarder.db.session import get_engine
 
 from .llm import translate_filename
-from .naming import _ensure_prefix, _is_useless_stem, _resolve_collision, build_new_name
+from .naming import (
+    _ensure_prefix, _is_useless_stem, _name_date_provenance,
+    _resolve_collision, build_new_name,
+)
 from .postpass import (
     _disambiguate_generic_stems_in_dir,
-    _flag_near_duplicate_proposals,
     _generate_fallback_for_useless_stems,
     _generate_hygiene_fallback,
     _normalize_spelling_in_proposals,
@@ -34,10 +36,52 @@ from .postpass import (
 
 _IDENTITY_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _GENERIC_SOURCE_TOKENS = {"img", "dsc", "image", "photo", "file", "untitled", "scan"}
+_SIGNED_TECH_RE = re.compile(
+    r"(?i)(?:^|[\s_])(?:level|elev(?:ation)?|height|ceiling|floor)[\s_]*[−-]\d+(?:\.\d+)?"
+)
+
+
+def _unsupported_name_inference(file_rec: File, proposed_stem: str) -> str | None:
+    """Catch specific model interpretations that readable content cannot certify.
+
+    These patterns caused observed false names: a signed plan elevation became
+    an ordinal floor, and an ambiguous render became an L-shaped object. Keep
+    the proposal out of the actionable queue when the original identity does
+    not independently establish that interpretation.
+    """
+    original = Path(file_rec.path).stem.casefold()
+    proposed = proposed_stem.casefold().replace("-", "_")
+    # A dotted numeric stem may be a drawing, sheet or version identifier.
+    # Neither model prose nor a date guessed from metadata establishes that
+    # `15.12` and `15_...` are interchangeable.
+    if re.fullmatch(r"\d{1,4}(?:\.\d{1,4})+", original):
+        if original not in proposed_stem.casefold():
+            return "source_numeric_identifier_lost"
+    if re.search(r"(?:^|_)\d+(?:st|nd|rd|th)(?:_|$)", proposed):
+        if not re.search(r"\d+(?:st|nd|rd|th)", original):
+            return "unverified_ordinal"
+    if re.search(r"(?:^|_)(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)(?:_|$)", proposed):
+        if not re.search(r"\b(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b", original):
+            return "unverified_ordinal"
+    if re.search(r"(?:^|_)(?:קומה|מפלס)_(?:ראשונה|שנייה|שלישית|רביעית|חמישית|שישית|שביעית|שמינית|תשיעית|עשירית|\d+)(?:_|$)", proposed):
+        if not re.search(r"(?:קומה|מפלס)[\s_-]?(?:ראשונה|שנייה|שלישית|רביעית|חמישית|שישית|שביעית|שמינית|תשיעית|עשירית|\d+)", original):
+            return "unverified_technical_level"
+    if re.search(r"(?:^|_)(?:floor|level|storey|story)_?\d+", proposed):
+        if not re.search(r"(?:floor|level|storey|story)[\s_-]?\d+", original):
+            return "unverified_technical_level"
+    # A single view of a render is weak evidence for a geometric shape label.
+    # Keep established identifiers such as an existing 'L-shape' filename.
+    if re.search(r"(?:^|_)(?:l|u|v|t|s|c|z)_?shap(?:e|ed)(?:_|$)", proposed):
+        if not re.search(r"(?:^|[\s_-])(?:l|u|v|t|s|c|z)[\s_-]?shap(?:e|ed)", original):
+            return "uncertain_shape_interpretation"
+    return None
 
 
 def _preserves_descriptive_identity(original_stem: str, proposed_stem: str) -> bool:
     """Do not trade an informative project filename for a generic AI label."""
+    signed = _SIGNED_TECH_RE.search(original_stem)
+    if signed and signed.group().strip().casefold() not in proposed_stem.casefold():
+        return False
     compact_id = any(
         (len(token) >= 2 and token.isupper())
         or (any(char.isalpha() for char in token) and any(char.isdigit() for char in token))
@@ -63,6 +107,9 @@ def _preserves_descriptive_identity(original_stem: str, proposed_stem: str) -> b
 def _restore_descriptive_identity(original_stem: str, proposed_stem: str) -> str:
     if _preserves_descriptive_identity(original_stem, proposed_stem):
         return proposed_stem
+    signed = _SIGNED_TECH_RE.search(original_stem)
+    if signed and signed.group().strip().casefold() not in proposed_stem.casefold():
+        return f"{original_stem}_{proposed_stem}"
     existing = {token.casefold() for token in _IDENTITY_TOKEN_RE.findall(proposed_stem)}
     original = [token for token in _IDENTITY_TOKEN_RE.findall(original_stem)
                 if token.casefold() not in _GENERIC_SOURCE_TOKENS]
@@ -109,8 +156,15 @@ def _suppress_unsafe_rename_postpasses(session_id: str | None,
     removed: dict[str, int] = {}
     with Session(get_engine()) as db:
         from donedatahoarder.core.dependency_protection import ProtectionIndex
+        from donedatahoarder.proposals.organizer.core import _inside_project, _project_roots
         owner = db.get(UserSession, session_id)
         protection = ProtectionIndex(Path(owner.root_path)) if owner and owner.root_path else None
+        project_roots = (
+            _project_roots(Path(owner.root_path),
+                           db.query(File).filter(File.session_id == session_id).yield_per(1000),
+                           protection)
+            if protection else set()
+        )
         proposals = (
             db.query(Proposal, File).join(File, Proposal.file_id == File.id)
             .filter(File.session_id == session_id,
@@ -119,6 +173,7 @@ def _suppress_unsafe_rename_postpasses(session_id: str | None,
             .all()
         )
         reserved = {Path(p.proposed_value) for p, _ in proposals if p.proposed_value}
+        next_suffixes: dict[Path, int] = {}
         for proposal, file_rec in proposals:
             original = Path(file_rec.path)
             proposed = Path(proposal.proposed_value or "")
@@ -127,8 +182,12 @@ def _suppress_unsafe_rename_postpasses(session_id: str | None,
             ))
             if file_rec.id in sequence_ids:
                 reason = "numbered_sequence"
+            elif _inside_project(original, project_roots):
+                reason = "project_subtree_preserved"
             elif protection and protection.assess(original).protected:
                 reason = "protected_resource"
+            elif (specificity := _unsupported_name_inference(file_rec, proposed.stem)):
+                reason = specificity
             elif borrowed and not _borrowed_name_supported(file_rec, proposed.stem):
                 # Related paths or a shared stem do not establish the same
                 # content. A target's own verified description must support
@@ -136,11 +195,19 @@ def _suppress_unsafe_rename_postpasses(session_id: str | None,
                 reason = "unsupported_relation_name_transfer"
             else:
                 restored = _restore_descriptive_identity(original.stem, proposed.stem)
+                if len(restored) > 96:
+                    # An identity-preserving suggestion must still be usable.
+                    # Keep the existing descriptive name for human review.
+                    reason = "name_too_long_after_identity_retention"
+                    removed[reason] = removed.get(reason, 0) + 1
+                    db.delete(proposal)
+                    continue
                 if restored != proposed.stem:
                     destination = proposed.with_name(restored + proposed.suffix)
                     if destination in reserved or destination.exists():
                         destination = _resolve_collision(destination, original,
-                                                         reserved_names=reserved)
+                                                         reserved_names=reserved,
+                                                         next_suffixes=next_suffixes)
                     reserved.add(destination)
                     proposal.proposed_value = str(destination)
                     proposal.reasoning = ((proposal.reasoning or "")
@@ -188,6 +255,15 @@ def _generate_proposals_impl(
                 session_root_path = user_sess.root_path
 
     with Session(engine) as session:
+        from donedatahoarder.core.dependency_protection import ProtectionIndex
+        from donedatahoarder.proposals.organizer.core import _inside_project, _project_roots
+
+        project_roots = (
+            _project_roots(Path(session_root_path),
+                           session.query(File).filter(File.session_id == session_id).yield_per(1000),
+                           ProtectionIndex(Path(session_root_path)))
+            if session_id and session_root_path else set()
+        )
         sequence_ids = {
             file_id for (file_id,) in (
                 session.query(RelationMember.file_id)
@@ -217,6 +293,7 @@ def _generate_proposals_impl(
         task = progress.add_task("Generating proposals…", total=total)
 
         reserved_names: set[Path] = set()  # Track proposed names to prevent collisions within batch
+        next_suffixes: dict[Path, int] = {}
 
         while True:
             # Build names inside a short read. translate_filename calls the LLM,
@@ -237,7 +314,8 @@ def _generate_proposals_impl(
                     verified = _content_verified_for_naming(file_rec)
                     new_name = (
                         build_new_name(file_rec, root_path=session_root_path)
-                        if verified and file_rec.id not in sequence_ids else None
+                        if verified and file_rec.id not in sequence_ids
+                        and not _inside_project(path, project_roots) else None
                     )
                     rename_name = None
                     if new_name and new_name != path.name:
@@ -245,7 +323,8 @@ def _generate_proposals_impl(
                         new_stem = Path(new_name).stem
                         new_stem = _ensure_prefix(new_stem, path.stem)
                         new_stem = _restore_descriptive_identity(path.stem, new_stem)
-                        rename_name = f"{new_stem}{Path(new_name).suffix}"
+                        if len(new_stem) <= 96 and not _unsupported_name_inference(file_rec, new_stem):
+                            rename_name = f"{new_stem}{Path(new_name).suffix}"
                     prepared.append({
                         "id": file_rec.id,
                         "path": path,
@@ -265,6 +344,7 @@ def _generate_proposals_impl(
                         item["path"].parent / new_name,
                         item["path"],
                         reserved_names=reserved_names,
+                        next_suffixes=next_suffixes,
                     )
                     reserved_names.add(proposed_path)
                     item["proposed_path"] = proposed_path
@@ -304,6 +384,7 @@ def _generate_proposals_impl(
                                 reasoning=(
                                     f"Renamed based on AI description: "
                                     f"{(item['ai_description'] or '')[:120]}"
+                                    + _name_date_provenance(file_rec, proposed_path.stem)
                                 ),
                                 confidence=(item["ai_confidence"] if item["ai_confidence"] is not None else 0.5),
                                 status=ProposalStatus.PENDING,
@@ -412,19 +493,6 @@ def _generate_proposals_impl(
             counts["spelling_normalized"] = spelling_fixed
     except Exception:
         # Normalisation is best-effort — never break the pipeline if it fails.
-        pass
-
-    # Post-pass 5: flag near-duplicate RENAME proposals. For files in the same
-    # directory with stems >= 0.92 similar, same extension, and same size,
-    # replace the later-mtime file's RENAME with a MARK_DUPLICATE proposal.
-    # This catches cases like "3.8 binoy -1.pdf" / "3.8-binoy -1.pdf" that
-    # should be deduplicated rather than both renamed.
-    try:
-        marked = _flag_near_duplicate_proposals(session_id)
-        if marked:
-            counts["marked_duplicates"] = marked
-    except Exception:
-        # Best-effort — never break the pipeline if it errors.
         pass
 
     if session_id:

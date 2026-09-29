@@ -64,6 +64,7 @@ web = [
 dev = [
     "pytest>=9.0,<10.0",
     "pytest-mock>=3.15,<4.0",
+    "python-docx>=1.1,<2.0",  # DOCX extraction regressions run in every CI matrix job
 ]
 all = ["donedatahoarder[docs,video,cloud,magic,web]"]
 
@@ -83,3 +84,6 @@ pythonpath = ["."]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["donedatahoarder*"]
+
+[tool.setuptools.package-data]
+"donedatahoarder.web" = ["templates/*.html", "static/*.css", "static/*.js", "static/vendor/*"]

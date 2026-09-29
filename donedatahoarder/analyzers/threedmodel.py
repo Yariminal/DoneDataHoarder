@@ -26,6 +26,8 @@ THREED_EXTENSIONS = {
 }
 
 MAX_HEADER_LINES = 80   # OBJ comment / group lines to extract
+MAX_OBJ_LINE_BYTES = 4096
+MAX_OBJ_HEADER_CHARS = 16000
 MAX_FBX_CHARS = 2000    # characters from FBX ASCII header
 
 THREED_PROMPT = """\
@@ -39,20 +41,23 @@ Extracted metadata / header (empty means binary format with no readable text):
 {header}
 ---
 
-Based on the filename, folder, file extension, and any extracted text, return a JSON object:
+Based on the filename, folder, file extension, and any extracted text, return
+a JSON object in this shape, replacing the example values:
 {{
-  "description": "1-2 sentences describing what this 3D asset likely is \
-(scene, character, prop, environment, vehicle, architectural model, etc.)",
-  "suggested_name": "meaningful filename stem — MUST preserve specific proper nouns \
-(asset names, project names, character names) from the original filename. \
-No extension, no date prefix, use_underscores, max 60 chars",
-  "tags": ["3d-model", "tag2", ...],
-  "asset_type": "one of: 3d_scene, 3d_character, 3d_prop, 3d_environment, \
-3d_vehicle, 3d_architecture, 3d_texture_set, other",
-  "software": "likely authoring software: 3ds_max, blender, rhino, maya, cinema4d, \
-generic — infer from file extension and filename clues, or null if unknown",
-  "confidence": 0.0-1.0
+  "description": "A concise description of the likely 3D asset.",
+  "suggested_name": "specific_asset_name",
+  "tags": ["3d-model", "specific_asset_type"],
+  "asset_type": "3d_scene",
+  "software": null,
+  "confidence": 0.8
 }}
+Describe the likely asset in 1-2 sentences. Preserve specific asset, project
+or character names from the original filename in suggested_name; omit extension
+and date prefix, use_underscores, max 60 chars. asset_type must be one of
+3d_scene, 3d_character, 3d_prop, 3d_environment, 3d_vehicle,
+3d_architecture, 3d_texture_set, other. Infer software from extension or name
+clues only: 3ds_max, blender, rhino, maya, cinema4d, generic, or null when
+unknown. confidence is 0 to 1.
 """
 
 
@@ -70,16 +75,25 @@ def _extract_obj_header(path: Path) -> str:
     """
     lines: list[str] = []
     try:
-        with open(path, encoding="utf-8", errors="ignore") as fh:
-            for i, raw in enumerate(fh):
-                if i > 500:
+        with open(path, "rb") as fh:
+            for _ in range(501):
+                raw = fh.readline(MAX_OBJ_LINE_BYTES + 1)
+                if not raw:
                     break
-                stripped = raw.strip()
+                if len(raw) > MAX_OBJ_LINE_BYTES and not raw.endswith(b"\n"):
+                    # Consume the rest of this oversized line in bounded chunks.
+                    while chunk := fh.readline(MAX_OBJ_LINE_BYTES + 1):
+                        if chunk.endswith(b"\n"):
+                            break
+                    continue
+                stripped = raw.decode("utf-8", errors="ignore").strip()
                 if stripped.startswith(("#", "mtllib", "usemtl", "o ", "g ")):
                     lines.append(stripped)
+                if len(lines) >= MAX_HEADER_LINES or sum(map(len, lines)) >= MAX_OBJ_HEADER_CHARS:
+                    break
     except OSError:
         pass
-    return "\n".join(lines[:MAX_HEADER_LINES])
+    return "\n".join(lines)[:MAX_OBJ_HEADER_CHARS]
 
 
 def _extract_fbx_header(path: Path) -> str:
