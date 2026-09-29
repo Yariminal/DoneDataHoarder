@@ -12,6 +12,7 @@ from pathlib import Path, PureWindowsPath
 from sqlalchemy.orm import Session
 
 from donedatahoarder.core.dependency_protection import ProtectionIndex
+from donedatahoarder.core.photo_quality import compare_photos
 from donedatahoarder.db.models import (
     DuplicateGroup, DuplicateMember, File, Proposal, ProposalType, UserSession,
 )
@@ -137,6 +138,7 @@ def duplicate_evidence(db: Session, proposal: Proposal, file: File) -> dict | No
         "similarity_score": membership.similarity_score if membership else None,
         "distance_to_keeper": membership.distance_to_keeper if membership else None,
         "sequence_comparison": sequence_comparison_metadata(file, keeper),
+        "photo_quality": compare_photos(file, keeper) if keeper else None,
         "member_ids": sorted(member.file_id for member in group.members),
     }
 
@@ -149,6 +151,39 @@ def proposal_review_token(db: Session, proposal: Proposal, file: File) -> str:
         file.path, file.hash_sha256, file.hash_md5, file.size_bytes,
         duplicate_evidence(db, proposal, file),
     ])
+
+
+def change_keeper(db: Session, session_id: str, group_id: int, file_id: int,
+                  *, expected_keeper_id: int | None = None) -> dict:
+    """Change a scoped keeper and invalidate decisions; caller holds the lease."""
+    from donedatahoarder.core.dedup import refresh_group_proposals
+
+    require_session(db, session_id)
+    group = db.get(DuplicateGroup, group_id)
+    if group is None or group.session_id != session_id:
+        raise ReviewError("Group not found in this session", 404)
+    if expected_keeper_id is not None and expected_keeper_id != group.keep_file_id:
+        raise ReviewError("Duplicate keeper changed; reopen the comparison")
+    invalid_member = (db.query(DuplicateMember.file_id)
+                      .outerjoin(File, File.id == DuplicateMember.file_id)
+                      .filter(DuplicateMember.group_id == group_id,
+                              File.id.is_(None) | (File.session_id != session_id)).first())
+    if invalid_member is not None:
+        raise ReviewError("Duplicate group contains files outside this session; rebuild its evidence")
+    keeper = (db.query(File).join(DuplicateMember, DuplicateMember.file_id == File.id)
+              .filter(DuplicateMember.group_id == group_id, File.id == file_id,
+                      File.session_id == session_id).first())
+    if keeper is None:
+        raise ReviewError("Keeper must be a file in this duplicate group", 400)
+    if group.keep_file_id == file_id:
+        return {"status": "unchanged", "keep_file_id": file_id, "review_reset": 0}
+    group.keep_file_id = file_id
+    try:
+        refreshed = refresh_group_proposals(db, group_id)
+    except ValueError as exc:
+        raise ReviewError(str(exc)) from exc
+    return {"status": "ok", "keep_file_id": file_id,
+            "review_reset": refreshed["changed"], "created": refreshed["created"]}
 
 
 def execution_preview(session_id: str) -> dict:
@@ -181,6 +216,7 @@ def execution_preview(session_id: str) -> dict:
                           .filter(DuplicateMember.file_id == proposal.file_id,
                                   DuplicateGroup.session_id == session_id).all())
                 item["keeper_groups"] = sorted((group.id, group.keep_file_id) for group in groups)
+                item["duplicate_evidence"] = duplicate_evidence(db, proposal, file) if file else None
             items.append(item)
         root_path = owner.root_path
     by_type: dict[str, int] = {}

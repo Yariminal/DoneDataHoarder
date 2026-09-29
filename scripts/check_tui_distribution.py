@@ -25,6 +25,7 @@ import zipfile
 
 REQUIRED_MEMBERS = {
     "donedatahoarder/cli.py", "donedatahoarder/core/review.py",
+    "donedatahoarder/core/photo_metadata.py", "donedatahoarder/core/photo_quality.py",
     "donedatahoarder/tui/__init__.py", "donedatahoarder/tui/app.py",
     "donedatahoarder/tui/images.py", "donedatahoarder/tui/launch.py",
     "donedatahoarder/tui/service.py", "donedatahoarder/tui/theme.py",
@@ -165,6 +166,9 @@ try:
     assert snapshot["counts"]["files"] == 2, snapshot["counts"]
     assert snapshot["counts"]["duplicates"] >= 1, snapshot["counts"]
     assert snapshot["proposals"], "Exact duplicate proposal missing"
+    assert all(file["photo_metadata"]["status"] == "complete" for file in snapshot["files"])
+    assert all(file["photo_metadata"]["width"] == 48 for file in snapshot["files"])
+    assert snapshot["proposals"][0]["duplicate_evidence"]["photo_quality"]["status"] == "equivalent"
     assert all(path.read_bytes() == original for path in root.glob("*.png"))
     async def render():
         app = DDHApp(workspace, image_capability=ImageCapabilities(renderer="off"))

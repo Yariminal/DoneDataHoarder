@@ -117,6 +117,7 @@ def test_catalog_and_workspace_serialize_semantic_commands_without_local_paths(t
         service.cancel_pipeline()
         service.approve(3, "review-evidence-token")
         service.reject(4)
+        service.set_keeper(8, 4, expected_keeper_id=3)
         service.edit(5, "Readable name.png")
         service.approve_clear(0.95)
         service.preview()
@@ -131,6 +132,7 @@ def test_catalog_and_workspace_serialize_semantic_commands_without_local_paths(t
         assert bodies[0]["model"] == "other-model"
         commands = {body["command"]: body["params"] for body in bodies[1:]}
         assert commands["approve"] == {"proposal_id": 3, "review_token": "review-evidence-token"}
+        assert commands["set_keeper"] == {"group_id": 8, "file_id": 4, "expected_keeper_id": 3}
         assert commands["apply"] == {"token": "preview-token", "confirmed": True}
         assert commands["undo"] == {"token": "undo-token", "confirmed": True}
         assert commands["edit"] == {"proposal_id": 5, "value": "Readable name.png"}

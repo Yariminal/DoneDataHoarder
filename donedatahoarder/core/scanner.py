@@ -425,6 +425,7 @@ def _scan_unlocked(
                     existing.hash_sha256 = None
                     existing.hash_perceptual = None
                     existing.date_exif = None
+                    existing.photo_metadata = None
                     existing.date_best = None
                     existing.ai_description = None
                     existing.ai_suggested_name = None

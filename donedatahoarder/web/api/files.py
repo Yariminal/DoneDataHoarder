@@ -11,6 +11,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Response
 from sqlalchemy.orm import Session
 
+from donedatahoarder.core.photo_quality import photo_evidence
 from donedatahoarder.db.models import File, FileStatus
 from donedatahoarder.db.session import get_engine
 
@@ -76,6 +77,7 @@ def list_files(
                 "extension": f.extension,
                 "size_bytes": f.size_bytes,
                 "mime_type": f.mime_type,
+                "photo_metadata": photo_evidence(f),
                 "status": f.status.value,
                 "date_best": f.date_best.isoformat() if f.date_best else None,
                 "ai_description": f.ai_description,
@@ -126,6 +128,7 @@ def get_file(file_id: int):
             "extension": f.extension,
             "size_bytes": f.size_bytes,
             "mime_type": f.mime_type,
+            "photo_metadata": photo_evidence(f),
             "hash_md5": f.hash_md5,
             "status": f.status.value,
             "date_modified": f.date_modified.isoformat() if f.date_modified else None,

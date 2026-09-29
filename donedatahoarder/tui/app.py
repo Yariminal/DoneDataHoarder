@@ -44,6 +44,63 @@ def human_size(value: Any) -> str:
     return "—"
 
 
+def photo_dimensions(photo: dict | None) -> str:
+    photo = photo or {}
+    width, height = photo.get("display_width") or photo.get("width"), photo.get("display_height") or photo.get("height")
+    if isinstance(width, (int, float)) and isinstance(height, (int, float)) and width > 0 and height > 0:
+        return f"{width:g}×{height:g} px · {width * height / 1_000_000:.1f} MP"
+    return "Pixel dimensions unknown"
+
+
+def photo_value(value: Any) -> str:
+    text = " ".join(readable(value).split())
+    return text if len(text) <= 512 else text[:512] + "…"
+
+
+def photo_metadata_summary(photo: dict | None) -> str:
+    """Render indexed capture evidence, keeping an unknown inventory explicit."""
+    photo = photo or {}
+    if photo.get("is_photo") is False or photo.get("status") == "not_photo":
+        return ""
+    lines = [photo_dimensions(photo)]
+    status = photo.get("status", "unknown")
+    fields = photo.get("fields") or {}
+    if status != "complete":
+        lines.append(f"Capture metadata inventory: {status}; absence is not established.")
+    elif not fields:
+        lines.append("No valid capture metadata found.")
+    for name, value in fields.items():
+        lines.append(f"{name.replace('_', ' ').capitalize()}: {photo_value(value)}")
+    lines.extend(photo_value(value) for value in photo.get("warnings", []))
+    return "\n".join(lines)
+
+
+def photo_quality_summary(quality: dict | None) -> str:
+    if not quality:
+        return ""
+    labels = {
+        "recommended": "PHOTO PRESERVATION · Keeper recommendation",
+        "tradeoff": "PHOTO TRADEOFF · Keep both for review",
+        "equivalent": "PHOTO EVIDENCE · Equivalent recorded evidence",
+        "unknown": "PHOTO EVIDENCE UNKNOWN · Keep both for review",
+        "variant": "PHOTO VARIANTS · Keep both for review",
+    }
+    candidate, keeper = quality.get("candidate") or {}, quality.get("keeper") or {}
+    lines = [labels.get(quality.get("status"), labels["unknown"]),
+             f"Candidate: {photo_dimensions(candidate)}",
+             f"Keeper: {photo_dimensions(keeper)}"]
+    lines.extend(photo_value(reason) for reason in quality.get("reasons", []))
+    for label, key, evidence in (("Only candidate retains", "candidate_unique_fields", candidate),
+                                 ("Only keeper retains", "keeper_unique_fields", keeper)):
+        for field in quality.get(key, []):
+            lines.append(f"{label} {field.replace('_', ' ')}: {photo_value((evidence.get('fields') or {}).get(field))}")
+    for field in quality.get("conflicting_fields", []):
+        lines.append(f"Conflicting {field.replace('_', ' ')}: candidate {photo_value((candidate.get('fields') or {}).get(field))}; keeper {photo_value((keeper.get('fields') or {}).get(field))}")
+    if quality.get("requires_review"):
+        lines.append("Inspect both originals. Pixel dimensions alone do not establish image quality or interchangeability.")
+    return "\n".join(lines)
+
+
 def duplicate_summary(evidence: dict) -> str:
     parts = [f"{str(evidence.get('type', 'Duplicate')).title()} candidate"]
     if evidence.get("exact_bytes") is True:
@@ -58,6 +115,8 @@ def duplicate_summary(evidence: dict) -> str:
         parts.append(f"Distance to keeper: {evidence['distance_to_keeper']}")
     if evidence.get("keeper_path"):
         parts.append(f"Keeper: {evidence['keeper_path']}")
+    if evidence.get("photo_quality"):
+        parts.append(photo_quality_summary(evidence["photo_quality"]))
     return "\n".join(parts)
 
 
@@ -136,18 +195,21 @@ class ImageScreen(ModalScreen[None]):
     ImageScreen { align: center middle; background: $background 90%; }
     ImageScreen > Vertical { width: 100%; height: 100%; border: solid $primary; background: $surface; padding: 0 1; }
     ImageScreen #image-heading { height: 1; color: $primary; }
-    ImageScreen #image-evidence { height: auto; max-height: 3; }
+    ImageScreen #image-evidence-scroll { height: auto; max-height: 7; }
+    ImageScreen #image-evidence { height: auto; }
     ImageScreen #image-panes { height: 1fr; }
     ImageScreen .image-column { width: 1fr; height: 1fr; border: solid $panel; }
     ImageScreen .image-name { height: auto; max-height: 5; padding: 0 1; }
     ImageScreen .image-preview { height: 1fr; }
+    ImageScreen .image-photo-scroll { height: auto; max-height: 6; padding: 0 1; }
+    ImageScreen .image-photo { height: auto; }
     ImageScreen #image-controls, ImageScreen #image-open-controls { height: 3; layout: horizontal; }
     ImageScreen Button { min-width: 5; margin-right: 1; padding: 0 1; }
     ImageScreen Select { width: 1fr; }
     ImageScreen #image-note { height: 1; color: $text-muted; }
     """
 
-    def __init__(self, file: dict, candidates: list[dict], *, capability: Any = None, evidence: str = "", source_factory: Callable | None = None, remote: bool = False) -> None:
+    def __init__(self, file: dict, candidates: list[dict], *, capability: Any = None, evidence: str = "", source_factory: Callable | None = None, remote: bool = False, keeper_callback: Callable | None = None) -> None:
         super().__init__()
         self.file, self.candidates, self.capability, self.evidence = file, candidates, capability, evidence
         self.candidate = candidates[0] if candidates else None
@@ -155,22 +217,28 @@ class ImageScreen(ModalScreen[None]):
         self.center = (0.5, 0.5)
         self.source_factory = source_factory or (lambda item: item["path"])
         self.remote = remote
+        self.keeper_callback = keeper_callback
 
     def compose(self) -> ComposeResult:
         with Vertical():
             yield Static("IMAGE COMPARISON" if self.candidates else "IMAGE PREVIEW", id="image-heading", markup=False)
             if self.candidates:
                 yield Select([(item.get("filename", str(item["id"])), str(item["id"])) for item in self.candidates], value=str(self.candidates[0]["id"]), allow_blank=False, id="image-candidate")
-            yield Static(self.evidence or "Visual inspection only. Review decisions are made in the Review workspace.", id="image-evidence", markup=False)
+            with VerticalScroll(id="image-evidence-scroll"):
+                yield Static(self.evidence or "Visual inspection only. Review decisions are made in the Review workspace.", id="image-evidence", markup=False)
             with Horizontal(id="image-panes"):
                 with Vertical(classes="image-column"):
                     yield Static(f"A · {self.file['path']}\n{human_size(self.file.get('size_bytes'))}", classes="image-name", id="image-a-name", markup=False)
+                    with VerticalScroll(classes="image-photo-scroll"):
+                        yield Static(photo_metadata_summary(self.file.get("photo_metadata")), classes="image-photo", id="image-a-photo", markup=False)
                     image = create_image_preview(self.source_factory(self.file), id="image-a", capability=self.capability)
                     image.add_class("image-preview")
                     yield image
                 if self.candidate:
                     with Vertical(classes="image-column"):
                         yield Static(f"B · {self.candidate['path']}\n{human_size(self.candidate.get('size_bytes'))}", classes="image-name", id="image-b-name", markup=False)
+                        with VerticalScroll(classes="image-photo-scroll"):
+                            yield Static(photo_metadata_summary(self.candidate.get("photo_metadata")), classes="image-photo", id="image-b-photo", markup=False)
                         image = create_image_preview(self.source_factory(self.candidate), id="image-b", capability=self.capability)
                         image.add_class("image-preview")
                         yield image
@@ -186,12 +254,41 @@ class ImageScreen(ModalScreen[None]):
                 yield Button("Open original", id="image-external", disabled=self.remote, tooltip="Original stays on the workstation; use inline preview." if self.remote else None)
                 if self.candidates:
                     yield Button("Open candidate", id="image-external-b", disabled=self.remote)
+                    yield Button("Keep A", id="image-keep-a", disabled=True)
+                    yield Button("Keep B", id="image-keep-b", disabled=True)
                 yield Button("Close", id="image-close")
             yield Static("1× fit · linked zoom/pan · original colors" + (" · workstation preview" if self.remote else ""), id="image-note", markup=False)
 
     def on_mount(self) -> None:
         self.query_one("#image-close", Button).focus()
         self.set_interval(0.3, self.update_dimensions)
+        self.update_keeper_controls()
+
+    def update_keeper_controls(self) -> None:
+        if not self.candidate:
+            return
+        enabled = bool(self.keeper_callback and self.candidate.get("comparison_group_id") is not None)
+        current = self.candidate.get("comparison_keeper_id")
+        for side, file in (("a", self.file), ("b", self.candidate)):
+            self.query_one(f"#image-keep-{side}", Button).disabled = not enabled or str(file["id"]) == str(current)
+
+    def choose_keeper(self, file: dict) -> None:
+        if not self.candidate or self.keeper_callback is None or self.candidate.get("comparison_group_id") is None:
+            return
+        group_id, file_id = self.candidate["comparison_group_id"], file["id"]
+        current_keeper = self.candidate.get("comparison_keeper_id")
+        if str(file_id) == str(current_keeper):
+            return
+
+        def confirmed(value: bool) -> None:
+            if value and self.is_mounted:
+                self.dismiss(None)
+                self.keeper_callback(group_id, file_id, expected_keeper_id=current_keeper)
+
+        self.app.push_screen(ConfirmScreen("Choose this photo as keeper?",
+            f"Keep: {file['path']}\n\n{photo_metadata_summary(file.get('photo_metadata'))}\n\n"
+            "Changing the keeper resets affected duplicate decisions for fresh review. Both files remain in place; this does not approve or apply any trash action.",
+            "Choose keeper"), confirmed)
 
     def update_dimensions(self) -> None:
         for side, file in (("a", self.file), ("b", self.candidate)):
@@ -229,6 +326,8 @@ class ImageScreen(ModalScreen[None]):
             self.query_one("#image-b").set_source(self.source_factory(selected))
             self.update_dimensions()
             self.query_one("#image-evidence", Static).update(selected.get("comparison_evidence") or self.evidence)
+            self.query_one("#image-b-photo", Static).update(photo_metadata_summary(selected.get("photo_metadata")))
+            self.update_keeper_controls()
             self.update_zoom()
 
     @on(Button.Pressed)
@@ -240,6 +339,8 @@ class ImageScreen(ModalScreen[None]):
             self.action_fit()
         elif action == "image-plus":
             self.action_zoom_in()
+        elif action in {"image-keep-a", "image-keep-b"}:
+            self.choose_keeper(self.file if action == "image-keep-a" else self.candidate)
         elif action == "image-minus":
             self.action_zoom_out()
         elif action in {"image-left", "image-right", "image-up", "image-down"}:
@@ -826,7 +927,8 @@ class DDHApp(App[None]):
         if file is None:
             proposal = next((item for item in self.snapshot.get("proposals", []) if str(item["file_id"]) == str(selected_id)), None)
             if proposal and proposal.get("file_path"):
-                file = {"id": proposal["file_id"], "path": proposal["file_path"], "filename": proposal.get("filename"), "mime_type": proposal.get("mime_type"), "status": proposal.get("status"), "preview_revision": proposal.get("preview_revision")}
+                quality = (proposal.get("duplicate_evidence") or {}).get("photo_quality") or {}
+                file = {"id": proposal["file_id"], "path": proposal["file_path"], "filename": proposal.get("filename"), "mime_type": proposal.get("mime_type"), "status": proposal.get("status"), "preview_revision": proposal.get("preview_revision"), "photo_metadata": proposal.get("photo_metadata") or quality.get("candidate")}
         return file
 
     def selected_proposal(self) -> dict | None:
@@ -847,6 +949,8 @@ class DDHApp(App[None]):
         if not file:
             return
         text = f"{file.get('filename')}\n{file.get('path')}\n\nType: {file.get('mime_type') or 'unknown'}\nSize: {human_size(file.get('size_bytes'))}\nState: {file.get('status')}\n\n{file.get('ai_description') or file.get('text') or 'No extracted description yet.'}"
+        if self.is_image(file):
+            text = f"{file.get('filename')}\n{file.get('path')}\n\nPHOTO EVIDENCE\n{photo_metadata_summary(file.get('photo_metadata'))}\n\n" + text.split("\n\n", 1)[1]
         self.query_one("#inspector-text", Static).update(text[:5000])
         image = self.query_one("#inspector-image")
         image.display = self.is_image(file) and self.storage_available
@@ -1039,21 +1143,22 @@ class DDHApp(App[None]):
                         pair_member = member if str(file["id"]) == str(keeper) else selected_member if str(member_id) == str(keeper) else None
                         pair_evidence = {"type": group.get("type"), "keeper_path": group.get("keeper_path")}
                         if pair_member:
-                            pair_evidence.update({key: pair_member.get(key) for key in ("exact_bytes", "matching_indexed_md5", "distance_to_keeper")})
+                            pair_evidence.update({key: pair_member.get(key) for key in ("exact_bytes", "matching_indexed_md5", "distance_to_keeper", "photo_quality")})
                         elif member.get("exact_bytes") is True and selected_member.get("exact_bytes") is True:
                             pair_evidence["exact_bytes"] = True
                         summary = duplicate_summary(pair_evidence)
-                        candidates[str(member_id)] = {**candidate, "comparison_evidence": summary}
+                        candidates[str(member_id)] = {**candidate, "photo_metadata": candidate.get("photo_metadata") or member.get("photo_metadata"), "comparison_evidence": summary, "comparison_group_id": group["id"], "comparison_keeper_id": keeper}
                         evidence.append(summary)
         if not candidates and proposal_evidence and proposal_evidence.get("keeper_path"):
             candidate = {"id": proposal_evidence.get("keeper_id"), "path": proposal_evidence["keeper_path"],
                          "filename": self.display_path(proposal_evidence["keeper_path"]).name,
                          "mime_type": proposal_evidence.get("keeper_mime_type"),
                          "preview_revision": proposal_evidence.get("keeper_preview_revision"),
+                         "photo_metadata": (proposal_evidence.get("photo_quality") or {}).get("keeper"),
                          "size_bytes": proposal_evidence.get("keeper_size_bytes")}
             if self.is_image(candidate) and str(candidate["id"]) != str(file["id"]):
                 summary = duplicate_summary(proposal_evidence)
-                candidates[str(candidate["id"])] = {**candidate, "comparison_evidence": summary}
+                candidates[str(candidate["id"])] = {**candidate, "comparison_evidence": summary, "comparison_group_id": proposal_evidence.get("group_id"), "comparison_keeper_id": proposal_evidence.get("keeper_id")}
                 evidence.append(summary)
         return list(candidates.values()), evidence[0] if evidence else ""
 
@@ -1080,7 +1185,11 @@ class DDHApp(App[None]):
             self.notify("No duplicate image candidates recorded. Run the Dedup stage first.")
             self.push_screen(ImageScreen(file, [], capability=self.image_capability, source_factory=self.preview_source, remote=bool(self.remote_connection)))
             return
-        self.push_screen(ImageScreen(file, candidates, capability=self.image_capability, evidence=evidence, source_factory=self.preview_source, remote=bool(self.remote_connection)))
+        self.push_screen(ImageScreen(file, candidates, capability=self.image_capability, evidence=evidence, source_factory=self.preview_source, remote=bool(self.remote_connection), keeper_callback=self.choose_photo_keeper if hasattr(self.service, "set_keeper") else None))
+
+    def choose_photo_keeper(self, group_id: int, file_id: int, *, expected_keeper_id: int | None = None) -> None:
+        self.operate("set_keeper", group_id, file_id, expected_keeper_id=expected_keeper_id,
+                     completed=lambda _: self.action_workspace("review"))
 
     def action_safe_quit(self) -> None:
         if self.remote_connection and not self.busy and not any(isinstance(screen, SessionScreen) and screen.opening for screen in self.screen_stack):

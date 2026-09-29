@@ -148,6 +148,10 @@ class File(Base):
     hash_sha256: Mapped[Optional[str]] = mapped_column(String(64), index=True)
     hash_perceptual: Mapped[Optional[str]] = mapped_column(String, index=True)  # images
 
+    # Versioned, content-bound dimensions and validated EXIF for photo review.
+    # NULL means older/uninspected evidence, never confirmed metadata absence.
+    photo_metadata: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     # --- dates ---
     date_modified: Mapped[Optional[datetime]] = mapped_column(DateTime)
     date_created: Mapped[Optional[datetime]] = mapped_column(DateTime)

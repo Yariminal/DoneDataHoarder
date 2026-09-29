@@ -13,6 +13,12 @@ add LAN, reconnect, and storage qualification to the release gates below.
 The [nearby-workstation implementation](REMOTE_DISCOVERY_PLAN.md) adds automatic
 discovery and one-time pairing to simplify the remote connection experience.
 
+The [photo keeper requirement](PHOTO_KEEPER_POLICY.md) records the user's core
+duplicate-photo intent: retain the best available resolution and meaningful EXIF,
+with explicit review when those criteria favor different copies. The implemented
+policy adds structured extraction, shared ranking, comparison evidence, and
+local/remote keeper selection; existing indexes have an explicit refresh command.
+
 The product promise is: open a messy folder, watch the real pipeline explain its
 work, compare duplicate candidates visually, inspect the proposed organization,
 and apply reviewed changes with a recoverable history. The full pipeline stays:

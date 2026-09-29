@@ -16,8 +16,9 @@ from donedatahoarder.core import job_store
 from donedatahoarder.core.dependency_protection import cached_protection_index
 from donedatahoarder.core.jobs import job_manager
 from donedatahoarder.core.process_lock import operation_lock
+from donedatahoarder.core.photo_quality import compare_photos, photo_evidence
 from donedatahoarder.core.review import (
-    ReviewError, duplicate_evidence, execution_preview, fingerprint,
+    ReviewError, change_keeper, duplicate_evidence, execution_preview, fingerprint,
     indexed_md5_match, owned_proposal, proposal_review_token, protected_reason,
     protection_index, require_session, stored_sha256_match, validated_edit,
     within_root,
@@ -46,6 +47,7 @@ def _file_dict(file: File) -> dict:
         "size_bytes": file.size_bytes, "extension": file.extension,
         "status": file.status.value, "date_modified": _iso(file.date_modified),
         "date_exif": _iso(file.date_exif), "ai_description": file.ai_description,
+        "photo_metadata": photo_evidence(file),
         "text": file.ai_transcript or "", "tags": file.tags_list(),
         "analysis_outcome": file.analysis_outcome,
         "analysis_reason": file.analysis_reason,
@@ -221,6 +223,7 @@ class WorkspaceService:
                                         "similarity_score": member.similarity_score,
                                         "distance_to_keeper": member.distance_to_keeper,
                                         "exact_bytes": stored_sha256_match(file, keeper),
+                                        "photo_quality": compare_photos(file, keeper) if keeper else None,
                                         "matching_indexed_md5": indexed_md5_match(file, keeper)})
                 duplicates.append({"id": group.id, "type": group.dupe_type.value,
                                    "keep_file_id": keeper.id if keeper else None,
@@ -398,6 +401,15 @@ class WorkspaceService:
             proposal.status = ProposalStatus.REJECTED
             db.commit()
         return {"id": proposal_id, "status": "rejected"}
+
+    def set_keeper(self, group_id: int, file_id: int,
+                   expected_keeper_id: int | None = None) -> dict:
+        with operation_lock("change terminal duplicate keeper"), Session(self.engine) as db:
+            self._idle()
+            result = change_keeper(db, self.session_id, group_id, file_id,
+                                   expected_keeper_id=expected_keeper_id)
+            db.commit()
+        return result
 
     def edit(self, proposal_id: int, value: str) -> dict:
         with operation_lock("edit terminal proposal"), Session(self.engine) as db:

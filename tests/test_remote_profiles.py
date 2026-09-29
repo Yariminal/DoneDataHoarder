@@ -372,6 +372,25 @@ def test_suspicious_profile_symlink_is_rejected(tmp_path, certificate):
     assert target.read_text() == "unchanged"
 
 
+def test_profile_write_preserves_preflight_policy_error_without_writes(tmp_path, certificate, monkeypatch):
+    # Windows may not permit creating the real symlink used above. Exercise
+    # policy-error propagation on every platform so the diagnostic cannot be
+    # accidentally wrapped as a generic serialization failure again.
+    from donedatahoarder.remote import profiles
+    store = ProfileStore(tmp_path / "uncreated-state")
+    saved = profile(certificate)
+    rejected = RemoteError("Saved workstation state must not use symlinks or junctions.")
+
+    def reject_path(path):
+        raise rejected
+
+    monkeypatch.setattr(profiles, "_no_links", reject_path)
+    with pytest.raises(RemoteError, match="symlinks") as caught:
+        store.save(saved)
+    assert caught.value is rejected
+    assert not store.directory.exists()
+
+
 def test_unavailable_discovery_falls_back_to_last_address(tmp_path, certificate):
     store = ProfileStore(tmp_path)
     saved = profile(certificate)

@@ -94,6 +94,40 @@ def test_auth_precedes_every_route_and_unrelated_routes_do_not_exist(workstation
         assert client.get(path, follow_redirects=False).status_code == 404
 
 
+def test_remote_keeper_change_is_scoped_receipted_and_rejects_stale_comparison(workstation):
+    client, _, root, _, _ = workstation
+    session_id = open_session(client)
+    first = add_file(session_id, root / "first.jpg")
+    second = add_file(session_id, root / "second.jpg")
+    with Session(get_engine()) as db:
+        group = DuplicateGroup(session_id=session_id, dupe_type=DupeType.EXACT,
+                               group_hash="keeper-command", keep_file_id=first)
+        db.add(group)
+        db.flush()
+        db.add_all([DuplicateMember(group_id=group.id, file_id=first),
+                    DuplicateMember(group_id=group.id, file_id=second)])
+        db.commit()
+        group_id = group.id
+    params = {"group_id": group_id, "file_id": second, "expected_keeper_id": first}
+    request_id = str(uuid4())
+    result = command(client, session_id, "set_keeper", params, request_id)
+    assert result.status_code == 200, result.text
+    assert result.json()["result"]["keep_file_id"] == second
+    replay = command(client, session_id, "set_keeper", params, request_id)
+    assert replay.json() == result.json()
+    stale = command(client, session_id, "set_keeper",
+                    {"group_id": group_id, "file_id": first, "expected_keeper_id": first})
+    assert stale.json()["state"] == "failed"
+    assert "changed" in str(stale.json())
+    other = open_session(client)
+    foreign = command(client, other, "set_keeper", params)
+    assert foreign.json()["state"] == "failed"
+    with Session(get_engine()) as db:
+        assert db.get(DuplicateGroup, group_id).keep_file_id == second
+    assert (root / "first.jpg").read_text() == "sample"
+    assert (root / "second.jpg").read_text() == "sample"
+
+
 def test_bad_configuration_fails_before_creating_database(tmp_path):
     database = tmp_path / "never-created.db"
     with pytest.raises(ValueError, match="32"):

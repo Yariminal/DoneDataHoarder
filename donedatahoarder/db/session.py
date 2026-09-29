@@ -39,6 +39,7 @@ def _migrate_add_columns(engine: Engine, inspector) -> None:
         ("sessions", "propose_model", "VARCHAR", "NULL"),
         ("sessions", "relate_scope", "VARCHAR", "'per_directory'"),
         ("files", "date_created_source", "VARCHAR", "NULL"),
+        ("files", "photo_metadata", "TEXT", "NULL"),
         ("scan_sessions", "last_scanned_path", "VARCHAR", "NULL"),
         ("files", "analysis_outcome", "VARCHAR", "NULL"),
         ("files", "analysis_reason", "VARCHAR", "NULL"),

@@ -85,6 +85,11 @@ def _write(path: Path, value: dict) -> None:
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
+    except RemoteError:
+        # Policy failures already carry bounded, secret-free diagnostics.
+        # RemoteError inherits ValueError, so preserve them before wrapping
+        # lower-level serialization and filesystem errors.
+        raise
     except (OSError, ValueError, TypeError):
         raise RemoteError("Cannot save workstation state. Check its private state directory.") from None
     finally:

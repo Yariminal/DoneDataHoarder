@@ -57,6 +57,7 @@ DoneDataHoarder is a **local-first, AI-powered file organizer** that:
 - **Exact deduplication** — Remove byte-for-byte identical files
 - **Near-duplicate detection** — Perceptual hashing identifies visually/structurally similar files
 - **Configurable similarity threshold** — Fine-tune what counts as a duplicate
+- **Photo keeper evidence** — Prefer measured resolution and meaningful EXIF; show unique metadata, conflicting values, and preservation tradeoffs before review. Existing indexes can use `ddh refresh-photos --db INDEX --session SESSION_ID`. See the [photo keeper policy](docs/PHOTO_KEEPER_POLICY.md).
 
 ### Relationship Grouping
 - Groups related files by folder structure and LLM reasoning

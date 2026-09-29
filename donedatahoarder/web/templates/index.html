@@ -358,6 +358,7 @@
               <dt>Status</dt><dd><span class="badge" :class="'badge-' + selectedFile.status" x-text="selectedFile.status"></span></dd>
               <dt>Date (best)</dt><dd x-text="selectedFile.date_best || '-'"></dd>
               <dt>Date EXIF</dt><dd x-text="selectedFile.date_exif || '-'"></dd>
+              <dt x-show="selectedFile.photo_metadata?.is_photo || selectedFile.mime_type?.startsWith('image/')">Photo evidence</dt><dd x-show="selectedFile.photo_metadata?.is_photo || selectedFile.mime_type?.startsWith('image/')" x-text="window.photoMetadataText(selectedFile.photo_metadata)" style="white-space:pre-wrap;overflow-wrap:anywhere;"></dd>
               <dt>Model</dt><dd x-text="selectedFile.analysis_model_tag || selectedFile.ai_model || '-'"></dd>
               <dt>Model digest</dt><dd class="text-mono text-sm" x-text="selectedFile.analysis_model_digest || '-'"></dd>
               <dt>Evidence</dt><dd x-text="`${selectedFile.analysis_outcome || 'Unknown'} · ${selectedFile.analysis_evidence_source || 'unknown source'}`"></dd>
@@ -487,7 +488,7 @@
                         <div x-show="p.protected" style="color:var(--danger)"><strong>Protected:</strong> <span x-text="p.protection_reason"></span></div>
                         <template x-if="p.proposal_type === 'mark_duplicate'">
                           <div class="mt-1">
-                            <div x-text="duplicateEvidenceText(p.duplicate_evidence)"></div>
+                            <div x-text="duplicateEvidenceText(p.duplicate_evidence)" style="white-space:pre-wrap;"></div>
                             <div x-show="p.duplicate_evidence?.type !== 'exact'" style="color:var(--warning)">Similarity comparison only. Both files require individual inspection; bulk trash approval is disabled and disposal is not implied.</div>
                             <div x-show="p.duplicate_evidence?.sequence_comparison" class="review-note"
                                  x-text="p.duplicate_evidence?.sequence_comparison?.note + ' This is one sampled comparison; other frames were not designated duplicates.'"></div>
@@ -558,7 +559,7 @@
                  style="max-width:900px; max-height:90vh; overflow:auto;">
               <div class="modal-title">Compare candidate and selected keeper</div>
               <p class="review-note" style="color:var(--warning)">This is an unverified similarity comparison. These files may serve different purposes. Approval will move the candidate to .ddh_trash when you commit; it does not prove the files are interchangeable.</p>
-              <p class="text-sm" x-text="duplicateEvidenceText(duplicateReview.duplicate_evidence)"></p>
+              <p class="text-sm" x-text="duplicateEvidenceText(duplicateReview.duplicate_evidence)" style="white-space:pre-wrap;"></p>
               <p class="text-sm text-dim">File details below come from the current indexed records. Inspect the original files when these previews do not show enough content.</p>
               <div class="duplicate-comparison-grid">
                 <div style="min-width:0;overflow-wrap:anywhere;">
@@ -566,6 +567,7 @@
                   <template x-if="hasImage(duplicateReviewFiles.candidate.id, duplicateReviewFiles.candidate.mime_type)"><img :src="'/api/files/' + duplicateReviewFiles.candidate.id + '/thumbnail?size=400'" loading="lazy" alt="Candidate image" style="display:block;max-width:100%;max-height:300px;margin:8px 0;"></template>
                   <div x-text="duplicateReviewFiles.candidate.path"></div>
                   <div class="text-sm" x-text="(duplicateReviewFiles.candidate.mime_type || 'Unknown type') + ' · ' + duplicateReviewFiles.candidate.size_bytes + ' bytes'"></div>
+                  <div class="text-sm" x-show="duplicateReviewFiles.candidate.photo_metadata?.is_photo || hasImage(duplicateReviewFiles.candidate.id, duplicateReviewFiles.candidate.mime_type)" x-text="window.photoMetadataText(duplicateReviewFiles.candidate.photo_metadata)" style="white-space:pre-wrap;"></div>
                   <div class="review-note" x-text="comparisonProvenance(duplicateReviewFiles.candidate)"></div>
                   <div class="text-sm" x-text="duplicateReviewFiles.candidate.ai_description || 'No content description'"></div>
                   <pre class="text-sm" x-show="duplicateReviewFiles.candidate.ai_transcript" x-text="duplicateReviewFiles.candidate.ai_transcript" style="white-space:pre-wrap;"></pre>
@@ -575,6 +577,7 @@
                   <template x-if="hasImage(duplicateReviewFiles.keeper.id, duplicateReviewFiles.keeper.mime_type)"><img :src="'/api/files/' + duplicateReviewFiles.keeper.id + '/thumbnail?size=400'" loading="lazy" alt="Selected keeper image" style="display:block;max-width:100%;max-height:300px;margin:8px 0;"></template>
                   <div x-text="duplicateReviewFiles.keeper.path"></div>
                   <div class="text-sm" x-text="(duplicateReviewFiles.keeper.mime_type || 'Unknown type') + ' · ' + duplicateReviewFiles.keeper.size_bytes + ' bytes'"></div>
+                  <div class="text-sm" x-show="duplicateReviewFiles.keeper.photo_metadata?.is_photo || hasImage(duplicateReviewFiles.keeper.id, duplicateReviewFiles.keeper.mime_type)" x-text="window.photoMetadataText(duplicateReviewFiles.keeper.photo_metadata)" style="white-space:pre-wrap;"></div>
                   <div class="review-note" x-text="comparisonProvenance(duplicateReviewFiles.keeper)"></div>
                   <div class="text-sm" x-text="duplicateReviewFiles.keeper.ai_description || 'No content description'"></div>
                   <pre class="text-sm" x-show="duplicateReviewFiles.keeper.ai_transcript" x-text="duplicateReviewFiles.keeper.ai_transcript" style="white-space:pre-wrap;"></pre>
@@ -641,6 +644,7 @@
                   <div class="text-mono text-sm" x-text="f.path"></div>
                   <div class="text-sm" x-text="f.ai_description || 'No content description'"></div>
                   <div class="text-sm text-dim" x-text="formatBytes(f.size_bytes)"></div>
+                  <div class="text-sm" x-show="f.photo_metadata?.is_photo || isImage(f)" x-text="window.photoMetadataText(f.photo_metadata)" style="white-space:pre-wrap;"></div>
                   <div class="text-sm" x-show="f.protected" style="color:var(--danger)" x-text="'Protected: ' + f.protection_reason"></div>
                 </div>
                 <div style="min-width:0;overflow-wrap:anywhere;">
@@ -649,7 +653,8 @@
                   <div class="text-mono text-sm" x-text="keeper(g)?.path || 'No keeper selected'"></div>
                   <div class="text-sm" x-text="keeper(g)?.ai_description || 'No content description'"></div>
                   <div class="text-sm text-dim" x-text="keeper(g) ? formatBytes(keeper(g).size_bytes) : ''"></div>
-                  <div class="text-sm text-dim" x-text="evidenceText(g, f)"></div>
+                  <div class="text-sm" x-show="keeper(g)?.photo_metadata?.is_photo || (keeper(g) && isImage(keeper(g)))" x-text="window.photoMetadataText(keeper(g)?.photo_metadata)" style="white-space:pre-wrap;"></div>
+                  <div class="text-sm text-dim" x-text="evidenceText(g, f)" style="white-space:pre-wrap;"></div>
                   <div class="review-note" x-show="f.closest_observed_peer">
                     <strong>Closest observed direct visual match</strong>
                     <template x-if="f.closest_observed_peer">

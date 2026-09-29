@@ -4,6 +4,49 @@
 
 document.addEventListener('alpine:init', () => {
 
+  const photoValue = value => {
+    const text = String(value == null ? 'Unknown' : typeof value === 'object' ? JSON.stringify(value) : value).replace(/\s+/g, ' ');
+    return text.length <= 512 ? text : text.slice(0, 512) + '…';
+  };
+  const photoDimensions = photo => {
+    const width = photo?.display_width || photo?.width;
+    const height = photo?.display_height || photo?.height;
+    return Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0
+      ? `${width}×${height} px · ${(width * height / 1000000).toFixed(1)} MP`
+      : 'Pixel dimensions unknown';
+  };
+  window.photoMetadataText = function (photo) {
+    if (photo?.is_photo === false || photo?.status === 'not_photo') return '';
+    const fields = photo?.fields || {};
+    const lines = [photoDimensions(photo)];
+    if (photo?.status !== 'complete') lines.push(`Capture metadata inventory: ${photo?.status || 'unknown'}; absence is not established.`);
+    else if (!Object.keys(fields).length) lines.push('No valid capture metadata found.');
+    for (const [field, value] of Object.entries(fields)) lines.push(`${field.replaceAll('_', ' ')}: ${photoValue(value)}`);
+    for (const warning of photo?.warnings || []) lines.push(photoValue(warning));
+    return lines.join('\n');
+  };
+  window.photoQualityText = function (quality) {
+    if (!quality) return '';
+    const labels = {
+      recommended: 'PHOTO PRESERVATION · Keeper recommendation',
+      tradeoff: 'PHOTO TRADEOFF · Keep both for review',
+      equivalent: 'PHOTO EVIDENCE · Equivalent recorded evidence',
+      unknown: 'PHOTO EVIDENCE UNKNOWN · Keep both for review',
+      variant: 'PHOTO VARIANTS · Keep both for review',
+    };
+    const candidate = quality.candidate || {}, keeper = quality.keeper || {};
+    const lines = [labels[quality.status] || labels.unknown,
+      `Candidate: ${photoDimensions(candidate)}`, `Keeper: ${photoDimensions(keeper)}`,
+      ...(quality.reasons || []).map(photoValue)];
+    for (const [label, key, evidence] of [
+      ['Only candidate retains', 'candidate_unique_fields', candidate],
+      ['Only keeper retains', 'keeper_unique_fields', keeper],
+    ]) for (const field of quality[key] || []) lines.push(`${label} ${field.replaceAll('_', ' ')}: ${photoValue(evidence.fields?.[field])}`);
+    for (const field of quality.conflicting_fields || []) lines.push(`Conflicting ${field.replaceAll('_', ' ')}: candidate ${photoValue(candidate.fields?.[field])}; keeper ${photoValue(keeper.fields?.[field])}`);
+    if (quality.requires_review) lines.push('Inspect both originals. Pixel dimensions alone do not establish image quality or interchangeability.');
+    return lines.join('\n');
+  };
+
   window.trapDialogTab = function (event) {
     const dialog = event.currentTarget;
     const choices = [...dialog.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), a[href]')]
@@ -1098,6 +1141,7 @@ document.addEventListener('alpine:init', () => {
         expected_keeper_id: files.keeper.id,
         expected_candidate_path: files.candidate.path,
         expected_keeper_path: files.keeper.path,
+        ...(candidate.review_token ? { expected_review_token: candidate.review_token } : {}),
       };
       this.cancelDuplicateReview();
       await this.approve(candidate.id, comparison);
@@ -1118,9 +1162,11 @@ document.addEventListener('alpine:init', () => {
     async approve(id, comparison = null) {
       if (!this.canActOn(id)) return;
       const sid = Alpine.store('session').current_session_id;
+      const proposal = this.proposals.find(p => p.id === id);
       try {
         await api.post(`/proposals/${id}/approve`, {
           session_id: sid,
+          ...(proposal?.review_token ? { expected_review_token: proposal.review_token } : {}),
           ...(comparison || {}),
         });
         if (sid !== Alpine.store('session').current_session_id || this._sessionId !== sid) return;
@@ -1259,6 +1305,9 @@ document.addEventListener('alpine:init', () => {
       return 'Analysis provenance unknown; inspect the original file.';
     },
     duplicateEvidenceText(evidence) {
+      return [this.duplicateByteEvidenceText(evidence), window.photoQualityText(evidence?.photo_quality)].filter(Boolean).join('\n');
+    },
+    duplicateByteEvidenceText(evidence) {
       if (!evidence) return 'Keeper evidence is unavailable; review this candidate individually.';
       if (evidence.exact_bytes === true) return 'Stored SHA-256 hashes match the keeper; execution rechecks the live bytes.';
       if (evidence.exact_bytes === false) return 'Stored SHA-256 hashes differ from the keeper. Do not discard this candidate.';
@@ -1330,10 +1379,13 @@ document.addEventListener('alpine:init', () => {
 
     async setKeeper(groupId, fileId) {
       const sid = Alpine.store('session').current_session_id;
+      const displayedGroup = this.groups.find(group => group.id === groupId);
       if (!sid || this.snapshotMode || this._sessionId !== sid ||
-          !this.groups.some(group => group.id === groupId && group.files.some(file => file.id === fileId))) return;
+          !displayedGroup?.files.some(file => file.id === fileId)) return;
       try {
-        const result = await api.post(`/duplicates/${groupId}/keeper`, { session_id: sid, keep_file_id: fileId });
+        const result = await api.post(`/duplicates/${groupId}/keeper`, {
+          session_id: sid, keep_file_id: fileId, expected_keeper_id: displayedGroup.keep_file_id,
+        });
         if (sid !== Alpine.store('session').current_session_id) return;
         await this.load();
         window._dataVersion++;
@@ -1362,6 +1414,9 @@ document.addEventListener('alpine:init', () => {
     keeper(g) { return g.files.find(f => f.id === g.keep_file_id) || null; },
     candidates(g) { return g.files.filter(f => f.id !== g.keep_file_id); },
     evidenceText(g, f) {
+      return [this.byteEvidenceText(g, f), window.photoQualityText(f.photo_quality)].filter(Boolean).join('\n');
+    },
+    byteEvidenceText(g, f) {
       if (f.exact_bytes_to_keeper === true) return 'Stored SHA-256 hashes match; live bytes are checked again before trash.';
       if (f.exact_bytes_to_keeper === false) return 'Stored SHA-256 hashes differ; do not discard this candidate.';
       if (g.dupe_type === 'exact') {

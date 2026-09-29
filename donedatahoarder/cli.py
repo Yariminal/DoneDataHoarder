@@ -294,6 +294,29 @@ def enrich(
 
 
 # ---------------------------------------------------------------------------
+# refresh-photos
+# ---------------------------------------------------------------------------
+
+@app.command("refresh-photos")
+def refresh_photos(
+    session_id: Annotated[str, typer.Option("--session", help="Existing session to refresh.")],
+    db: Annotated[str, typer.Option("--db", help="SQLite database path.", envvar="DDH_DB")] = "donedatahoarder.db",
+    workers: Annotated[int, typer.Option("--workers", "-w", min=1, max=32)] = 1,
+):
+    """Refresh indexed photo evidence without resetting analysis or changing photos."""
+    _init_db(db)
+    from donedatahoarder.core.enricher import refresh_photo_metadata
+    try:
+        counts = refresh_photo_metadata(session_id=session_id, workers=workers)
+    except ValueError as exc:
+        console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(1) from exc
+    console.print("Photo evidence refreshed. Existing keepers are preserved; inspect comparisons before approving.")
+    for name, count in counts.items():
+        console.print(f"{name}: {count}", markup=False)
+
+
+# ---------------------------------------------------------------------------
 # analyze
 # ---------------------------------------------------------------------------
 

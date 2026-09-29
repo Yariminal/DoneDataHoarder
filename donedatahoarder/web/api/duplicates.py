@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 
 from donedatahoarder.core.dependency_protection import cached_protection_index
 from donedatahoarder.core.dedup import closest_perceptual_peer, sequence_comparison_metadata
+from donedatahoarder.core.photo_quality import compare_photos, photo_evidence
+from donedatahoarder.core.review import ReviewError, change_keeper
 from donedatahoarder.db.models import DuplicateGroup, DuplicateMember, File, UserSession
 from donedatahoarder.db.session import get_engine
 
@@ -39,7 +41,9 @@ def list_duplicates(page: int = Query(1, ge=1), per_page: int = Query(20, ge=1, 
         items = []
         for g in groups:
             files = []
-            member_query = session.query(DuplicateMember).filter(DuplicateMember.group_id == g.id)
+            member_query = (session.query(DuplicateMember)
+                            .join(File, File.id == DuplicateMember.file_id)
+                            .filter(DuplicateMember.group_id == g.id, File.session_id == session_id))
             member_count = member_query.count()
             visible_members = member_query.order_by(DuplicateMember.file_id).limit(100).all()
             if g.keep_file_id and all(m.file_id != g.keep_file_id for m in visible_members):
@@ -50,12 +54,14 @@ def list_duplicates(page: int = Query(1, ge=1), per_page: int = Query(20, ge=1, 
             if g.dupe_type.value == "perceptual":
                 peer_rows = (session.query(File.id, File.path, File.hash_perceptual)
                              .join(DuplicateMember, DuplicateMember.file_id == File.id)
-                             .filter(DuplicateMember.group_id == g.id)
+                             .filter(DuplicateMember.group_id == g.id, File.session_id == session_id)
                              .order_by(File.id).limit(256).all())
             keeper = session.get(File, g.keep_file_id) if g.keep_file_id else None
+            if keeper and keeper.session_id != session_id:
+                keeper = None
             for m in visible_members:
                 f = session.get(File, m.file_id)
-                if f:
+                if f and f.session_id == session_id:
                     is_keeper = f.id == g.keep_file_id
                     decision = protection.assess(Path(f.path)) if protection else None
                     files.append({
@@ -66,6 +72,8 @@ def list_duplicates(page: int = Query(1, ge=1), per_page: int = Query(20, ge=1, 
                         "date_best": f.date_best.isoformat() if f.date_best else None,
                         "is_keeper": is_keeper,
                         "mime_type": f.mime_type,
+                        "photo_metadata": photo_evidence(f),
+                        "photo_quality": compare_photos(f, keeper) if keeper else None,
                         "ai_description": f.ai_description,
                         "analysis_outcome": getattr(f, "analysis_outcome", None),
                         "analysis_evidence_source": getattr(f, "analysis_evidence_source", None),
@@ -88,6 +96,7 @@ def list_duplicates(page: int = Query(1, ge=1), per_page: int = Query(20, ge=1, 
                 wasted = (session.query(func.coalesce(func.sum(File.size_bytes), 0))
                           .join(DuplicateMember, DuplicateMember.file_id == File.id)
                           .filter(DuplicateMember.group_id == g.id,
+                                  File.session_id == session_id,
                                   File.id != g.keep_file_id).scalar() or 0)
             items.append({
                 "id": g.id,
@@ -114,35 +123,14 @@ def list_duplicates(page: int = Query(1, ge=1), per_page: int = Query(20, ge=1, 
 
 @router.post("/duplicates/{group_id}/keeper")
 def set_keeper(group_id: int, body: SetKeeperRequest):
-    from donedatahoarder.core.dedup import refresh_group_proposals
-
     with review_operation("change duplicate keeper"):
         engine = get_engine()
         with Session(engine) as session:
-            g = session.get(DuplicateGroup, group_id)
-            if not g or g.session_id != body.session_id:
-                raise HTTPException(404, "Group not found in this session")
-            keeper = (
-                session.query(File)
-                .join(DuplicateMember, DuplicateMember.file_id == File.id)
-                .filter(
-                    DuplicateMember.group_id == group_id,
-                    File.id == body.keep_file_id,
-                    File.session_id == body.session_id,
-                )
-                .first()
-            )
-            if keeper is None:
-                raise HTTPException(400, "Keeper must be a file in this duplicate group")
-            if g.keep_file_id == body.keep_file_id:
-                return {"status": "unchanged", "keep_file_id": body.keep_file_id,
-                        "review_reset": 0}
-            g.keep_file_id = body.keep_file_id
             try:
-                refreshed = refresh_group_proposals(session, group_id)
-            except ValueError as exc:
+                result = change_keeper(session, body.session_id, group_id, body.keep_file_id,
+                                       expected_keeper_id=body.expected_keeper_id)
+            except ReviewError as exc:
                 session.rollback()
-                raise HTTPException(409, str(exc)) from exc
+                raise HTTPException(exc.status_code, str(exc)) from exc
             session.commit()
-    return {"status": "ok", "keep_file_id": body.keep_file_id,
-            "review_reset": refreshed["changed"], "created": refreshed["created"]}
+    return result

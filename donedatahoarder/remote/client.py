@@ -611,6 +611,11 @@ class RemoteWorkspaceService:
     def reject(self, proposal_id: int) -> dict:
         return self._command("reject", proposal_id=proposal_id)
 
+    def set_keeper(self, group_id: int, file_id: int,
+                   expected_keeper_id: int | None = None) -> dict:
+        return self._command("set_keeper", group_id=group_id, file_id=file_id,
+                             expected_keeper_id=expected_keeper_id)
+
     def edit(self, proposal_id: int, value: str) -> dict:
         return self._command("edit", proposal_id=proposal_id, value=value)
 

@@ -66,6 +66,12 @@ class _ApproveClear(_Params):
     min_confidence: float = Field(default=0.9, ge=0, le=1, allow_inf_nan=False)
 
 
+class _Keeper(_Params):
+    group_id: StrictInt = Field(gt=0)
+    file_id: StrictInt = Field(gt=0)
+    expected_keeper_id: StrictInt | None = Field(default=None, gt=0)
+
+
 class _Confirmed(_Params):
     token: StrictStr = Field(min_length=1, max_length=128)
     confirmed: StrictBool = False
@@ -87,6 +93,7 @@ COMMANDS: dict[str, type[_Params]] = {
     "approve_clear": _ApproveClear, "preview": _Params,
     "apply": _Confirmed, "history": _History, "undo_preview": _Params,
     "undo": _Confirmed, "preflight": _Start, "update_settings": _Settings,
+    "set_keeper": _Keeper,
 }
 READ_COMMANDS = {"preview", "history", "undo_preview", "preflight"}
 

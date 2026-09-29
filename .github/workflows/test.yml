@@ -37,6 +37,7 @@ jobs:
           ddh remote-serve --help
           ddh remote-pair --help
           ddh remote-devices --help
+          ddh refresh-photos --help
 
   ui-state:
     runs-on: ubuntu-latest
@@ -51,6 +52,7 @@ jobs:
           node tests/ui_setup_session_state.cjs
           node tests/ui_analysis_coverage_state.cjs
           node tests/ui_nonexact_review.cjs
+          node tests/ui_photo_review.cjs
           node tests/ui_dashboard_state.cjs
           node tests/ui_review_request_state.cjs
           node tests/ui_relate_progress_state.cjs

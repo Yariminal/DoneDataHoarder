@@ -91,6 +91,94 @@ def proposal_row(service, identity):
     return next(row for row in service.snapshot()["proposals"] if row["id"] == identity)
 
 
+def test_photo_evidence_binds_review_and_execution_previews(workspace):
+    import json
+
+    service, root, _ = workspace
+    keeper_id, candidate_id, _, proposal_id = duplicate_pair(service, root)
+    with Session(get_engine()) as db:
+        for identity, width, fields in ((keeper_id, 6000, {}),
+                                        (candidate_id, 3000, {"camera_model": "Photo camera"})):
+            file = db.get(File, identity)
+            file.mime_type = "image/jpeg"
+            file.photo_metadata = json.dumps({
+                "version": 1, "status": "complete", "source_sha256": file.hash_sha256,
+                "width": width, "height": width * 2 // 3, "format": "JPEG", "mode": "RGB",
+                "fields": fields, "warnings": [],
+            })
+        db.commit()
+    row = proposal_row(service, proposal_id)
+    evidence = row["duplicate_evidence"]["photo_quality"]
+    assert evidence["status"] == "tradeoff"
+    assert evidence["candidate_unique_fields"] == ["camera_model"]
+    assert service.get_file(keeper_id)["photo_metadata"]["megapixels"] == 24
+    assert service.snapshot()["duplicates"][0]["members"][0]["photo_metadata"]["status"] == "complete"
+    with Session(get_engine()) as db:
+        file = db.get(File, candidate_id)
+        metadata = json.loads(file.photo_metadata)
+        metadata["fields"]["camera_model"] = "New evidence"
+        file.photo_metadata = json.dumps(metadata)
+        db.commit()
+    with pytest.raises(ReviewError, match="changed"):
+        service.approve(proposal_id, row["review_token"])
+    service.approve(proposal_id, proposal_row(service, proposal_id)["review_token"])
+    preview = service.preview()
+    with Session(get_engine()) as db:
+        file = db.get(File, candidate_id)
+        metadata = json.loads(file.photo_metadata)
+        metadata["fields"]["lens_model"] = "Another recovered field"
+        file.photo_metadata = json.dumps(metadata)
+        db.commit()
+    assert service.preview()["token"] != preview["token"]
+    assert (root / "keeper.jpg").read_bytes() == b"keeper"
+    assert (root / "candidate.jpg").read_bytes() == b"candidate"
+
+
+def test_choose_keeper_scopes_group_resets_review_and_rejects_stale_choice(workspace):
+    service, root, _ = workspace
+    first, second, group_id, proposal_id = duplicate_pair(service, root, kind=DupeType.EXACT)
+    unrelated = add_file(service, root, "outside.jpg")
+    service.approve(proposal_id)
+    with pytest.raises(ReviewError, match="this duplicate group"):
+        service.set_keeper(group_id, unrelated, expected_keeper_id=first)
+    with pytest.raises(ReviewError, match="this session"):
+        service.set_keeper(group_id + 100, second, expected_keeper_id=first)
+    result = service.set_keeper(group_id, second, expected_keeper_id=first)
+    assert result["status"] == "ok"
+    with Session(get_engine()) as db:
+        assert db.get(DuplicateGroup, group_id).keep_file_id == second
+        assert db.get(Proposal, proposal_id).status == ProposalStatus.REJECTED
+        replacement = db.query(Proposal).filter(Proposal.file_id == first).one()
+        assert replacement.status == ProposalStatus.PENDING
+        assert replacement.proposed_value == str(root / "candidate.jpg")
+        replacement.status = ProposalStatus.APPLIED
+        db.commit()
+    with pytest.raises(ReviewError, match="keeper changed"):
+        service.set_keeper(group_id, first, expected_keeper_id=first)
+    with pytest.raises(ReviewError, match="[Aa]pplied"):
+        service.set_keeper(group_id, first, expected_keeper_id=second)
+    with Session(get_engine()) as db:
+        assert db.get(DuplicateGroup, group_id).keep_file_id == second
+
+
+def test_keeper_choice_rejects_corrupt_cross_session_membership(workspace):
+    service, root, _ = workspace
+    first, second, group_id, proposal_id = duplicate_pair(service, root, kind=DupeType.EXACT)
+    foreign_root = root.parent / "foreign-collection"
+    foreign_root.mkdir()
+    foreign = WorkspaceService(foreign_root)
+    foreign_id = add_file(foreign, foreign_root, "private.jpg")
+    with Session(get_engine()) as db:
+        db.add(DuplicateMember(group_id=group_id, file_id=foreign_id))
+        db.commit()
+    with pytest.raises(ReviewError, match="outside this session"):
+        service.set_keeper(group_id, second, expected_keeper_id=first)
+    with Session(get_engine()) as db:
+        assert db.get(DuplicateGroup, group_id).keep_file_id == first
+        assert db.query(Proposal).filter(Proposal.file_id == foreign_id).count() == 0
+        assert db.get(Proposal, proposal_id).status == ProposalStatus.PENDING
+
+
 def test_open_does_not_scan_and_reopen_preserves_session(workspace):
     service, root, _ = workspace
     (root / "not-yet-indexed.txt").write_text("untouched")
