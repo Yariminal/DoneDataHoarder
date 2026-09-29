@@ -191,5 +191,42 @@ context.window.appConfirm = async () => { confirmCount += 1; return true; };
   assert.equal(context.window._dataVersion, previousVersion + 4,
     'bulk review must invalidate dashboard counts');
 
+  api.post = (url, body) => { posts.push({ url, body }); return defer(url); };
+  const conflict = components.get('proposalReview')();
+  conflict.$nextTick = fn => fn();
+  conflict._sessionId = 'E';
+  conflict._loadedFilters = JSON.stringify([conflict.page, conflict.perPage,
+    conflict.statusFilter, conflict.typeFilter, conflict.search, conflict.minConfidence]);
+  conflict.proposals = [{ id: 71, status: 'pending', proposal_type: 'mark_duplicate' }];
+  const approval = conflict.approve(71, { expected_keeper_id: 20 });
+  const conflictError = Object.assign(
+    new Error('Duplicate comparison changed; review this pair again'), { status: 409 });
+  pending.get('/proposals/71/approve').shift().reject(conflictError);
+  await new Promise(resolve => setImmediate(resolve));
+  const refreshUrl = '/proposals?page=1&per_page=50&status=pending&session_id=E';
+  assert.equal((pending.get(refreshUrl) || []).length, 1,
+    'conflict must request the current review queue');
+  assert.equal(conflict.proposals.length, 0, 'stale action disappears during refresh');
+  answer(refreshUrl, { items: [{ id: 72, status: 'pending' }], total: 1 });
+  await approval;
+  assert.deepEqual(conflict.proposals.map(item => item.id), [72]);
+  assert.match(app.toasts.at(-1).msg, /Duplicate comparison changed; review this pair again/);
+
+  const late = components.get('proposalReview')();
+  late.$nextTick = fn => fn();
+  late._sessionId = 'E';
+  late._loadedFilters = JSON.stringify([late.page, late.perPage,
+    late.statusFilter, late.typeFilter, late.search, late.minConfidence]);
+  late.proposals = [{ id: 73, status: 'pending', proposal_type: 'mark_duplicate' }];
+  const lateApproval = late.approve(73);
+  session.current_session_id = 'F'; late.onSessionChange();
+  const toastCount = app.toasts.length;
+  pending.get('/proposals/73/approve').shift().reject(conflictError);
+  await lateApproval;
+  assert.equal(app.toasts.length, toastCount, 'old session conflict must not toast');
+  assert.equal((pending.get(refreshUrl) || []).length, 0,
+    'old session conflict must not refresh its review queue');
+  assert.equal(late.proposals.length, 0);
+
   console.log('Review and Files discard stale session, filter, and detail responses');
 })().catch(error => { console.error(error); process.exitCode = 1; });

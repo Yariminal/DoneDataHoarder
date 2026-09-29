@@ -11,8 +11,19 @@ const posts = [];
 const shell = { inert: false, setAttribute() { this.inert = true; },
   removeAttribute() { this.inert = false; } };
 let focused = 0;
-const reviewButton = { focus() { focused += 1; } };
-const returnButton = { isConnected: true, focus() { focused += 1; } };
+const reviewButton = { focus() { focused += 1; context.document.activeElement = this; },
+  getClientRects() { return [1]; } };
+const approveButton = { focus() { focused += 1; context.document.activeElement = this; },
+  getClientRects() { return [1]; } };
+const dialog = {
+  scrollTop: 55,
+  focus(options) {
+    assert.equal(options.preventScroll, true, 'long dialog should keep its top visible');
+    focused += 1; context.document.activeElement = this;
+  },
+  querySelectorAll() { return [reviewButton, approveButton]; },
+};
+const returnButton = { isConnected: true, focus() { focused += 1; context.document.activeElement = this; } };
 const details = new Map([
   [10, { id: 10, path: 'C:/collection/candidate.png', mime_type: 'image/png',
     size_bytes: 200, ai_description: 'Candidate image' }],
@@ -40,7 +51,7 @@ const context = {
     addEventListener(name, callback) { listeners.set(name, callback); },
     querySelector(selector) {
       if (selector === '.app-shell') return shell;
-      if (selector === '.duplicate-review-dialog button.btn-outline') return reviewButton;
+      if (selector === '.duplicate-review-dialog') return dialog;
       return null;
     },
   },
@@ -83,6 +94,18 @@ listeners.get('alpine:init')();
   assert.equal(review.duplicateReview.duplicate_evidence.keeper_id, 20);
   assert.equal(review.duplicateReviewFiles.keeper.mime_type, 'application/pdf');
   assert.equal(shell.inert, true, 'background must be inert while reviewing');
+  assert.equal(context.document.activeElement, dialog);
+  assert.equal(dialog.scrollTop, 0, 'comparison should open at the title');
+  let prevented = false;
+  context.window.trapDialogTab({ currentTarget: dialog, shiftKey: false,
+    preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(context.document.activeElement, reviewButton, 'Tab from dialog reaches first action');
+  context.document.activeElement = dialog;
+  context.window.trapDialogTab({ currentTarget: dialog, shiftKey: true,
+    preventDefault() {} });
+  assert.equal(context.document.activeElement, approveButton,
+    'Shift+Tab from dialog reaches last action');
   review.cancelDuplicateReview();
   assert.equal(posts.length, 0, 'cancelling must leave the candidate pending');
   assert.equal(shell.inert, false);
