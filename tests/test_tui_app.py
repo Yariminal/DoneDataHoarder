@@ -405,7 +405,9 @@ def test_inspector_snapshot_refreshes_same_path_replacements_without_redrawing_u
     monkeypatch.setattr(images, "_native_widgets", {"sixel": NativeImage})
     path = tmp_path / "original.png"
     with Image.new("RGB", (128, 64), "red") as source:
-        source.save(path)
+        # Stored PNG blocks keep red/blue fixture lengths equal across zlib
+        # versions, so this test isolates same-size, same-mtime replacement.
+        source.save(path, compress_level=0)
 
     async def wait_for_pixels(pilot, preview, color):
         previous, stable_frames = None, 0
@@ -441,7 +443,7 @@ def test_inspector_snapshot_refreshes_same_path_replacements_without_redrawing_u
             before = path.stat()
             replacement = tmp_path / "replacement.png"
             with Image.new("RGB", (128, 64), "blue") as source:
-                source.save(replacement)
+                source.save(replacement, compress_level=0)
             assert replacement.stat().st_size == before.st_size
             os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
             os.replace(replacement, path)

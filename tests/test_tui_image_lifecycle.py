@@ -15,9 +15,9 @@ from textual.widgets import Static
 from donedatahoarder.tui import images
 
 
-def save_image(path, color="red", size=(128, 64)):
+def save_image(path, color="red", size=(128, 64), *, compress_level=6):
     with Image.new("RGB", size, color) as source:
-        source.save(path, format="PNG")
+        source.save(path, format="PNG", compress_level=compress_level)
     return path
 
 
@@ -51,7 +51,9 @@ async def settle(app, pilot):
 
 def test_unchanged_snapshot_does_not_replace_pixels_or_reset_zoom(tmp_path, monkeypatch):
     monkeypatch.setattr(images, "_native_widgets", {"sixel": TrackedNative})
-    path = save_image(tmp_path / "selected.png")
+    # Uncompressed PNG blocks have equal lengths for equal dimensions on all
+    # zlib builds; color must change without changing size or mtime.
+    path = save_image(tmp_path / "selected.png", compress_level=0)
 
     async def exercise():
         app = PreviewApp()
@@ -79,7 +81,7 @@ def test_unchanged_snapshot_does_not_replace_pixels_or_reset_zoom(tmp_path, monk
 
             # A replacement with identical size and mtime must still refresh.
             before = path.stat()
-            replacement = save_image(tmp_path / "replacement.png", "blue")
+            replacement = save_image(tmp_path / "replacement.png", "blue", compress_level=0)
             assert replacement.stat().st_size == before.st_size
             os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
             os.replace(replacement, path)
