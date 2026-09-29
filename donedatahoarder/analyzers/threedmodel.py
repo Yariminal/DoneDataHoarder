@@ -15,6 +15,7 @@ from the filename alone — much better than silently skipping the file.
 from pathlib import Path
 
 from donedatahoarder.analyzers.base import AnalysisResult, BaseAnalyzer, SYSTEM_PROMPT
+from donedatahoarder.analyzers.response_schemas import ThreeDAnalysisResponse
 from donedatahoarder.db.models import File
 
 THREED_EXTENSIONS = {
@@ -144,7 +145,8 @@ class ThreeDModelAnalyzer(BaseAnalyzer):
         )
 
         try:
-            data = self._client.generate_json(prompt, system=SYSTEM_PROMPT)
+            data = self._client.generate_json(prompt, system=SYSTEM_PROMPT,
+                                              model_cls=ThreeDAnalysisResponse)
         except Exception as exc:
             return AnalysisResult(
                 description=f"AI inference failed: {exc}",

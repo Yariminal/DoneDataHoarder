@@ -21,6 +21,7 @@ from xml.etree import ElementTree
 from donedatahoarder.analyzers.base import (
     AnalysisResult, BaseAnalyzer, EXTRACTOR_VERSION, SYSTEM_PROMPT,
 )
+from donedatahoarder.analyzers.response_schemas import DocumentAnalysisResponse
 from donedatahoarder.db.models import File
 
 MAX_CHARS = 3000   # max text chars to send to AI
@@ -623,7 +624,8 @@ class DocumentAnalyzer(BaseAnalyzer):
         )
 
         try:
-            data = self._client.generate_json(prompt, system=SYSTEM_PROMPT)
+            data = self._client.generate_json(prompt, system=SYSTEM_PROMPT,
+                                              model_cls=DocumentAnalysisResponse)
         except Exception as exc:
             return AnalysisResult(
                 description=f"AI inference failed: {exc}",
@@ -677,7 +679,7 @@ class DocumentAnalyzer(BaseAnalyzer):
         prompt = PDF_VISION_PROMPT.format(
             context=context, page_count=len(pages)
         )
-        kwargs: dict = {"system": SYSTEM_PROMPT}
+        kwargs: dict = {"system": SYSTEM_PROMPT, "model_cls": DocumentAnalysisResponse}
         if len(pages) == 1:
             kwargs["image_bytes"] = pages[0]
         else:

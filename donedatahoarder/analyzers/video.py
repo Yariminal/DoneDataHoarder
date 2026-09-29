@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Optional
 
 from donedatahoarder.analyzers.base import AnalysisResult, BaseAnalyzer, SYSTEM_PROMPT
+from donedatahoarder.analyzers.response_schemas import AudioAnalysisResponse, VideoAnalysisResponse
 from donedatahoarder.db.models import File
 
 try:
@@ -274,7 +275,8 @@ class VideoAnalyzer(BaseAnalyzer):
                 prompt += whisper_note
 
             try:
-                data = self._client.generate_json(prompt, system=SYSTEM_PROMPT)
+                data = self._client.generate_json(prompt, system=SYSTEM_PROMPT,
+                                                  model_cls=AudioAnalysisResponse)
             except Exception as exc:
                 return AnalysisResult(
                     description=f"AI inference failed: {exc}",
@@ -339,10 +341,12 @@ class VideoAnalyzer(BaseAnalyzer):
                     prompt,
                     images_list=frames,
                     system=SYSTEM_PROMPT,
+                    model_cls=VideoAnalysisResponse,
                 )
             else:
                 # No frames — text-only with transcript
-                data = self._client.generate_json(prompt, system=SYSTEM_PROMPT)
+                data = self._client.generate_json(prompt, system=SYSTEM_PROMPT,
+                                                  model_cls=VideoAnalysisResponse)
         except Exception as exc:
             return AnalysisResult(
                 description=f"AI inference failed: {exc}",

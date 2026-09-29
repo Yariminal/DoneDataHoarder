@@ -385,7 +385,7 @@ class OllamaClient(BaseAIClient):
         )
         result = validated.model_dump()
         # Unwrap lists that were boxed for LooseDict validation
-        if isinstance(result, dict) and "_list" in result:
+        if model_cls is LooseDict and isinstance(result, dict) and "_list" in result:
             return result["_list"]
         return result
 

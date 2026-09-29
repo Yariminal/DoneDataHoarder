@@ -10,11 +10,11 @@ from sqlalchemy.orm import Session
 
 from donedatahoarder.analyzers import pipeline
 from donedatahoarder.analyzers import cache
-from donedatahoarder.analyzers.base import AnalysisResult, BaseAnalyzer
+from donedatahoarder.analyzers.base import AnalysisResult, BaseAnalyzer, PROMPT_VERSION
 from donedatahoarder.analyzers.document import DocumentAnalyzer
 from donedatahoarder.analyzers.image import ImageAnalyzer
 from donedatahoarder.analyzers.video import VideoAnalyzer
-from donedatahoarder.db.models import File, FileStatus, UserSession
+from donedatahoarder.db.models import AnalysisCache, File, FileStatus, UserSession
 from donedatahoarder.db.session import get_engine, init_db
 from scripts.bench_analysis_economy import select_frame_window
 
@@ -99,6 +99,41 @@ def test_verified_cache_reuses_only_identical_identity(tmp_path, monkeypatch):
     monkeypatch.setattr(cache, "PROMPT_VERSION", "changed-prompt")
     assert pipeline._process_one_file(seventh, get_engine(), [analyzer], client, set())[1] == "analyzed"
     assert analyzer.calls == 6
+
+
+def test_pre_contract_cache_is_reanalyzed_then_current_cache_reused(tmp_path, monkeypatch):
+    init_db(tmp_path / "index.db")
+    root = tmp_path / "files"
+    root.mkdir()
+    with Session(get_engine()) as db:
+        user = UserSession(root_path=str(root), name="contract-cache")
+        db.add(user)
+        db.commit()
+        session_id = user.id
+    monkeypatch.setattr(pipeline, "build_context", lambda _row: "fixed context")
+    analyzer = StubAnalyzer()
+    client = StubClient()
+
+    first = _add_file(root, session_id, "legacy.png")
+    assert pipeline._process_one_file(first, get_engine(), [analyzer], client, set())[1] == "analyzed"
+    with Session(get_engine()) as db:
+        row = db.query(AnalysisCache).one()
+        assert row.prompt_version == PROMPT_VERSION
+        row.prompt_version = "analysis-v3-2026-09-28"
+        db.commit()
+
+    second = _add_file(root, session_id, "reanalyzed.png")
+    assert pipeline._process_one_file(second, get_engine(), [analyzer], client, set())[1] == "analyzed"
+    assert analyzer.calls == 2
+    third = _add_file(root, session_id, "current.png")
+    assert pipeline._process_one_file(third, get_engine(), [analyzer], client, set())[1] == "cached"
+    assert analyzer.calls == 2
+    with Session(get_engine()) as db:
+        assert {row.prompt_version for row in db.query(AnalysisCache).all()} == {
+            "analysis-v3-2026-09-28", PROMPT_VERSION,
+        }
+        assert db.get(File, second).analysis_prompt_version == PROMPT_VERSION
+        assert db.get(File, third).analysis_prompt_version == PROMPT_VERSION
 
 
 def test_cache_rejects_same_size_timestamp_preserving_byte_edit(tmp_path, monkeypatch):
