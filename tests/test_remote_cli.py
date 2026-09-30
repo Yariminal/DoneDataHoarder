@@ -88,6 +88,14 @@ def test_token_is_reused_without_printing_and_private_on_posix(tmp_path):
         assert file.stat().st_mode & 0o077 == 0
 
 
+@pytest.mark.parametrize("control", ["\x00", "\x01", "\x1b", "\x7f"])
+def test_token_file_rejects_header_control_characters(tmp_path, control):
+    file = tmp_path / "token"
+    file.write_text("a" * 32 + control + "b" * 32, encoding="utf-8")
+    with pytest.raises(ValueError, match="printable ASCII"):
+        read_token(file)
+
+
 def test_lan_requires_tls_before_creating_token(tmp_path):
     token = tmp_path / "token"
     result = CliRunner().invoke(cli.app, ["remote-serve", "--root", str(tmp_path), "--token-file", str(token), "--host", "0.0.0.0"])

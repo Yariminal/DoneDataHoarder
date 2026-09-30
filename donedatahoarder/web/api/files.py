@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
 from donedatahoarder.core.photo_quality import photo_evidence
@@ -154,7 +154,7 @@ def get_file(file_id: int):
 
 
 @router.get("/files/{file_id}/thumbnail")
-def get_thumbnail(file_id: int, size: int = 200):
+def get_thumbnail(file_id: int, size: int = Query(default=200, ge=1, le=2048)):
     """Serve a resized thumbnail for image files."""
     engine = get_engine()
     with Session(engine) as session:
@@ -173,18 +173,20 @@ def get_thumbnail(file_id: int, size: int = 200):
     if not path.exists():
         raise HTTPException(404, "File not on disk")
 
-    try:
-        from PIL import Image
+    from donedatahoarder.tui.images import PreviewError, prepare_image
 
-        with Image.open(path) as img:
-            img = img.convert("RGB")
-            img.thumbnail((size, size))
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=80)
+    try:
+        prepared = prepare_image(path, max_size=(size, size))
+        try:
+            with io.BytesIO() as buf:
+                prepared.image.save(buf, format="PNG")
+                content = buf.getvalue()
             return Response(
-                content=buf.getvalue(),
-                media_type="image/jpeg",
-                headers={"Cache-Control": "public, max-age=3600"},
+                content=content,
+                media_type="image/png",
+                headers={"Cache-Control": "no-store"},
             )
-    except Exception as exc:
-        raise HTTPException(500, f"Thumbnail generation failed: {exc}")
+        finally:
+            prepared.image.close()
+    except PreviewError as exc:
+        raise HTTPException(415, str(exc)) from exc

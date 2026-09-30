@@ -356,6 +356,13 @@ class ImageScreen(ModalScreen[None]):
                 self.notify(str(exc), severity="error")
 
 
+class ReviewTable(DataTable):
+    """Fit the evidence labels after the table receives its actual pane size."""
+
+    def on_resize(self) -> None:
+        self.app.update_review_table()
+
+
 class DDHApp(App[None]):
     """The app never mutates files directly; WorkspaceService owns every operation."""
 
@@ -458,7 +465,8 @@ class DDHApp(App[None]):
     @property
     def remote_blocked(self) -> bool:
         connection = self.remote_connection
-        return bool(connection and (connection.state != "connected" or connection.pending_request_id))
+        return bool(connection and (connection.state != "connected" or connection.pending_request_id
+                                    or self._connection_error))
 
     @property
     def storage_available(self) -> bool:
@@ -508,7 +516,7 @@ class DDHApp(App[None]):
                     yield Button("Approve clear", id="approve-clear")
                     yield Button("Preview [p]", id="preview", variant="primary")
                 with Horizontal(id="review-layout"):
-                    yield DataTable(id="review-table", cursor_type="row", classes="pane")
+                    yield ReviewTable(id="review-table", cursor_type="row", classes="pane")
                     with VerticalScroll(id="review-evidence", classes="pane"):
                         yield Static("Select a proposal to inspect its evidence.", id="review-detail", markup=False)
             with TabPane("3 Collections", id="collections"):
@@ -529,11 +537,11 @@ class DDHApp(App[None]):
 
     def on_mount(self) -> None:
         for selector, columns in {
-            "#review-table": ("Current → proposed", "Type", "Decision"),
             "#collections-table": ("Collection", "Files"), "#history-table": ("Operation", "State", "Details"),
         }.items():
             self.query_one(selector, DataTable).add_columns(*columns)
         self.query_one("#inspector-image").display = False
+        self.call_after_refresh(self.update_review_table)
         self.reload_theme()
         self.refresh_snapshot()
         self.set_interval(1.5, self.refresh_snapshot)
@@ -581,6 +589,8 @@ class DDHApp(App[None]):
         try:
             snapshot = await asyncio.to_thread(self.service.snapshot, limit=self.page_limit, offset=self.offset)
         except Exception as exc:
+            if generation != self._generation or not self.is_mounted:
+                return
             if self.remote_connection:
                 self._connection_failures += 1
                 self._next_refresh_at = time.monotonic() + min(30, 1.5 * 2 ** min(self._connection_failures, 5))
@@ -649,20 +659,53 @@ class DDHApp(App[None]):
                 self.update_connection()
                 self.refresh_snapshot()
 
-    def _table(self, selector: str, rows: list[tuple[str, tuple]], signature: Any) -> None:
-        encoded = json.dumps(signature, sort_keys=True, default=str)
+    def _table(self, selector: str, rows: list[tuple[str, tuple]], signature: Any,
+               *, columns: tuple[tuple[str, int], ...] | None = None) -> None:
+        encoded = json.dumps([signature, columns], sort_keys=True, default=str)
         if self._signatures.get(selector) == encoded:
             return
         table = self.query_one(selector, DataTable)
         old_row = table.cursor_row
         old_key = str(self.selected_proposal_id) if selector == "#review-table" else str(self.selected_collection_id) if selector == "#collections-table" else None
-        table.clear()
+        table.clear(columns=columns is not None)
+        if columns is not None:
+            for label, width in columns:
+                table.add_column(label, width=width)
         for key, cells in rows:
-            table.add_row(*(Text(readable(cell)) for cell in cells), key=key)
+            table.add_row(*(Text(readable(cell), no_wrap=True, overflow="ellipsis") for cell in cells), key=key)
         if rows:
             selected_row = next((index for index, (key, _) in enumerate(rows) if key == old_key), min(old_row, len(rows) - 1))
             table.move_cursor(row=selected_row, animate=False)
         self._signatures[selector] = encoded
+
+    def relative_display_path(self, value: str | None) -> str:
+        if not value:
+            return "—"
+        root = (self.snapshot.get("session") or {}).get("root_path")
+        if root:
+            try:
+                return str(self.display_path(value).relative_to(self.display_path(root)))
+            except ValueError:
+                pass
+        return value
+
+    def update_review_table(self) -> None:
+        if not self.is_mounted:
+            return
+        proposals = self.snapshot.get("proposals", [])
+        table = self.query_one("#review-table", DataTable)
+        labels = {"mark_duplicate": "Duplicate", "rename_folder": "Folder rename"}
+        types = [labels.get(item.get("proposal_type"), item.get("proposal_type") or "—") for item in proposals]
+        type_width = max([4, *(Text(value).cell_len for value in types)])
+        decision_width = max([8, *(Text(item.get("status") or "—").cell_len for item in proposals)])
+        path_width = max(1, table.content_size.width - type_width - decision_width
+                         - 6 * table.cell_padding - table.scrollbar_size_vertical)
+        rows = [(str(item["id"]),
+                 (f"{self.relative_display_path(item.get('current_path'))} → {self.relative_display_path(item.get('proposed_path'))}",
+                  proposal_type, item.get("status")))
+                for item, proposal_type in zip(proposals, types)]
+        self._table("#review-table", rows, proposals,
+                    columns=(("Current → proposed", path_width), ("Type", type_width), ("Decision", decision_width)))
 
     def update_snapshot(self, snapshot: dict) -> None:
         self.snapshot = snapshot
@@ -670,17 +713,22 @@ class DDHApp(App[None]):
         self.update_title()
         self.update_connection()
         files = snapshot.get("files", [])
+        if not any(str(item["id"]) == str(self.selected_file_id) for item in files):
+            self.selected_file_id = None
         self.update_file_tree(files, session.get("root_path", ""))
+        if self.selected_file_id is None and files:
+            self.selected_file_id = files[0]["id"]
         proposals = snapshot.get("proposals", [])
-        self._table("#review-table", [(str(item["id"]), (f"{item.get('current_path', '')} → {item.get('proposed_path', '')}", item.get("proposal_type"), item.get("status"))) for item in proposals], proposals)
+        if not any(str(item["id"]) == str(self.selected_proposal_id) for item in proposals):
+            self.selected_proposal_id = proposals[0]["id"] if proposals else None
+        self.update_review_table()
         collections = snapshot.get("collections", [])
+        if not any(str(item["id"]) == str(self.selected_collection_id) for item in collections):
+            self.selected_collection_id = None
+            self.query_one("#collection-detail", Static).update("Related files appear here after Relate.")
         self._table("#collections-table", [(str(item["id"]), (item.get("label"), item.get("member_count", len(item.get("members", []))))) for item in collections], collections)
         history = snapshot.get("history", [])
         self._table("#history-table", [(str(index), (item.get("operation", "Operation"), item.get("state", ""), f"{item.get('source', '')} → {item.get('destination', '')}")) for index, item in enumerate(history)], history)
-        if self.selected_file_id is None and files:
-            self.selected_file_id = files[0]["id"]
-        if self.selected_proposal_id is None and proposals:
-            self.selected_proposal_id = proposals[0]["id"]
         self.update_inspector()
         self.update_review_detail()
         self.update_stages()
@@ -717,8 +765,11 @@ class DDHApp(App[None]):
         else:
             pending = bool(connection.pending_request_id)
             state = "COMMAND PENDING" if pending else connection.state.replace("_", " ").upper()
-            if not pending and connection.state == "connected" and not self.storage_available:
-                state = "DRIVE MISSING"
+            if not pending and connection.state == "connected":
+                if self._connection_error:
+                    state = "STALE"
+                elif not self.storage_available:
+                    state = "DRIVE MISSING"
             button.label = Text(f"{'●' if connection.state == 'connected' else '○'} {connection.name} · {state}")
             button.tooltip = f"{state} · Connection and session settings [F2]"
         button.set_class(self.remote_blocked or not self.storage_available, "disconnected")
@@ -771,6 +822,9 @@ class DDHApp(App[None]):
             self._signatures.clear()
             self.selected_file_id = self.selected_proposal_id = self.selected_collection_id = None
             self.offset = 0
+            self._next_refresh_at = 0
+            self._connection_failures = 0
+            self._connection_error = ""
             self.query_one("#inspector-image").set_source(None)
             self.query_one("#inspector-image").display = False
             self.query_one("#inspector-text", Static).update("Choose a workstation collection.")
@@ -947,6 +1001,11 @@ class DDHApp(App[None]):
             return
         file = self.selected_file()
         if not file:
+            self.query_one("#inspector-text", Static).update("No indexed file selected. Run the pipeline or choose Metadata only to get started.")
+            image = self.query_one("#inspector-image")
+            image.set_source(None)
+            image.display = False
+            self._image_path = None
             return
         text = f"{file.get('filename')}\n{file.get('path')}\n\nType: {file.get('mime_type') or 'unknown'}\nSize: {human_size(file.get('size_bytes'))}\nState: {file.get('status')}\n\n{file.get('ai_description') or file.get('text') or 'No extracted description yet.'}"
         if self.is_image(file):
@@ -971,6 +1030,8 @@ class DDHApp(App[None]):
             if proposal.get("duplicate_evidence"):
                 detail += "\n\nDUPLICATE EVIDENCE\n" + duplicate_summary(proposal["duplicate_evidence"])
             self.query_one("#review-detail", Static).update(detail[:7000])
+        else:
+            self.query_one("#review-detail", Static).update("Select a proposal to inspect its evidence.")
 
     @on(DataTable.RowHighlighted)
     def row_selected(self, event: DataTable.RowHighlighted) -> None:
@@ -994,6 +1055,7 @@ class DDHApp(App[None]):
     @on(TabbedContent.TabActivated, "#workspace")
     def workspace_changed(self) -> None:
         self.update_controls()
+        self.call_after_refresh(self.update_review_table)
 
     def action_workspace(self, name: str) -> None:
         self.query_one("#workspace", TabbedContent).active = name
@@ -1035,6 +1097,8 @@ class DDHApp(App[None]):
         self._image_path = None
         self._last_job_message = ""
         self._next_refresh_at = 0
+        self._connection_failures = 0
+        self._connection_error = ""
         self.inspected_stage = None
         self.query_one("#inspector-image").set_source(None)
         self.query_one("#inspector-image").display = False

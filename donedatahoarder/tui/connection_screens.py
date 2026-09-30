@@ -61,6 +61,8 @@ class ConnectionScreen(ModalScreen[dict | None]):
                 text += f"\nPending command: {connection.pending_request_id}\nNew commands are blocked until its outcome is known."
             if getattr(connection, "error", None):
                 text += f"\n{connection.error}"
+            if self.workspace._connection_error:
+                text += "\nWorkspace stale · changes are blocked until a fresh snapshot is received."
         text += f"\nSession: {session.get('id', 'Choose a session')}\nFolder: {session.get('root_path', '—')}"
         if not self.workspace.storage_available:
             text += "\nDRIVE MISSING · Session state remains available. Reconnect the collection drive before continuing."

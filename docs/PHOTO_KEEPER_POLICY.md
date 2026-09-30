@@ -94,6 +94,10 @@ unchanged repeat refresh leaves review decisions alone. Refreshing performs no
 photo writes, metadata merge, or file deletion. Stop active pipeline work first;
 the operation uses the same database writer lease as the pipeline.
 
+Force-rescanning a keeper also returns related duplicate approvals to pending
+review, including older comparisons linked by keeper path. Re-enrich the files
+and review those comparisons again before applying them.
+
 ## Limits
 
 This version compares EXIF, not every possible metadata store. RAW and

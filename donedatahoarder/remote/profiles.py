@@ -20,7 +20,7 @@ from uuid import UUID
 
 import httpx
 
-from donedatahoarder.remote.client import API_PREFIX, RemoteConnection, RemoteError, _base_url, _tls_context, _tls_name
+from donedatahoarder.remote.client import API_PREFIX, RemoteConnection, RemoteError, _base_url, _tls_context, _tls_name, _transport_url
 
 MAX_PROFILE_BYTES = 32 * 1024
 
@@ -264,7 +264,7 @@ def choose_verified_endpoint(urls: Sequence[str], certificate_pem: str, hostname
             if urlsplit(endpoint).scheme != "https":
                 raise RemoteError("Pairing requires HTTPS.")
             try:
-                with client.stream("GET", endpoint + API_PREFIX + "/hello",
+                with client.stream("GET", _transport_url(endpoint) + API_PREFIX + "/hello",
                                    extensions={"sni_hostname": hostname},
                                    headers={"Accept-Encoding": "identity"}) as response:
                     if response.status_code == 401:
@@ -312,7 +312,7 @@ def pair_device(url: str, invitation_text: str, device_name: str, *,
     try:
         with httpx.Client(verify=context, transport=transport, trust_env=False, follow_redirects=False,
                           timeout=httpx.Timeout(15.0, connect=5.0)) as client:
-            with client.stream("POST", endpoint + API_PREFIX + "/pair",
+            with client.stream("POST", _transport_url(endpoint) + API_PREFIX + "/pair",
                                json={"secret": invitation["secret"], "device_name": device_name},
                                headers={"Accept": "application/json", "Accept-Encoding": "identity"},
                                extensions={"sni_hostname": hostname}) as response:

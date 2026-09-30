@@ -1218,7 +1218,8 @@ document.addEventListener('alpine:init', () => {
         const updated = await api.post(`/proposals/${id}/edit`, { session_id: sid, proposed_value: value });
         if (sid !== Alpine.store('session').current_session_id || this._sessionId !== sid) return;
         this.proposals = this.proposals.map(p =>
-          p.id === id ? { ...p, proposed_value: value, proposed_path: updated.proposed_value, status: 'modified' } : p
+          p.id === id ? { ...p, proposed_value: updated.proposed_value,
+            proposed_path: updated.proposed_value, review_token: updated.review_token, status: 'modified' } : p
         );
         this.editingId = null;
         this.markReviewChanged();

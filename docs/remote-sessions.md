@@ -14,11 +14,13 @@ theme remain in the same interface.
 
 ## Nearby workstations (recommended)
 
-On the Windows workstation, use an internal directory for DDH's database and
-credentials and authorize only the collection folder on your SSD:
+First clone the preview branch as described in the [installation guide](../INSTALL.md).
+Run installation commands from that checkout. On the Windows workstation, use
+an internal directory for DDH's database and credentials and authorize only
+the collection folder on your SSD:
 
 ```powershell
-python -m pip install -e ".[remote,nearby]"
+uv tool install --python 3.12 '.[remote,nearby,docs]'
 ddh remote-serve --root "E:\Hoard" --db "$env:LOCALAPPDATA\DoneDataHoarder\index.db" --token-file "$env:LOCALAPPDATA\DoneDataHoarder\remote-token" --host 0.0.0.0 --name HOME-PC --discoverable --pair
 ```
 
@@ -32,7 +34,7 @@ omit `--pair`. DDH does not install a service or change firewall rules.
 On Omarchy, in Python 3.12 or newer:
 
 ```sh
-python -m pip install -e '.[tui,nearby]'
+uv tool install --python 3.12 '.[tui,nearby]'
 ddh tui --discover
 ```
 
@@ -69,7 +71,7 @@ Collection names, SSD paths, credentials, and file content are not broadcast.
 From this source checkout, in Windows PowerShell:
 
 ```powershell
-python -m pip install -e ".[remote]"
+uv tool install --python 3.12 '.[remote,docs]'
 ddh remote-serve --root "E:\Hoard" --db "$env:LOCALAPPDATA\DoneDataHoarder\index.db" --token-file "$env:LOCALAPPDATA\DoneDataHoarder\remote-token" --name HOME-PC
 ```
 
@@ -115,7 +117,7 @@ DDH does not install SSH or change firewall rules automatically.
 In another laptop terminal, using the matching checkout and Python 3.12+:
 
 ```sh
-python -m pip install -e '.[tui]'
+uv tool install --python 3.12 '.[tui]'
 chmod 600 ~/.config/donedatahoarder/home-token
 ddh tui --connect http://127.0.0.1:8765 --token-file ~/.config/donedatahoarder/home-token
 ```
@@ -154,6 +156,8 @@ session endpoint.
   credential. Separate `device-*.json` profiles contain each paired credential
   and trusted certificate, saved with owner-only permissions on Linux. Keep
   this directory private; on Windows use a private account directory and ACLs.
+  Command requests are limited to 64 KiB before JSON validation; pairing requests
+  have a separate 8 KiB limit.
 - If a workstation crash leaves an outcome uncertain, further changes are
   blocked. Session state/history remain available. There is deliberately no
   automatic dismissal or replay. A guided operator reconciliation flow remains
@@ -162,7 +166,7 @@ session endpoint.
 - If an authorized collection folder disappears, the workstation remains
   connected and reports storage unavailable. Cached session records and
   cancellation remain accessible; starting, applying, undoing, and image reads
-  require the folder to return.
+  require the folder to return. Other authorized folders remain available.
 - Image comparison fetches bounded, original-color PNG previews prepared on the
   workstation. Linked zoom/pan, native terminal rendering, and stale-image
   disposal are retained. Full-original downloads and external-viewer opening

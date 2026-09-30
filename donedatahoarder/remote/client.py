@@ -42,12 +42,17 @@ def _base_url(value: str) -> str:
         if (parsed.scheme not in {"https", "http"} or not host or
                 parsed.username is not None or parsed.password is not None or
                 parsed.query or parsed.fragment or parsed.path not in {"", "/"} or
-                "?" in value or "#" in value or "\\" in value or "%" in host):
+                "?" in value or "#" in value or "\\" in value):
             raise ValueError
         if port is not None and not 1 <= port <= 65535:
             raise ValueError
         try:
-            address = ipaddress.ip_address(host)
+            literal, marker, scope = host.partition("%25")
+            if "%" in host and (not marker or not re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", scope)):
+                raise ValueError
+            address = ipaddress.ip_address(literal)
+            if marker and (address.version != 6 or not address.is_link_local):
+                raise ValueError
         except ValueError:
             address = None
             if not re.fullmatch(r"[A-Za-z0-9.-]+", host):
@@ -59,6 +64,19 @@ def _base_url(value: str) -> str:
             raise
         raise RemoteError("Use an http(s) workstation address without credentials, a path, query, or fragment.") from None
     return value.rstrip("/")
+
+
+def _transport_url(value: str) -> str:
+    """Decode IPv6's URI zone delimiter for HTTPX's literal socket hostname.
+
+    Discovery and saved profiles use RFC 6874's %25 delimiter. HTTPX passes
+    its hostname to the socket backend unchanged, which needs the raw % scope.
+    Only validated scoped IPv6 literals can contain a percent in a base URL.
+    """
+    parsed = urlsplit(value)
+    if parsed.hostname and "%25" in parsed.hostname:
+        return value.replace("%25", "%", 1)
+    return value
 
 
 def _part(value: Any) -> str:
@@ -277,7 +295,7 @@ class RemoteConnection:
         start = time.monotonic()
         try:
             extensions = {"sni_hostname": self.tls_hostname} if self.tls_hostname else None
-            with self._client.stream(method, self.url + API_PREFIX + path, params=params, json=json,
+            with self._client.stream(method, _transport_url(self.url) + API_PREFIX + path, params=params, json=json,
                                      extensions=extensions) as response:
                 status = response.status_code
                 if status == 401 or (status == 403 and path == "/hello"):
@@ -305,7 +323,7 @@ class RemoteConnection:
                 try:
                     data = json_module.loads(body)
                 except (ValueError, UnicodeError, RecursionError):
-                    raise self._fail("Workstation returned an invalid JSON response.", state="incompatible", status=status) from None
+                    raise self._fail("Workstation returned an invalid JSON response.", state="incompatible") from None
                 if status >= 400:
                     detail = data.get("detail") if isinstance(data, dict) else None
                     message = self._safe(detail) if isinstance(detail, str) else f"Workstation request failed (HTTP {status})."

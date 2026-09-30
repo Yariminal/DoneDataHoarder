@@ -1,457 +1,182 @@
 # DoneDataHoarder
 
-**A terminal file-organization workbench for Linux and Omarchy.** Watch a folder become an organized collection, compare images, and review every proposed change. Powered by the existing local-first CLI and Ollama pipeline.
+**Organize files by what belongs together.**
 
-## Omarchy terminal workspace
+A local-first file and folder organizer for the Linux terminal, built with
+Omarchy in mind. Its pipeline draws on filenames, content analysis, the existing
+folder tree, and metadata to infer relationships and propose a clearer structure.
+Watch the reasoning, review the plan, and choose what changes.
 
-The new optional TUI keeps the full pipeline visible: **Scan → Enrich → Analyze → Dedup → Relate → Propose → Organize → Preview**, followed by manual review and apply. Open a real folder, inspect indexed files and image previews, review proposed destinations, and recover logged operations from History. Processing never commits file changes automatically.
+[![Tests](https://github.com/Yariminal/DoneDataHoarder/actions/workflows/test.yml/badge.svg?branch=codex%2Fomarchy-tui)](https://github.com/Yariminal/DoneDataHoarder/actions/workflows/test.yml)
+[![Python 3.12+ TUI](https://img.shields.io/badge/TUI-Python%203.12%2B-7aa2f7)](INSTALL.md)
+[![License: MIT](https://img.shields.io/badge/license-MIT-9ece6a)](LICENSE)
 
-Install from this source checkout with **Python 3.12 or newer**:
+[Get started](#try-the-preview) · [How organization works](docs/organization.md) · [Terminal guide](docs/tui.md) · [Remote workstation](docs/remote-sessions.md)
+
+![The DDH terminal workspace showing a sample collection and the full pipeline](docs/assets/workspace.svg)
+
+*Actual Textual interface with a disposable sample collection. Headless captures
+use text evidence; they do not demonstrate native terminal photo rendering.*
+
+## Why this exists
+
+Years of downloads, project exports, documents, media, and backups accumulate
+context that a filename alone cannot explain. A drawing, its PDF export, a
+reference image, and a materials list may belong to the same project. The
+folders they came from are evidence too.
+
+DDH turns that evidence into a reviewable organization plan:
+
+- **Find relationships.** Identify related names, source/export companions,
+  versions, and sequences, and expose the resulting collections for inspection.
+- **Use content and context.** Available descriptions, semantic tags, file
+  metadata, and the original folder hierarchy inform naming and organization.
+- **Propose a better structure.** Review clearer names, eligible loose files
+  grouped into folders, and folder renames. Dependency and project checks
+  constrain what can move.
+- **Preserve valuable copies.** Duplicate review compares photo resolution and
+  meaningful EXIF, and makes preservation tradeoffs explicit.
+- **Follow the whole pipeline.** Scan → Enrich → Analyze → Dedup → Relate →
+  Propose → Organize → Preview. Approve and apply are separate actions.
+- **Use the hardware you already own.** Keep the TUI on an Omarchy laptop while a
+  paired Windows workstation processes the collection attached to it.
+
+Signals are used at different stages: Relate currently groups chiefly from names
+and directory context; Organize adds content-derived summaries and the folder
+tree. See [how organization works](docs/organization.md) for the exact boundaries.
+
+## Photo duplicates: preserve the image and its history
+
+A full-resolution copy may be missing the capture date, camera, or lens metadata
+that another copy retains. DDH ranks resolution and meaningful EXIF, shows what
+each preserves, and lets you choose the keeper. Conflicting advantages stay in
+review. Similarity alone does not prove that a copy is interchangeable.
+
+![Photo review showing the evidence behind a keeper recommendation](docs/assets/photo-review.svg)
+
+## Try the preview
+
+This is an **alpha preview** on the `codex/omarchy-tui` branch. The commands below
+install that source, rather than assuming a package-index release contains it.
+You need Git and [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e '.[tui,docs]'
+git clone --branch codex/omarchy-tui https://github.com/Yariminal/DoneDataHoarder.git
+cd DoneDataHoarder
+uv tool install --python 3.12 '.[tui,docs,nearby]'
 ddh tui
-# Or open a folder directly:
+```
+
+The installation uses an isolated environment. If `ddh` is not on `PATH`, follow
+uv's shell setup message. The core CLI supports Python 3.10+; the TUI needs 3.12+.
+
+Start with generated files if you want to explore first:
+
+```bash
+# Choose a new directory: this command refuses to overwrite an existing one.
+ddh tui-fixture /tmp/ddh-preview
+ddh tui --db /tmp/ddh-preview/index.sqlite
+```
+
+Select the saved fixture session, then press `c` to compare a duplicate pair.
+The fixture includes deliberately changed, missing, and corrupt images for
+checking error handling. It never approves or applies a change.
+
+For your own folder:
+
+```bash
 ddh tui ~/Downloads
 ```
 
-Use the metadata-only run to scan, enrich, and find duplicates without Ollama. For the full run, start Ollama and choose an installed model with `ddh tui ~/Downloads --model gemma3:12b`. The terminal workspace uses the local Ollama backend and does not fall back to a cloud provider.
-
-With no folder argument, the TUI offers a folder/recent-session picker. Use `o` to switch while idle and `?` for keyboard help. See the [installation guide](docs/tui-installation.md) for an isolated installation and the [native image test kit](docs/tui-qualification.md) for repeatable terminal qualification.
-
-The TUI reads Omarchy's active palette and uses native terminal image rendering when available. Foot/Sixel is the primary target; an external **Open original** action handles unsupported terminals or formats. Use `--images off` to disable in-terminal photos, or `--images sixel` / `--images kitty` to select a renderer. See [the TUI guide](docs/tui.md) for shortcuts, image compatibility, and verification details.
-
-By default, the TUI index lives at `$XDG_DATA_HOME/donedatahoarder/index.db` (usually `~/.local/share/donedatahoarder/index.db`). Use `--db PATH` or `DDH_DB` to open an existing CLI/web database, and `--session ID` to resume a particular session. Existing CLI commands and the web UI remain available; their Python requirement stays at 3.10+.
-
-The development candidate also supports **remote terminal sessions**: keep the TUI on your Omarchy laptop and run processing, Ollama, and image preparation on a Windows workstation with the collection on an attached SSD. `ddh remote-serve` exposes explicitly authorized folders; `ddh tui --connect` attaches through verified HTTPS or an SSH tunnel. The connection button/F2 shows status and session settings, and closing the remote TUI leaves workstation jobs running. See the [setup guide and current limits](docs/remote-sessions.md). Automatic SSD classification and durable volume identity protection are proposed follow-up work, not properties of the current folder allowlist.
-
-For **nearby workstations**, install the `nearby` extra on both devices. Run the workstation with `--host 0.0.0.0 --discoverable --pair`, then `ddh tui --discover` on Omarchy. Select the workstation, paste its one-use invitation once, and optionally enable automatic reconnect. The main TUI stays the same; discovery, saved devices, and pairing live behind the connection indicator. Each laptop gets a revocable credential, and discovery never supplies certificate trust.
-
----
-
-## 🎯 What It Does
-
-DoneDataHoarder is a **local-first, AI-powered file organizer** that:
-
-- **Scans & Indexes** — Walks any directory tree and builds a searchable SQLite database
-- **AI Analysis** — Uses local LLM (Ollama) or cloud AI (Gemini) for vision + text analysis
-- **Smart Renaming** — Generates meaningful filenames (e.g., `2023-07-04_family_bbq.jpg` instead of `IMG_1234.jpg`)
-- **Deduplication** — Finds exact and near-duplicate files using perceptual hashing
-- **Automatic Organization** — Groups related files (CAD models + exports, photos + backups, etc.)
-- **Cross-Script Support** — Safely handles Hebrew, Arabic, Chinese, and other non-Latin scripts
-- **Web Review UI** — Inspect proposed changes and their reasons before approving them
-- **Safe by Default** — Execution is a dry run by default; disk changes require reviewed proposals and an explicit commit
-
----
-
-## ✨ Key Features
-
-### Smart File Discovery
-- Detects vision-capable models (LLaVA, BakLLaVA, Gemma3-vision, etc.)
-- Automatic circuit-breaker fallback: Ollama → Gemini if local inference fails
-- Graceful degradation for optional dependencies (ffmpeg, faster-whisper, pdfplumber)
-
-### Intelligent Deduplication
-- **Exact deduplication** — Remove byte-for-byte identical files
-- **Near-duplicate detection** — Perceptual hashing identifies visually/structurally similar files
-- **Configurable similarity threshold** — Fine-tune what counts as a duplicate
-- **Photo keeper evidence** — Prefer measured resolution and meaningful EXIF; show unique metadata, conflicting values, and preservation tradeoffs before review. Existing indexes can use `ddh refresh-photos --db INDEX --session SESSION_ID`. See the [photo keeper policy](docs/PHOTO_KEEPER_POLICY.md).
-
-### Relationship Grouping
-- Groups related files by folder structure and LLM reasoning
-- Recognizes project patterns: CAD files + exports, documents + versions, photos + edits
-- Cross-script linking: Hebrew files linked to English equivalents
-
-### Robust Organization
-- **Deterministic folder naming** — Consistent naming across runs
-- **Collision handling** — Automatic `_1`, `_2` suffixes for conflicts
-- **Prefix preservation** — Maintains project identifiers in filenames
-- **Generic stem detection** — Prevents uninformative names like "drawing.pdf" when duplicates exist
-
-### Production-Ready Stability
-- **SQLite WAL mode** — Prevents "database is locked" errors during long runs
-- **Configurable timeouts** — Handle slow hardware or reasoning models gracefully
-- **Clean shutdown** — Proper resource cleanup and session management
-
----
-
-## 🚀 Quick Start
-
-### Install
-```bash
-pip install donedatahoarder
-```
-
-### Check Your Setup
-```bash
-ddh doctor
-```
-
-### Scan a Folder (Dry-Run)
-```bash
-ddh scan /path/to/messy-folder
-```
-
-### Run Full Pipeline
-```bash
-# Everything from scan through propose (dry-run)
-ddh pipeline /path/to/messy-folder
-```
-
-### Review Proposals in Browser
-```bash
-ddh serve
-# Open http://localhost:8080 in your browser
-```
-
-### Apply Approved Changes
-```bash
-ddh execute --session YOUR_SESSION_ID --commit
-```
-In the web UI, use **Review** to approve or edit proposals, then **Pipeline → Preview changes** to inspect the selected paths and counts before **Commit**. The web API requires a fresh preview token for a commit. The CLI requires the session ID and asks for confirmation.
-
-The web **Unattended Run** uses scan → enrich → analyze → dedup → relate → propose → organize → dry-run preview. It saves each step and checkpoint on the server, resumes an interrupted run only when you choose **Resume from checkpoint**, and never commits file changes automatically. Analysis provider failures appear separately with an explicit **Retry provider errors** action.
-
----
-
-## 📋 CLI Commands
-
-| Command | Purpose |
-|---------|---------|
-| `tui [folder]` | Open the terminal pipeline, image comparison, review, and history workspace (Python 3.12+) |
-| `tui-fixture NEW_DIRECTORY` | Create a disposable indexed collection for native image checks |
-| `tui-diagnostics` | Capture terminal capabilities and a pending native qualification checklist |
-| `doctor` | Diagnose Ollama availability, disk space, and database integrity |
-| `scan` | Index a directory tree into the database |
-| `enrich` | Extract metadata, file hashes, and accurate modification dates |
-| `dedup` | Find exact and near-duplicate files |
-| `analyze` | AI vision + text analysis for every file |
-| `relate` | Group conceptually related files (CAD + exports, docs + versions, etc.) |
-| `propose` | Generate rename / tag / move proposals |
-| `review` | Interactive inspection of proposals before applying |
-| `execute` | Preview reviewed proposals; use `--session <id> --commit` to apply them |
-| `undo` | Attempt to reverse logged operations, including restoring files from trash |
-| `stats` | View database statistics and session history |
-| `pipeline` | CLI sequence: scan → enrich → exact/perceptual dedup → analyze → propose → dry-run preview; it does not run relate or organize |
-| `serve` | Launch web UI for reviewing and approving proposals |
-| `models` | List available Ollama models |
-| `bench` | Benchmark AI performance on sample files |
-| `config` | Manage naming rules and preferences |
-
-To retry files that failed AI inference while keeping successful analysis, run `ddh analyze --session <id> --retry-errors --model gemma4:26b --workers 1`. This also processes newly enriched files; other scanner or metadata errors are excluded. Omit `--session` to analyze qualifying files across the selected database.
-
----
-
-## 🔧 Environment Variables
-
-### Core Configuration
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DDH_DB` | `./ddh.db` | SQLite database path |
-| `DDH_BACKEND` | `auto` | LLM backend: `ollama`, `gemini`, or `auto` |
-| `DDH_MODEL` | `gemma3:12b` | Default text model (Ollama) |
-| `DDH_VISION_MODEL` | `gemma3:12b` | Vision-capable model (Ollama) |
-
-### Backend-Specific
-| Variable | Description |
-|----------|-------------|
-| `OLLAMA_HOST` | Ollama server URL (default: `http://localhost:11434`) |
-| `DATAHOARDER_OLLAMA_TIMEOUT` | Per-request timeout in seconds (default: `300` = 5 min) |
-| `GEMINI_API_KEY` | Gemini API key for cloud fallback |
-
-### Logging & Debugging
-| Variable | Default | Values |
-|----------|---------|--------|
-| `DDH_LOG` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-
----
-
-## 📦 Installation by Feature
-
-### Minimum (Images & Documents)
-```bash
-pip install donedatahoarder
-# Works: JPG, PNG, GIF, WEBP, PDF, DOCX, XLSX, TXT, etc.
-```
-
-### + Video Support
-```bash
-pip install donedatahoarder[video]
-# Also requires ffmpeg binary:
-# Windows: choco install ffmpeg
-# macOS: brew install ffmpeg
-# Linux: apt-get install ffmpeg
-```
-
-### + Audio Transcription
-```bash
-pip install donedatahoarder[video]  # Includes faster-whisper
-```
-
-### + PDF / Office Document Support
-```bash
-pip install donedatahoarder[docs]
-# Includes: pdfplumber, python-docx, openpyxl
-```
-
-### + Cloud Fallback (Gemini)
-```bash
-pip install donedatahoarder[cloud]
-export GEMINI_API_KEY=your-api-key
-```
-
-### Everything
-```bash
-pip install donedatahoarder[all]
-```
-
-For detailed installation instructions, see [INSTALL.md](INSTALL.md).
-
----
-
-## 💡 How It Works
-
-### 1. **Scan**
-Walks your directory tree and indexes metadata (size, dates, extension) into SQLite. Skips system files, caches, and junk.
-
-### 2. **Enrich**
-Extracts:
-- File hashes (MD5, SHA256)
-- Perceptual hashes (for image deduplication)
-- EXIF data (photos: camera, ISO, GPS, etc.)
-- Audio metadata (ID3 tags, duration)
-- Document metadata (creator, modified date)
-
-### 3. **Dedup**
-Groups files by hash:
-- **Exact duplicates** → Mark for deletion
-- **Near-duplicates** (perceptual hash similarity ≥92%) → Flag for review
-
-### 4. **Analyze**
-For each file, run AI vision + text analysis:
-- **Images**: Describe content, objects, OCR text
-- **PDFs**: Extract text, OCR scanned pages
-- **Videos**: Extract keyframes, optionally transcribe audio
-- **Documents**: Extract full text
-- **Audio**: Transcribe speech-to-text
-
-### 5. **Relate**
-Group files by semantic relationship:
-- Same project (CAD + exports + backups)
-- Same event (photos + videos + edited copies)
-- Same publication (doc versions, translations)
-- Numeric prefix matching (project IDs)
-- Cross-script matching (Hebrew ↔ English equivalents)
-
-### 6. **Propose**
-Generate proposals for each file:
-- **RENAME**: Meaningful filename based on AI analysis + relationships
-- **MOVE**: Reorganize into project folders
-- **TAG**: Save semantic tags in the DoneDataHoarder database (file metadata is not rewritten)
-- **MARK_DUPLICATE**: Flag as duplicate
-
-### 7. **Review**
-Browse proposals in the web UI, adjust confidence thresholds, and approve before applying.
-
-### 8. **Execute**
-Apply approved or edited proposals:
-- Renames (with collision detection and backoff)
-- Moves (creating folders as needed)
-- Trash/delete duplicates
-- Updates database metadata
-
----
-
-## 🛡️ Safety & Reliability
-
-- **Dry-run by default** — Execution does not change files until you explicitly use `--commit`
-- **SQLite WAL mode** — Prevents database-locked errors on long operations
-- **Configurable confidence thresholds** — Only apply changes you trust
-- **Undo log** — `ddh undo --db YOUR_DB --session YOUR_SESSION_ID` attempts to reverse all outstanding logged operations for that session, including restoring trashed files. `ddh undo --last` selects the most recent session with outstanding operations; it does not limit recovery to one execute run. Recovery can fail if paths have since changed.
-- **Session tracking** — Every operation logged with timestamps and diffs
-- **No external scanning** — All analysis happens locally or with your Gemini API key
-
----
-
-## 🌍 Language Support
-
-DoneDataHoarder handles **any Unicode filename**:
-- ✅ Hebrew (`מידול.dwg` → `midul_3d_modeling.dwg`)
-- ✅ Arabic, Chinese, Japanese, Korean, Russian, etc.
-- ✅ Mixed scripts in a single directory
-- ✅ Accent characters and diacritics
-
----
-
-## 🔄 Workflow Example
-
-**Before:**
-```
-Downloads/
-  IMG_1234.jpg
-  photo (1).jpg
-  myfile.pdf
-  scan_001.pdf
-  scan_002.pdf
-  בדיקה.docx
-  בדיקה (1).docx
-```
-
-**After running the pipeline, reviewing proposals, and committing the selected session:**
-```
-Downloads/
-  2024-01-15_family_bbq.jpg           (was IMG_1234.jpg)
-  2024-01-15_family_bbq_alt.jpg       (was photo (1).jpg)
-  inspection_report_2024.pdf          (was myfile.pdf)
-  parking_survey_page_1.pdf           (was scan_001.pdf)
-  parking_survey_page_2.pdf           (was scan_002.pdf)
-  .ddh_trash/
-    inspection_report_2024_dup.docx   (was בדיקה (1).docx → duplicate)
-```
-
----
-
-## 📊 Database Schema
-
-DoneDataHoarder uses SQLite with the following main tables:
-
-- **File** — Indexed files with paths, sizes, hashes, metadata
-- **Proposal** — Rename/move/tag proposals with confidence scores
-- **DuplicateGroup** — Grouped near-duplicates for review
-- **RelationGroup** — Semantically related files (projects, events, etc.)
-- **UserSession** — Tracks scanning/analysis sessions with progress
-
-No external dependencies needed; everything is self-contained.
-
----
-
-## ⚙️ Advanced Configuration
-
-### Custom Naming Rules
-```bash
-ddh config set naming.date_format "%Y-%m-%d"
-ddh config set naming.prefer_original_stem true
-```
-
-### Apply Pending Proposals by Confidence (Explicit Opt-In)
-```bash
-ddh execute --session YOUR_SESSION_ID --include-pending --min-confidence 0.7
-ddh execute --session YOUR_SESSION_ID --include-pending --min-confidence 0.7 --commit
-```
-Without `--include-pending`, execution selects only approved or edited proposals. The web Commit action always uses that reviewed-only selection.
-
-### Selective Processing
-```bash
-# Only analyze images, skip videos
-ddh analyze --include "*.jpg" "*.png" --exclude "*.mp4"
-
-# Only dedup PDFs
-ddh dedup --include "*.pdf"
-```
-
----
-
-## 🐛 Troubleshooting
-
-### "Ollama model not found"
-```bash
-ollama pull gemma3:12b
-# Or use Gemini backend:
-export GEMINI_API_KEY=your-key
-export DDH_BACKEND=gemini
-```
-
-### "Database is locked"
-Another DoneDataHoarder process is running. Close other terminals/web UI:
-```bash
-# macOS/Linux:
-pkill -f ddh
-
-# Windows:
-taskkill /F /IM python.exe /T
-```
-
-### "ffmpeg not found"
-```bash
-# Windows (Chocolatey):
-choco install ffmpeg
-
-# macOS:
-brew install ffmpeg
-
-# Linux:
-sudo apt-get install ffmpeg
-```
-
-### "Timeout errors during analysis"
-Your hardware is slower. Increase timeout:
-```bash
-export DATAHOARDER_OLLAMA_TIMEOUT=600  # 10 minutes
-ddh analyze --retry-errors
-```
-
-### "Memory errors with large files"
-Process in batches:
-```bash
-ddh scan /path/to/files --batch-size 100
-```
-
----
-
-## 📝 Recent Improvements
-
-### v0.3.0
-- ✅ **Folder organization** — Automatic move proposals with deduplication
-- ✅ **Stem word deduplication** — Removes description echoes from AI-generated names
-- ✅ **Normalized folder names** — Consistent space-to-underscore conversion
-- ✅ **Improved timeout handling** — Configurable per-request timeout for slow hardware
-- ✅ **Database reliability** — SQLite WAL mode prevents lock contention
-- ✅ **Vision model detection** — Auto-detects gemma4, gemma3-vision, LLaVA variants
-- ✅ **Automatic proposal execution** — Execute with default confidence 0.5 for trusted runs
-
----
-
-## 📚 Documentation
-
-- **[Installation Guide](INSTALL.md)** — Detailed setup for all platforms
-- **[GitHub Wiki](https://github.com/Yariminal/DoneDataHoarder/wiki)** — Advanced topics
-- **[Issues & Discussions](https://github.com/Yariminal/DoneDataHoarder/issues)** — Community support
-
----
-
-## 🤝 Contributing
-
-Contributions welcome! To get started:
+Press **`m` for metadata-only processing**: indexing, hashes, EXIF, duplicate
+finding, and review work without Ollama. For AI descriptions and organization,
+run Ollama and select an installed vision-capable model:
 
 ```bash
-git clone https://github.com/Yariminal/DoneDataHoarder.git
-cd DoneDataHoarder
-pip install -e ".[dev,web]"
-pytest tests/
+ddh tui ~/Downloads --model YOUR_INSTALLED_VISION_MODEL
 ```
 
----
+The TUI uses the selected Ollama endpoint and does not switch to a cloud provider.
+No model is downloaded by DDH installation. See [installation and troubleshooting](INSTALL.md).
 
-## 📄 License
+## A small laptop, a capable workstation
 
-MIT License — see [LICENSE](LICENSE) file for details.
+Attach the collection to your workstation. Run the workstation service, open
+`ddh tui --discover` on your laptop, select the nearby device, and paste its
+one-use invitation. The same terminal interface controls the remote session;
+the workstation performs processing and prepares image previews.
 
----
+The connection indicator shows status. Paired devices can be revoked, processing
+continues after the laptop disconnects, and uncertain commands are not blindly
+replayed. Follow the [complete Windows + Omarchy setup](docs/remote-sessions.md).
 
-## 🙋 Support
+Remote access currently uses explicit folder allowlists. An attached external
+SSD is a supported collection location; **automatic SSD-only enforcement is not
+implemented**. Discovery also depends on your LAN allowing multicast traffic.
 
-- **GitHub Issues** — Bug reports and feature requests
-- **GitHub Discussions** — Questions and ideas
-- **Email** — Contact the maintainer
+## Made for the terminal
 
----
+DDH follows Omarchy's active theme with a Tokyo Night fallback. Photos keep their
+original colors. Foot/Sixel is the primary image target; Kitty graphics and an
+external-viewer fallback are available. Actual terminal and multiplexer behavior
+still needs the [native image checks](docs/tui-qualification.md).
 
-## 🎓 Learn More
+| Key | Action |
+| --- | --- |
+| `1` / `2` / `3` / `4` | Pipeline / Review / Collections / History |
+| `m` | Run metadata-only processing |
+| `i` / `c` | Open an image / compare copies |
+| `a` / `r` / `e` | Approve / reject / edit in Review |
+| `p` | Preview approved changes |
+| `F2` | Connection and workstation settings |
+| `o` | Open a folder or saved session |
+| `?` | Keyboard help |
 
-- **How LLM-based file organization works** — See `donedatahoarder/proposals/namer.py` for the AI renaming logic
-- **Database architecture** — Explore `donedatahoarder/db/models.py`
-- **Pipeline orchestration** — Check `donedatahoarder/cli.py` for command flow
+## What changes your files?
 
-Enjoy organizing your data! 🎉
+Opening a workspace and running the pipeline build an index and proposals.
+Applying reviewed proposals can rename or move files and place duplicates in
+DDH's recovery trash. A separate preview and confirmation are required in the
+TUI. History provides conflict-checked recovery; it is not a backup system.
+
+New duplicate groups use the photo keeper policy. Existing keeper choices stay
+intact. To backfill photo evidence in an existing index, run this on the machine
+that owns the collection:
+
+```bash
+ddh refresh-photos --db /path/to/index.db --session SESSION_ID
+```
+
+This preserves AI analysis and keeper choices. Changed evidence returns affected
+approvals to review. It does not merge metadata or rewrite your photographs.
+
+## Current limits
+
+- Pixel dimensions measure resolution, not sharpness or authenticity. Crops,
+  edits, upscales, and metadata conflicts need human judgment.
+- Structured photo evidence currently covers JPEG, PNG, WebP, TIFF, and BMP.
+  RAW and HEIC/HEIF/AVIF metadata remain unsupported. Sidecars are not compared.
+- Make intended cloud files local first. DDH does not add a OneDrive hydration
+  policy; offline placeholders and scanner reparse-point exclusions still apply.
+- The browser interface and older CLI workflows remain available. AI/provider
+  support, document extraction, and video transcription have separate extras.
+- Automated tests and isolated installs do not replace real Omarchy, native
+  graphics, external-drive hotplug, or photo-library qualification.
+
+## Documentation and contributing
+
+| Guide | What it covers |
+| --- | --- |
+| [Install](INSTALL.md) | Linux, Windows, extras, models, updates, troubleshooting |
+| [Terminal workspace](docs/tui.md) | Sessions, review, image controls, recovery |
+| [Folder organization](docs/organization.md) | Relationship signals, content context, proposed structure |
+| [Remote sessions](docs/remote-sessions.md) | Windows worker, nearby pairing, reconnect |
+| [Photo keeper policy](docs/PHOTO_KEEPER_POLICY.md) | Ranking, tradeoffs, metadata support |
+| [Validation status](docs/TUI_IMPLEMENTATION_STATUS.md) | Evidence and remaining hardware checks |
+| [Contributing](CONTRIBUTING.md) | Development and tests |
+| [Preview launch kit](docs/launch.md) | Demo sequence, screenshots, draft announcements |
+
+Found a bad recommendation? A small reproducible pair, with the expected keeper
+and explanation, is especially useful. See [how to report a bug](CONTRIBUTING.md#reporting-bugs-and-submitting-changes).
+
+MIT licensed. Independent community project; not an official Omarchy application.

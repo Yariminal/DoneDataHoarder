@@ -304,6 +304,67 @@ def test_tree_preserves_selected_file_when_rows_reorder(tmp_path):
     asyncio.run(scenario())
 
 
+def test_refresh_clears_evidence_and_pixels_when_rows_disappear(tmp_path):
+    async def scenario():
+        service = FakeWorkspace(tmp_path)
+        service.data["collections"] = [{"id": 20, "label": "Previous collection",
+                                        "members": [], "reason": "Previous evidence"}]
+        app = DDHApp(service)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settled(pilot)
+            assert "original.png" in str(app.query_one("#inspector-text", Static).render())
+            assert "renamed.png" in str(app.query_one("#review-detail", Static).render())
+            preview = app.query_one("#inspector-image")
+            assert preview.source is not None
+            await pilot.press("3")
+            await settled(pilot)
+            assert "Previous evidence" in str(app.query_one("#collection-detail", Static).render())
+
+            service.data["files"] = []
+            service.data["proposals"] = []
+            service.data["collections"] = []
+            app.update_snapshot(service.snapshot())
+            await settled(pilot)
+
+            assert app.selected_file_id is None
+            assert app.selected_proposal_id is None
+            assert app.selected_collection_id is None
+            assert "original.png" not in str(app.query_one("#inspector-text", Static).render())
+            assert "renamed.png" not in str(app.query_one("#review-detail", Static).render())
+            assert "Previous evidence" not in str(app.query_one("#collection-detail", Static).render())
+            assert preview.source is None
+            assert not preview.display
+            assert app.query_one("#approve", Button).disabled
+    asyncio.run(scenario())
+
+
+def test_review_table_keeps_type_and_decision_visible_with_long_paths(tmp_path):
+    async def scenario():
+        root = tmp_path / ("long collection path " * 5)
+        service = FakeWorkspace(root)
+        source, destination = root / "trip" / "source.png", root / "trip" / "destination.png"
+        service.data["proposals"][0].update(current_path=str(source), proposed_path=str(destination))
+        app = DDHApp(service)
+        async with app.run_test(size=(140, 42)) as pilot:
+            await settled(pilot)
+            await pilot.press("2")
+            await settled(pilot)
+            table = app.query_one("#review-table", DataTable)
+            path_cell = table.get_row_at(0)[0].plain
+            assert str(root) not in path_cell
+            assert "trip" in path_cell and "source.png" in path_cell and "destination.png" in path_cell
+            detail = str(app.query_one("#review-detail", Static).render())
+            assert str(source) in detail and str(destination) in detail
+            for size in ((140, 42), (80, 24)):
+                await pilot.resize_terminal(*size)
+                await settled(pilot)
+                assert sum(column.get_render_width(table) for column in table.ordered_columns) <= table.content_size.width
+                assert table.ordered_columns[1].label.plain == "Type"
+                assert table.ordered_columns[2].label.plain == "Decision"
+            assert service.calls == []
+    asyncio.run(scenario())
+
+
 def test_ctrl_q_uses_safe_quit_and_bad_preview_cannot_apply(tmp_path):
     async def scenario():
         service = FakeWorkspace(tmp_path)

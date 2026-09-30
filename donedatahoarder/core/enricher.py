@@ -26,6 +26,7 @@ from donedatahoarder.db.models import (
     DuplicateGroup, DuplicateMember, File, FileStatus, Proposal, ProposalStatus,
     ProposalType, UserSession,
 )
+from donedatahoarder.core.media_dates import parse_media_date
 from donedatahoarder.db.session import get_engine
 from donedatahoarder.logging import get_logger
 from donedatahoarder.core.photo_metadata import (
@@ -153,11 +154,9 @@ def _audio_date(path: Path) -> Optional[datetime]:
             val = f.get(key)
             if val:
                 raw = str(val[0]).strip()
-                for fmt in ("%Y-%m-%d", "%Y", "%Y-%m-%dT%H:%M:%S"):
-                    try:
-                        return datetime.strptime(raw[:len(fmt)], fmt)
-                    except ValueError:
-                        continue
+                date = parse_media_date(raw)
+                if date is not None:
+                    return date
     except Exception:
         pass
     return None
@@ -396,7 +395,7 @@ def _best_date(
 def _take(counts: dict, limit: Optional[int]) -> Optional[int]:
     """How many pending rows to pull this batch. None means stop."""
     take = BATCH_SIZE
-    if limit:
+    if limit is not None:
         remaining = limit - (counts["enriched"] + counts["errors"])
         if remaining <= 0:
             return None
@@ -419,12 +418,14 @@ def _enrich_unlocked(workers: int = 1, limit: Optional[int] = None, session_id: 
     """
     engine = get_engine()
     counts = {"enriched": 0, "errors": 0, "skipped": 0}
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
 
     with Session(engine) as session:
         query = session.query(File).filter(File.status == FileStatus.PENDING)
         if session_id:
             query = query.filter(File.session_id == session_id)
-        if limit:
+        if limit is not None:
             query = query.limit(limit)
         total = query.count()
 
@@ -483,12 +484,14 @@ def _enrich_with_progress_unlocked(
     """
     engine = get_engine()
     counts = {"enriched": 0, "errors": 0, "skipped": 0}
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
 
     with Session(engine) as session:
         query = session.query(File).filter(File.status == FileStatus.PENDING)
         if session_id:
             query = query.filter(File.session_id == session_id)
-        if limit:
+        if limit is not None:
             query = query.limit(limit)
         total = query.count()
 

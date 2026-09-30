@@ -17,6 +17,7 @@ from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationError
 from sqlalchemy.orm import Session
 
@@ -36,6 +37,33 @@ from .pairing import PairingStore, PairingError, PairingRateLimited, MAX_PAIR_BO
 logger = logging.getLogger("donedatahoarder.remote")
 PREFIX = "/remote/v1"
 PATH_FLAVOR = "windows" if os.name == "nt" else "posix"
+MAX_COMMAND_BODY_BYTES = 64 * 1024
+
+
+class _BoundedRoute(APIRoute):
+    """Bound command bodies before the framework buffers or validates JSON."""
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def bounded(request: Request):
+            if request.method != "POST" or request.url.path == PREFIX + "/pair":
+                return await handler(request)
+            length = request.headers.get("content-length", "")
+            if length.isdigit() and (len(length) > 20 or int(length) > MAX_COMMAND_BODY_BYTES):
+                raise HTTPException(413, "Remote command request is too large")
+            body = bytearray()
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > MAX_COMMAND_BODY_BYTES:
+                    raise HTTPException(413, "Remote command request is too large")
+                body.extend(chunk)
+
+            async def receive():
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+
+            return await handler(Request(request.scope, receive))
+
+        return bounded
 
 
 class _Params(BaseModel):
@@ -206,9 +234,11 @@ class _Scope:
         self.lexical(value)
         path = _unlinked_absolute(value, require_directory=True)
         for root in self.roots:
+            if not path.is_relative_to(root):
+                continue
             # Revalidate the configured folder in case it has been replaced.
             checked = _unlinked_absolute(root, require_directory=True)
-            if checked == root and path.is_relative_to(root):
+            if checked == root:
                 return path
         raise ReviewError("Collection is outside the workstation's allowed folders", 403)
 
@@ -235,8 +265,9 @@ def create_app(db_path: Path, *, token: str, allowed_roots: list[Path],
                name: str | None = None, pairing_store: PairingStore | None = None,
                pairing_path: Path | None = None) -> FastAPI:
     """Create one authenticated daemon; never mount the general web routes."""
-    if not isinstance(token, str) or len(token) < 32 or any(char.isspace() or ord(char) < 32 for char in token):
-        raise ValueError("The remote token must contain at least 32 non-whitespace characters")
+    if (not isinstance(token, str) or not 32 <= len(token) <= 4096
+            or any(not 33 <= ord(char) <= 126 for char in token)):
+        raise ValueError("The remote token must contain 32–4096 printable ASCII characters without whitespace")
     _Settings(model=model, workers=workers)
     if not model.strip() or any(ord(char) < 32 for char in model):
         raise ValueError("Choose a non-empty model name")
@@ -261,6 +292,7 @@ def create_app(db_path: Path, *, token: str, allowed_roots: list[Path],
     app = FastAPI(title="DoneDataHoarder Remote", version=__version__,
                   docs_url=None, redoc_url=None, openapi_url=None,
                   redirect_slashes=False)
+    app.router.route_class = _BoundedRoute
     expected = ("Bearer " + token).encode("utf-8")
     command_lock = threading.Lock()
 
@@ -377,6 +409,7 @@ def create_app(db_path: Path, *, token: str, allowed_roots: list[Path],
                     and receipts.uncertain_for(payload.get("session_id"), payload.get("root"))):
                 raise ReviewError("An earlier command has an uncertain outcome. Inspect this session on the workstation before more changes")
             result = operation()
+            return receipts.finish(request_id, result=result)
         except (ReviewError, HTTPException) as exc:
             detail = str(exc) if isinstance(exc, ReviewError) else str(exc.detail)
             return receipts.finish(request_id, error={"detail": detail, "status_code": exc.status_code})
@@ -392,7 +425,6 @@ def create_app(db_path: Path, *, token: str, allowed_roots: list[Path],
             logger.exception("Remote command failed (%s)", request_id)
             return receipts.finish(request_id, uncertain=mutation, error={
                 "detail": "The workstation could not confirm the command outcome. Inspect this session and workstation logs before more changes", "status_code": 409})
-        return receipts.finish(request_id, result=result)
 
     @app.get(PREFIX + "/hello")
     def hello():

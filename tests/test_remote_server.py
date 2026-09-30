@@ -22,7 +22,7 @@ from donedatahoarder.db.models import (
 )
 from donedatahoarder.db.session import get_engine
 from donedatahoarder.remote.receipts import ReceiptConflict, ReceiptStore
-from donedatahoarder.remote.server import PREFIX, create_app
+from donedatahoarder.remote.server import MAX_COMMAND_BODY_BYTES, PREFIX, create_app
 from donedatahoarder.tui import onboarding, service as service_module
 from donedatahoarder.tui.service import WorkspaceService
 
@@ -153,6 +153,14 @@ def test_database_and_recovery_journal_cannot_live_in_collection(tmp_path, monke
     assert not (root / "journal").exists()
 
 
+@pytest.mark.parametrize("token", ["a" * 32 + "\x7f", "a" * 32 + "é", "a" * 4097])
+def test_header_incompatible_token_is_rejected_before_creating_database(tmp_path, token):
+    database = tmp_path / "never-created.db"
+    with pytest.raises(ValueError, match="printable ASCII"):
+        create_app(database, token=token, allowed_roots=[tmp_path])
+    assert not database.exists()
+
+
 def test_sessions_and_file_metadata_are_scoped_to_allowed_roots(workstation):
     client, app, root, _, _ = workstation
     session_id = open_session(client)
@@ -240,6 +248,30 @@ def test_missing_drive_preserves_metadata_control_and_receipt_access(workstation
         assert new_client.get(PREFIX + "/commands/" + key).json() == receipt
 
 
+def test_missing_allowed_folder_does_not_block_another_collection(workstation):
+    client, _, first, database, _ = workstation
+    first_session = open_session(client)
+    second = first.parent / "second-collection"
+    second.mkdir()
+    app = create_app(database, token=TOKEN, allowed_roots=[first, second])
+    with TestClient(app, headers={"Authorization": "Bearer " + TOKEN}) as other_client:
+        second_session = open_session(other_client, root=str(second))
+        file_id = add_file(second_session, second / "available.txt")
+        first.rename(first.parent / "disconnected-drive")
+        listed = {row["id"]: row for row in other_client.get(PREFIX + "/sessions").json()}
+        assert listed[first_session]["storage"]["available"] is False
+        assert listed[second_session]["storage"]["available"] is True
+        snapshot = other_client.get(PREFIX + f"/sessions/{second_session}/snapshot")
+        assert snapshot.status_code == 200, snapshot.text
+        assert snapshot.json()["storage"]["available"] is True
+        assert snapshot.json()["files"][0]["id"] == file_id
+        opened = open_session(other_client, root=str(second))
+        assert other_client.get(PREFIX + f"/sessions/{opened}/snapshot").json()["storage"]["available"] is True
+        settings = command(other_client, second_session, "update_settings", {"workers": 2}).json()
+        assert settings["state"] == "completed", settings
+        assert (second / "available.txt").read_text() == "sample"
+
+
 def test_create_and_command_receipts_replay_without_duplicate_execution(workstation, monkeypatch):
     client, app, root, _, _ = workstation
     request_id = str(uuid4())
@@ -275,6 +307,28 @@ def test_command_allowlist_types_and_failed_receipts(workstation):
     assert failed["state"] == "failed" and failed["error"]["status_code"] == 400
     assert command(client, session_id, "apply", {"token": "stale", "confirmed": False}, key).json() == failed
     assert command(client, session_id, "reject", {"proposal_id": 999}).json()["error"]["status_code"] == 404
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_command_body_limit_precedes_validation_and_dispatch(workstation, monkeypatch, chunked):
+    client, app, _, _, _ = workstation
+    session_id = open_session(client)
+    calls = []
+    monkeypatch.setattr(WorkspaceService, "update_settings", lambda self, **kwargs: calls.append(kwargs))
+    key = str(uuid4())
+    body = ('{"request_id":"' + key + '","command":"update_settings","params":{"workers":2}}').encode()
+    body += b" " * (MAX_COMMAND_BODY_BYTES + 1 - len(body))
+    content = (body[index:index + 1024] for index in range(0, len(body), 1024)) if chunked else body
+    response = client.post(PREFIX + f"/sessions/{session_id}/commands", content=content,
+                           headers={"Content-Type": "application/json"})
+    assert response.status_code == 413, response.text
+    assert calls == []
+    assert app.state.remote_receipts.get(key) is None
+    response = client.post(PREFIX + "/sessions", content=body,
+                           headers={"Content-Type": "application/json"})
+    assert response.status_code == 413
+    with TestClient(app) as unauthenticated:
+        assert unauthenticated.post(PREFIX + "/sessions", content=body).status_code == 401
 
 
 def test_real_metadata_pipeline_remains_owned_by_workstation(workstation):
@@ -350,6 +404,30 @@ def test_unexpected_mutation_failure_is_uncertain_and_gates_other_clients(workst
         assert blocked["state"] == "failed" and "uncertain" in blocked["error"]["detail"]
         assert other_client.get(PREFIX + f"/sessions/{session_id}/snapshot").status_code == 200
     assert command(client, session_id, "apply", {"token": "example", "confirmed": True}, key).json() == receipt
+
+
+@pytest.mark.parametrize("invalid_result", [{"applied": float("inf")}, {"applied": {1}}])
+def test_unrecordable_mutation_result_is_uncertain_and_blocks_more_changes(workstation, monkeypatch, invalid_result):
+    client, app, root, _, _ = workstation
+    session_id = open_session(client)
+    calls = []
+
+    def unrecordable_apply(self, **kwargs):
+        calls.append(self.session_id)
+        (root / "completed.txt").write_text("mutation completed before receipt encoding")
+        return invalid_result
+
+    monkeypatch.setattr(WorkspaceService, "apply", unrecordable_apply)
+    key = str(uuid4())
+    receipt = command(client, session_id, "apply", {"token": "example", "confirmed": True}, key).json()
+    assert receipt["state"] == "uncertain", receipt
+    assert app.state.remote_receipts.get(key) == receipt
+    assert (root / "completed.txt").read_text() == "mutation completed before receipt encoding"
+    assert command(client, session_id, "apply", {"token": "example", "confirmed": True}, key).json() == receipt
+    assert calls == [session_id]
+    blocked = command(client, session_id, "update_settings", {"workers": 2}).json()
+    assert blocked["state"] == "failed" and "uncertain" in blocked["error"]["detail"]
+    assert command(client, session_id, "history").json()["state"] == "completed"
 
 
 def test_preview_route_is_authenticated_and_returns_actual_bounded_png(workstation):

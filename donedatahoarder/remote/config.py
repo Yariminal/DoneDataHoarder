@@ -21,8 +21,8 @@ def read_token(path: Path) -> str:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
         raise ValueError("Token file must be a regular file containing a private connection token.")
     token = path.read_text(encoding="utf-8").strip()
-    if len(token) < 32 or len(token) > 512 or not token.isascii() or any(char.isspace() for char in token):
-        raise ValueError("Connection token must contain 32–512 ASCII characters without whitespace.")
+    if len(token) < 32 or len(token) > 512 or any(not 33 <= ord(char) <= 126 for char in token):
+        raise ValueError("Connection token must contain 32–512 printable ASCII characters without whitespace.")
     return token
 
 

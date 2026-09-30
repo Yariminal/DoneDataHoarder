@@ -6,7 +6,7 @@ import pytest
 pytest.importorskip("textual")
 
 from PIL import Image
-from textual.widgets import TabbedContent
+from textual.widgets import Button, DataTable, Static, TabbedContent
 
 from donedatahoarder.core import jobs
 from donedatahoarder.core.jobs import JobManager
@@ -37,13 +37,27 @@ def test_metadata_duplicate_review_and_undo_through_real_app(tmp_path, monkeypat
     (root / "copy.png").write_bytes(original_bytes)
     workspace = WorkspaceService(root)
 
-    async def wait_for(pilot, predicate, message):
+    async def wait_for(pilot, predicate, message, *, workspace_app=None, action_state=None):
         for _ in range(160):
             if predicate():
                 return
             await pilot.pause(0.1)
         current = workspace.snapshot()
-        pytest.fail(f"{message}: plan={current.get('plan')!r}; job={current.get('job')!r}")
+        ui_state = None
+        if workspace_app is not None:
+            table = workspace_app.query_one("#review-table", DataTable)
+            ui_state = {
+                "busy": workspace_app.busy,
+                "selected_proposal_id": workspace_app.selected_proposal_id,
+                "selected_proposal": workspace_app.selected_proposal(),
+                "approve_disabled": workspace_app.query_one("#approve", Button).disabled,
+                "workspace": workspace_app.query_one("#workspace", TabbedContent).active,
+                "review_row_count": table.row_count,
+                "review_cursor_row": table.cursor_row,
+                "status": str(workspace_app.query_one("#status", Static).render()),
+                "snapshot": workspace_app.snapshot,
+            }
+        pytest.fail(f"{message}: plan={current.get('plan')!r}; job={current.get('job')!r}; ui={ui_state!r}; action={action_state!r}")
 
     async def scenario():
         app = DDHApp(workspace, image_capability=ImageCapabilities(renderer="off"))
@@ -68,10 +82,31 @@ def test_metadata_duplicate_review_and_undo_through_real_app(tmp_path, monkeypat
             assert (root / "original.png").exists() and (root / "copy.png").exists()
             await pilot.press("2")
             assert app.query_one("#workspace", TabbedContent).active == "review"
-            await pilot.click("#approve")
+            approve = app.query_one("#approve", Button)
+            action_state = {
+                "disabled": approve.disabled, "mounted": approve.is_mounted,
+                "display": approve.display, "visible": approve.visible,
+                "region": str(approve.region), "selected_proposal_id": app.selected_proposal_id,
+                "busy": app.busy, "has_live_workers": app.snapshot.get("has_live_workers"),
+                "active_job": app.snapshot.get("active_job"),
+            }
+
+            def approve_ready():
+                # Tab activation can precede layout. Pilot resolves click
+                # coordinates before its own pause, so an enabled button with
+                # a stale region can silently send the click to another widget.
+                region = approve.region
+                return (not approve.disabled and region.width > 1 and region.height > 1
+                        and app.get_widget_at(region.x + 1, region.y + 1)[0] is approve)
+
+            await wait_for(pilot, approve_ready, "Review button did not become visible",
+                           workspace_app=app, action_state=action_state)
+            action_state["ready_region"] = str(approve.region)
+            action_state["click_hit"] = await pilot.click("#approve", offset=(1, 1))
+            assert action_state["click_hit"], f"Review click missed its button: {action_state!r}"
             await wait_for(pilot, lambda: not app.busy and any(
                 proposal["status"] == "approved" for proposal in app.snapshot["proposals"]),
-                "Review decision was not persisted")
+                "Review decision was not persisted", workspace_app=app, action_state=action_state)
             await pilot.click("#preview")
             await wait_for(pilot, confirmation_ready,
                            "Execution preview was not shown")

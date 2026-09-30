@@ -2,14 +2,14 @@
 DoneDataHoarder CLI — entry point for all commands.
 
 Usage:
-    datahoarder scan     /path/to/drive
-    datahoarder enrich
-    datahoarder analyze  [--workers N] [--limit N]
-    datahoarder dedup
-    datahoarder propose
-    datahoarder review
-    datahoarder execute  [--commit]
-    datahoarder stats
+    ddh scan     /path/to/drive
+    ddh enrich
+    ddh analyze  [--workers N] [--limit N]
+    ddh dedup
+    ddh propose
+    ddh review
+    ddh execute  [--commit]
+    ddh stats
 """
 from __future__ import annotations
 
@@ -84,8 +84,8 @@ def _maybe_show_welcome() -> None:
         Panel(
             "[bold green]Welcome to DoneDataHoarder![/bold green]\n\n"
             "Your AI-powered file organization assistant.\n"
-            "  • Run [cyan]datahoarder doctor[/cyan] to check your setup\n"
-            "  • Run [cyan]datahoarder scan /path/to/files[/cyan] to get started\n"
+            "  • Run [cyan]ddh doctor[/cyan] to check your setup\n"
+            "  • Run [cyan]ddh scan /path/to/files[/cyan] to get started\n"
             "  • Docs: [blue]https://github.com/Yariminal/DoneDoneDataHoarder[/blue]",
             title="🗄️  DoneDataHoarder",
             style="green",
@@ -417,7 +417,7 @@ def dedup(
             f"({prop_counts['groups']} groups, {prop_counts['skipped']} already existed, "
             f"{prop_counts['no_keeper']} missing keeper)"
         )
-        console.print("Run [bold]datahoarder review --dupes[/bold] to inspect, then [bold]datahoarder execute --commit[/bold] to clean up.")
+        console.print("Run [bold]ddh review --dupes[/bold] to inspect, then [bold]ddh execute --commit[/bold] to clean up.")
     else:
         console.print("\n[dim]No new duplicate proposals created.[/dim]")
 
@@ -465,7 +465,7 @@ def relate(
                 s.query(UserSession).order_by(UserSession.updated_at.desc()).first()
             )
             if not latest:
-                console.print("[red]No sessions found. Run `datahoarder scan` first.[/red]")
+                console.print("[red]No sessions found. Run `ddh scan` first.[/red]")
                 raise typer.Exit(1)
             session_id = latest.id
             console.print(f"Using latest session: [cyan]{session_id}[/cyan]")
@@ -500,8 +500,8 @@ def relate(
 @app.command()
 def propose(
     db: Annotated[str, typer.Option("--db", help="SQLite database path.", envvar="DDH_DB")] = "donedatahoarder.db",
-    limit: Annotated[Optional[int], typer.Option("--limit", help="Max proposals to generate.")] = None,
-    offset: Annotated[Optional[int], typer.Option("--offset", help="Skip first N files.")] = None,
+    limit: Annotated[Optional[int], typer.Option("--limit", min=0, help="Max analyzed files to process; omits collection-wide postpasses.")] = None,
+    offset: Annotated[Optional[int], typer.Option("--offset", min=0, help="Skip first N files.")] = None,
     no_organize: Annotated[bool, typer.Option("--no-organize", help="Skip folder reorganization proposals.")] = False,
 ):
     """[bold blue]Generate[/bold blue] rename/tag and folder reorganization proposals from analyzed files."""
@@ -531,7 +531,9 @@ def propose(
         f"{counts['skipped']} unchanged"
     )
 
-    if not no_organize:
+    if limit is not None or offset is not None:
+        console.print("Skipping collection-wide organization for this file slice.", markup=False)
+    elif not no_organize:
         console.print(Panel("Analyzing folder structure for reorganization…", style="cyan"))
         from donedatahoarder.proposals.organizer import generate_reorg_proposals
 
@@ -550,7 +552,7 @@ def propose(
         else:
             console.print("[yellow]No active session — skipping folder reorganization.[/yellow]")
 
-    console.print("Run [bold]datahoarder review[/bold] to inspect them.")
+    console.print("Run [bold]ddh review[/bold] to inspect them.")
 
 
 # ---------------------------------------------------------------------------
@@ -587,7 +589,7 @@ def review(
                 f"(confidence >= {min_confidence})."
             )
             console.print(
-                f"Run [bold]datahoarder execute --session {session_id} --commit[/bold] "
+                f"Run [bold]ddh execute --session {session_id} --commit[/bold] "
                 f"to apply them to disk."
             )
         else:
@@ -604,7 +606,7 @@ def review(
         _interactive_review(limit=limit, offset=offset, session_id=session_id)
     else:
         console.print(
-            "\nRun [bold]datahoarder execute --session <id>[/bold] to preview reviewed proposals, "
+            "\nRun [bold]ddh execute --session <id>[/bold] to preview reviewed proposals, "
             "or add [bold]--commit[/bold] to apply them."
         )
 
@@ -617,7 +619,7 @@ def _review_dupes(
 
     groups = duplicate_summary()
     if not groups:
-        console.print("[yellow]No duplicate groups found. Run 'datahoarder dedup' first.[/yellow]")
+        console.print("[yellow]No duplicate groups found. Run 'ddh dedup' first.[/yellow]")
         return
 
     start = offset or 0
@@ -768,7 +770,7 @@ def execute(
     Defaults to dry-run. Pass [bold]--commit[/bold] to make real changes.
 
     Filesystem changes are journaled for recovery.
-    Use [bold]datahoarder undo --session <id>[/bold] to reverse them.
+    Use [bold]ddh undo --session <id>[/bold] to reverse them.
     """
     _init_db(db)
 
@@ -948,7 +950,7 @@ def pipeline(
     """
     [bold]Run the full pipeline[/bold]: scan -&gt; enrich -&gt; dedup -&gt; analyze -&gt; propose -&gt; (preview).
 
-    Does NOT execute changes unless you follow up with [bold]datahoarder execute --commit[/bold].
+    Does NOT execute changes unless you follow up with [bold]ddh execute --commit[/bold].
     """
     _init_db(db)
     root = root.resolve()
@@ -1051,9 +1053,9 @@ def pipeline(
         Panel(
             "[bold green]Pipeline complete![/bold green]\n\n"
             "Next steps:\n"
-            f"  • [cyan]datahoarder review --session {session_id}[/cyan] — inspect proposals\n"
-            f"  • [cyan]datahoarder execute --session {session_id}[/cyan] — preview approvals\n"
-            f"  • [cyan]datahoarder execute --session {session_id} --commit[/cyan] — apply approvals\n",
+            f"  • [cyan]ddh review --session {session_id}[/cyan] — inspect proposals\n"
+            f"  • [cyan]ddh execute --session {session_id}[/cyan] — preview approvals\n"
+            f"  • [cyan]ddh execute --session {session_id} --commit[/cyan] — apply approvals\n",
             style="green",
         )
     )

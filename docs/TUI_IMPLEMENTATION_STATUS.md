@@ -1,5 +1,30 @@
 # Python + Textual implementation checkpoint
 
+## Preview readiness review — 2026-09-30
+
+The current candidate includes the full Textual organization workspace, nearby
+workstation pairing, and photo keeper decisions based on resolution and meaningful
+capture metadata. The README leads with file and folder organization through
+relationship inference and contextual evidence, includes real headless TUI
+captures, and links to source installation, platform limits, and a preview demo
+guide. The candidate remains an alpha preview; no package has been published.
+
+The readiness audit corrected stale review evidence after rescans or workspace
+changes, content-verification failures in execution/recovery, disabled-cache
+analysis bypassing stale-file checks, media-date parsing, and remote transport
+and uncertain-command handling. Regression tests use disposable synthetic files.
+
+Current results belong to [PR #10](https://github.com/Yariminal/DoneDataHoarder/pull/10)
+and its checks for the latest commit. The checkpoint counts below describe
+earlier increments, not the latest suite. Package qualification builds a wheel
+and sdist, installs them outside the checkout, and exercises metadata processing,
+saved-session resume, pairing/revocation, and isolated uv tool lifecycle.
+
+Real Omarchy/Foot and Kitty image rendering, Windows-to-Omarchy discovery,
+workstation GPU processing, external-drive hotplug, and real photo libraries
+still require hardware checks. Remote access is folder-allowlisted; automatic
+external-SSD-only enforcement and EXIF merging are not implemented.
+
 ## Nearby workstation increment — 2026-09-29
 
 The same TUI now includes mDNS discovery, a Nearby workstations picker, managed

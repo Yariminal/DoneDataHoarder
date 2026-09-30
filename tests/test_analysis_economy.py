@@ -136,7 +136,8 @@ def test_pre_contract_cache_is_reanalyzed_then_current_cache_reused(tmp_path, mo
         assert db.get(File, third).analysis_prompt_version == PROMPT_VERSION
 
 
-def test_cache_rejects_same_size_timestamp_preserving_byte_edit(tmp_path, monkeypatch):
+@pytest.mark.parametrize("use_cache", [True, False])
+def test_analysis_rejects_same_size_timestamp_preserving_byte_edit(tmp_path, monkeypatch, use_cache):
     init_db(tmp_path / "index.db")
     root = tmp_path / "files"
     root.mkdir()
@@ -154,10 +155,69 @@ def test_cache_rejects_same_size_timestamp_preserving_byte_edit(tmp_path, monkey
     before = path.stat()
     path.write_bytes(b"fake content")  # same length, unlike indexed bytes
     os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
-    assert pipeline._process_one_file(second, get_engine(), [analyzer], StubClient(), set())[1] == "error"
+    assert pipeline._process_one_file(second, get_engine(), [analyzer], StubClient(), set(),
+                                      use_cache=use_cache)[1] == "error"
     with Session(get_engine()) as db:
         assert db.get(File, second).analysis_reason == "stale_enrichment"
     assert analyzer.calls == 1
+
+
+@pytest.mark.parametrize("use_cache", [True, False])
+def test_analysis_rechecks_edits_during_inference(tmp_path, monkeypatch, use_cache):
+    init_db(tmp_path / "index.db")
+    root = tmp_path / "files"
+    root.mkdir()
+    with Session(get_engine()) as db:
+        user = UserSession(root_path=str(root), name="edit-during-inference")
+        db.add(user)
+        db.commit()
+        sid = user.id
+    file_id = _add_file(root, sid, "one.png")
+    monkeypatch.setattr(pipeline, "build_context", lambda _row: "fixed context")
+
+    class EditingAnalyzer(StubAnalyzer):
+        def analyze(self, file_rec, context):
+            result = super().analyze(file_rec, context)
+            result.transcript = "now stale transcript"
+            result.detected_date = datetime(2020, 1, 1)
+            Path(file_rec.path).write_bytes(b"fake content")
+            return result
+
+    analyzer = EditingAnalyzer()
+    assert pipeline._process_one_file(file_id, get_engine(), [analyzer], StubClient(), set(),
+                                      use_cache=use_cache)[1] == "error"
+    with Session(get_engine()) as db:
+        row = db.get(File, file_id)
+        assert row.status == FileStatus.ERROR
+        assert row.analysis_reason == "stale_enrichment"
+        assert row.ai_description is None
+        assert row.ai_transcript is None
+        assert row.analysis_detected_date is None
+        assert row.date_best is None
+        assert db.query(AnalysisCache).count() == 0
+
+
+def test_no_cache_preserves_analysis_checks_without_cache_reads_or_writes(tmp_path, monkeypatch):
+    init_db(tmp_path / "index.db")
+    root = tmp_path / "files"
+    root.mkdir()
+    with Session(get_engine()) as db:
+        user = UserSession(root_path=str(root), name="no-cache")
+        db.add(user)
+        db.commit()
+        sid = user.id
+    analyzer = StubAnalyzer()
+    monkeypatch.setattr(pipeline, "build_context", lambda _row: "fixed context")
+    first = _add_file(root, sid, "one.png")
+    assert pipeline._process_one_file(first, get_engine(), [analyzer], StubClient(), set())[1] == "analyzed"
+    second = _add_file(root, sid, "two.png")
+    monkeypatch.setattr(pipeline, "restore", lambda *args, **kwargs: pytest.fail("no-cache restored a result"))
+    monkeypatch.setattr(pipeline, "remember", lambda *args, **kwargs: pytest.fail("no-cache stored a result"))
+    assert pipeline._process_one_file(second, get_engine(), [analyzer], StubClient(), set(),
+                                      use_cache=False)[1] == "analyzed"
+    assert analyzer.calls == 2
+    with Session(get_engine()) as db:
+        assert db.get(File, second).analysis_cache_hit is False
 
 
 def test_cache_does_not_cross_text_and_vision_model_tags(tmp_path, monkeypatch):

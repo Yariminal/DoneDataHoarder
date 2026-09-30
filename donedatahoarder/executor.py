@@ -477,7 +477,9 @@ def _delete_duplicate(
             return False, "Duplicate keeper changed since analysis"
         if evidence_type == DupeType.EXACT:
             from donedatahoarder.core.undo_log import _compute_sha256
-            if _compute_sha256(path) != _compute_sha256(keeper_path):
+            source_hash = _compute_sha256(path)
+            keeper_hash = _compute_sha256(keeper_path)
+            if not source_hash or not keeper_hash or source_hash != keeper_hash:
                 return False, "Exact duplicate no longer matches its keeper"
 
     # Use a root-level trash folder if we can determine the session root,
@@ -800,8 +802,9 @@ def plan_execution(
                         group = db_session.get(DuplicateGroup, prop.duplicate_group_id)
                         if group and group.dupe_type == DupeType.EXACT:
                             from donedatahoarder.core.undo_log import _compute_sha256
-                            if (_compute_sha256(Path(victim_file.path))
-                                    != _compute_sha256(Path(keeper_file.path))):
+                            source_hash = _compute_sha256(Path(victim_file.path))
+                            keeper_hash = _compute_sha256(Path(keeper_file.path))
+                            if not source_hash or not keeper_hash or source_hash != keeper_hash:
                                 error = "Exact duplicate no longer matches its keeper"
         steps.append(ExecutionStep(
             prop.id, kind, source, step_destination, error,

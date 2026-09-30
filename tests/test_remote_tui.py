@@ -1,6 +1,7 @@
 """The remote adapter changes execution ownership, not the terminal workflow."""
 import asyncio
 import copy
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -120,6 +121,96 @@ def test_remote_quit_leaves_active_worker_running():
             await pilot.press("q")
             assert exits == [True]
             assert service.calls == []
+    asyncio.run(scenario())
+
+
+def test_obsolete_snapshot_failure_does_not_disconnect_new_workspace():
+    async def scenario():
+        old = RemoteWorkspace()
+        replacement = RemoteWorkspace()
+        replacement.session_id = "replacement-session"
+        replacement.data["session"]["id"] = replacement.session_id
+        started, release = threading.Event(), threading.Event()
+        app = DDHApp(old, image_capability=ImageCapabilities("off", "Preview off"))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.2)
+
+            def stale_snapshot(**kwargs):
+                started.set()
+                if not release.wait(5):
+                    raise RuntimeError("Test snapshot was not released")
+                raise ValueError("Previous workstation disconnected")
+
+            old.snapshot = stale_snapshot
+            app.refresh_snapshot()
+            assert await asyncio.to_thread(started.wait, 2)
+            try:
+                app.open_session(replacement)
+            finally:
+                release.set()
+            await pilot.pause(0.2)
+            assert app._connection_failures == 0
+            assert app._connection_error == ""
+            assert app._next_refresh_at == 0
+            app.refresh_snapshot()
+            await pilot.pause(0.2)
+            assert app.snapshot["session"]["id"] == "replacement-session"
+            assert not app.query_one("#run", Button).disabled
+    asyncio.run(scenario())
+
+
+def test_new_workspace_starts_with_its_own_connection_retry_state():
+    async def scenario():
+        old = RemoteWorkspace()
+        replacement = RemoteWorkspace()
+        replacement.connection.name = "SECOND-PC"
+        app = DDHApp(old, image_capability=ImageCapabilities("off", "Preview off"))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.2)
+            old.fail = True
+            app.refresh_snapshot()
+            await pilot.pause(0.2)
+            assert app._connection_failures == 1
+            assert app._connection_error
+
+            replacement.fail = True
+            app.open_session(replacement)
+            await pilot.pause(0.2)
+            assert app._connection_failures == 1
+            assert "SECOND-PC" in str(app.query_one("#connection", Button).label)
+            assert app.snapshot == {}
+    asyncio.run(scenario())
+
+
+def test_failed_workspace_refresh_blocks_changes_even_when_transport_stays_connected():
+    async def scenario():
+        service = RemoteWorkspace()
+        app = DDHApp(service, image_capability=ImageCapabilities("off", "Preview off"))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.2)
+            previous = copy.deepcopy(app.snapshot)
+            original_snapshot = service.snapshot
+
+            def denied_snapshot(**kwargs):
+                raise ValueError("Session is no longer available")
+
+            service.snapshot = denied_snapshot
+            app.refresh_snapshot()
+            await pilot.pause(0.2)
+            assert service.connection.state == "connected"
+            assert app.snapshot == previous
+            assert app.query_one("#run", Button).disabled
+            assert "STALE" in str(app.query_one("#connection", Button).label)
+            await pilot.press("m", "space")
+            await pilot.pause()
+            assert service.calls == []
+
+            service.snapshot = original_snapshot
+            app._next_refresh_at = 0
+            app.refresh_snapshot()
+            await pilot.pause(0.2)
+            assert not app.query_one("#run", Button).disabled
+            assert "STALE" not in str(app.query_one("#connection", Button).label)
     asyncio.run(scenario())
 
 

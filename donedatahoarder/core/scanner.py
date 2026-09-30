@@ -18,11 +18,14 @@ from rich.progress import (
     BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
     TextColumn, TimeElapsedColumn,
 )
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from donedatahoarder.db.models import (
-    File, FileStatus, Proposal, ProposalStatus, ScanSession,
+    DuplicateGroup, DuplicateMember, File, FileStatus, Proposal,
+    ProposalStatus, ProposalType, ScanSession,
 )
+from donedatahoarder.core.media_dates import parse_media_date
 from donedatahoarder.db.session import get_engine
 from donedatahoarder.logging import get_logger
 from donedatahoarder.core.ignore import load_ddhignore
@@ -220,11 +223,9 @@ def _mutagen_date_created(path: Path) -> Optional[datetime]:
             val = f.get(key)
             if val:
                 raw = str(val[0]).strip()
-                for fmt in ("%Y-%m-%d", "%Y", "%Y-%m-%dT%H:%M:%S"):
-                    try:
-                        return datetime.strptime(raw[: len(fmt)], fmt)
-                    except ValueError:
-                        continue
+                date = parse_media_date(raw)
+                if date is not None:
+                    return date
     except Exception:
         pass
     return None
@@ -454,6 +455,30 @@ def _scan_unlocked(
                     session.add(File(**{k: v for k, v in record.items() if not k.startswith("_")}))
                     counts["new"] += 1
             if reset_ids:
+                # A review compares both files. Resetting a keeper or another
+                # group member invalidates decisions owned by untouched files
+                # too, including legacy proposals linked only by keeper path.
+                affected_groups = select(DuplicateGroup.id).where(
+                    DuplicateGroup.session_id == session_id,
+                    or_(DuplicateGroup.keep_file_id.in_(reset_ids),
+                        DuplicateGroup.id.in_(select(DuplicateMember.group_id).where(
+                            DuplicateMember.file_id.in_(reset_ids)))),
+                )
+                related_files = select(DuplicateMember.file_id).where(
+                    DuplicateMember.group_id.in_(affected_groups))
+                owned_files = select(File.id).where(File.session_id == session_id)
+                reset_paths = select(File.path).where(File.id.in_(reset_ids))
+                session.query(Proposal).filter(
+                    Proposal.file_id.in_(owned_files),
+                    Proposal.proposal_type == ProposalType.MARK_DUPLICATE,
+                    Proposal.status.in_((ProposalStatus.PENDING, ProposalStatus.APPROVED,
+                                         ProposalStatus.MODIFIED)),
+                    or_(Proposal.duplicate_group_id.in_(affected_groups),
+                        Proposal.file_id.in_(related_files),
+                        Proposal.proposed_value.in_(reset_paths)),
+                ).update({"status": ProposalStatus.PENDING, "review_kind": None,
+                          "user_notes": "Duplicate evidence reset by force rescan; review again"},
+                         synchronize_session=False)
                 session.query(Proposal).filter(
                     Proposal.file_id.in_(reset_ids),
                     Proposal.status.in_((ProposalStatus.PENDING, ProposalStatus.APPROVED,

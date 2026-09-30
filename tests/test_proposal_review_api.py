@@ -3,6 +3,7 @@
 from pathlib import Path
 from datetime import datetime
 import hashlib
+import io
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
@@ -60,6 +61,44 @@ def _proposal(sid: str, root: Path, name: str, status=ProposalStatus.PENDING,
 def _status(proposal_id: int) -> ProposalStatus:
     with Session(get_engine()) as db:
         return db.get(Proposal, proposal_id).status
+
+
+def test_photo_thumbnails_keep_orientation_alpha_and_current_pixels(review_db):
+    from PIL import Image
+
+    client, (one, _), (root, _) = review_db
+    oriented_path, alpha_path = root / "portrait.jpg", root / "transparent.png"
+    exif = Image.Exif()
+    exif[274] = 6
+    with Image.new("RGB", (120, 80), "red") as image:
+        image.save(oriented_path, exif=exif)
+    with Image.new("RGBA", (40, 20), (20, 30, 40, 64)) as image:
+        image.save(alpha_path)
+    with Session(get_engine()) as db:
+        files = [File(session_id=one, path=str(path), filename=path.name,
+                      mime_type="image/jpeg" if path == oriented_path else "image/png")
+                 for path in (oriented_path, alpha_path)]
+        db.add_all(files)
+        db.commit()
+        oriented_id, alpha_id = [file.id for file in files]
+
+    response = client.get(f"/api/files/{oriented_id}/thumbnail", params={"size": 60})
+    assert response.status_code == 200
+    with Image.open(io.BytesIO(response.content)) as image:
+        assert image.size == (40, 60)
+    response = client.get(f"/api/files/{alpha_id}/thumbnail")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.headers["cache-control"] == "no-store"
+    with Image.open(io.BytesIO(response.content)) as image:
+        assert image.getpixel((0, 0)) == (20, 30, 40, 64)
+    with Image.new("RGBA", (40, 20), (50, 60, 70, 192)) as image:
+        image.save(alpha_path)
+    response = client.get(f"/api/files/{alpha_id}/thumbnail")
+    with Image.open(io.BytesIO(response.content)) as image:
+        assert image.getpixel((0, 0)) == (50, 60, 70, 192)
+    for invalid_size in (0, -1, 2049):
+        assert client.get(f"/api/files/{alpha_id}/thumbnail", params={"size": invalid_size}).status_code == 422
 
 
 def test_dashboard_pending_review_counts_are_scoped_and_bounded(review_db):
@@ -660,6 +699,13 @@ def test_individual_review_is_session_bound_and_edit_cannot_escape_root(review_d
     response = client.post(f"/api/proposals/{rename}/edit", json={"session_id": one, "proposed_value": "safe.txt"})
     assert response.status_code == 200
     assert response.json()["proposed_value"] == str(root_one / "safe.txt")
+    token = response.json()["review_token"]
+    row = next(item for item in client.get("/api/proposals", params={"session_id": one, "status": "modified"}).json()["items"]
+               if item["id"] == rename)
+    assert token == row["review_token"]
+    assert client.post(f"/api/proposals/{rename}/approve", json={
+        "session_id": one, "expected_review_token": token,
+    }).status_code == 200
 
 
 def test_preview_matches_reviewed_selection_and_stale_token_blocks_commit(review_db):

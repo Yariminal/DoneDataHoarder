@@ -1,13 +1,14 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "donedatahoarder"
 version = "0.6.0"
-description = "AI-powered file organization for data hoarders — local LLM (Ollama) renames, dedupes and organizes years of files"
+description = "A local-first file and folder organizer with relationship inference, reviewed changes, and remote workstation sessions"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "DoneDataHoarder Contributors" },
 ]
@@ -15,7 +16,6 @@ requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",

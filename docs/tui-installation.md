@@ -1,5 +1,9 @@
 # Installing the terminal candidate
 
+For a source installation of the current preview branch, start with the
+[installation guide](../INSTALL.md). The procedure below is for testing built
+wheel and source artifacts before distributing a candidate.
+
 This is the installation path for a locally built, unpublished candidate. Use
 Python 3.12 or newer for the TUI; the existing CLI still supports Python 3.10+.
 Installation is isolated from Arch's system Python and does not change terminal,
@@ -70,18 +74,20 @@ The checker creates temporary environments outside the repository and:
 
 - Verifies TUI modules, application assets, and Python version markers, including
   rejecting deleted modules retained by an old build directory.
-- Installs the wheel with `tui,docs`, checks dependencies, and calls the installed
+- Installs the wheel with `tui,docs,remote,nearby`, checks dependencies, and calls the installed
   main, TUI, fixture, and diagnostics help commands.
 - Generates a disposable qualification fixture through the installed CLI and
   writes an images-off diagnostics report that retains `qualification: not_run`.
 - Runs the actual metadata-only pipeline on two disposable PNG copies, confirms
-  the duplicate proposal and unchanged source bytes, opens the headless Textual
+  the duplicate proposal, photo dimensions and unchanged source bytes, opens the headless Textual
   workspace, and resumes the persisted session in a new process.
 - Rebuilds a wheel from the sdist, compares all application payload hashes and
   version/dependency/entrypoint metadata,
   reinstalls it, and repeats the checks outside the source checkout.
 - Exercises the documented uv wheel/extras installation, forced reinstall,
   saved-session relaunch, and uninstall using temporary tool/cache directories.
+- Exercises disposable workstation pairing and device revocation with the
+  installed package. This does not qualify physical LAN discovery or a GPU.
 - Writes artifact hashes, runtime and dependency versions, smoke results, and
   matching `.constraints.txt` into the chosen report directory.
 

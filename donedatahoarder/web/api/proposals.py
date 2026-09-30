@@ -286,7 +286,9 @@ def edit_proposal(proposal_id: int, body: EditProposalRequest):
             p.review_kind = "individual"
             proposed_value = p.proposed_value
             session.commit()
-    return {"status": "modified", "id": proposal_id, "proposed_value": proposed_value}
+            review_token = proposal_review_token(session, p, file)
+    return {"status": "modified", "id": proposal_id, "proposed_value": proposed_value,
+            "review_token": review_token}
 
 
 @router.post("/proposals/bulk-approve")

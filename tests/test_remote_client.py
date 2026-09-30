@@ -35,6 +35,8 @@ def connection(handler=None, **kwargs):
     "https://user:password@host", "https://host/path", "https://host/?secret=x", "https://host/#secret",
     "https://host?", "https://host#", "https://host\\evil", "https://host:0", "https://host:99999",
     " https://host", "https://host\n", "file:///tmp/test", "https://", "http://[not-an-address]",
+    "https://[fe80::1%7]", "https://[fe80::1%25%257]", "https://[fd01::8%257]",
+    "http://[fe80::1%257]",
 ])
 def test_reject_unsafe_endpoint_without_revealing_url(url):
     with pytest.raises(RemoteError) as caught:
@@ -52,6 +54,50 @@ def test_accept_https_or_literal_loopback(url):
         assert client.latency_ms is not None
         assert client.generation == 1
         assert client.url == url.rstrip("/")
+    finally:
+        client.close()
+
+
+def test_discovered_scoped_ipv6_endpoint_uses_socket_interface_scope():
+    from donedatahoarder.remote.discovery import Candidate
+    from uuid import uuid4
+    candidate = Candidate(str(uuid4()), "Workstation", "workstation.local", 8765,
+                          ("fe80::1%7",))
+    requests = []
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json=HELLO)
+    client = RemoteConnection(candidate.endpoint, "private-token",
+                              transport=httpx.MockTransport(handler))
+    try:
+        client.connect()
+        # HTTPX passes the host directly to socket.create_connection; %257
+        # would address interface 257 instead of the advertised interface 7.
+        assert requests[0].url.host == "fe80::1%7"
+    finally:
+        client.close()
+
+
+def test_malformed_rejection_preserves_pending_command_guard(tmp_path):
+    guard = tmp_path / "pending.json"
+    posts = []
+    def handler(request):
+        if request.method == "POST":
+            posts.append(json.loads(request.content))
+            return httpx.Response(409, content=b"invalid JSON")
+        if "/commands/" in request.url.path:
+            return httpx.Response(200, json={"request_id": posts[0]["request_id"],
+                                            "state": "uncertain"})
+        return httpx.Response(200, json={})
+    client = connection(handler, pending_file=guard)
+    try:
+        with pytest.raises(RemoteError, match="invalid JSON"):
+            RemoteWorkspaceService(client, "session").apply("preview", confirmed=True)
+        assert client.pending_request_id == posts[0]["request_id"]
+        assert json.loads(guard.read_text())["request_id"] == client.pending_request_id
+        client.connect()
+        assert not client.can_mutate
+        assert len(posts) == 1
     finally:
         client.close()
 

@@ -187,6 +187,36 @@ def test_pairing_endpoint_selection_sends_no_secret_across_multiple_adapters(cer
     assert len(requests) == 2
 
 
+def test_scoped_ipv6_pairing_uses_socket_scope_and_saves_escaped_endpoint(tmp_path, certificate):
+    from donedatahoarder.remote.profiles import select_pairing_endpoint
+
+    pem, _, _ = certificate()
+    invite = invitation(pem)
+    endpoint = "https://[fe80::1%257]:8765"
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        assert request.url.host == "fe80::1%7"
+        assert request.extensions["sni_hostname"] == HOSTNAME
+        if request.method == "POST":
+            assert "authorization" not in request.headers
+            assert json.loads(request.content)["secret"] == SECRET
+            return httpx.Response(200, json={"token": TOKEN, "device_id": str(uuid4()), "server_id": SERVER_ID})
+        if "authorization" in request.headers:
+            assert request.headers["authorization"] == "Bearer " + TOKEN
+            return httpx.Response(200, json=HELLO)
+        return httpx.Response(401, json={"detail": "Unauthorized"})
+
+    transport = httpx.MockTransport(handler)
+    assert select_pairing_endpoint([endpoint], invite, transport=transport) == endpoint
+    store = ProfileStore(tmp_path / "laptop")
+    saved = pair_device(endpoint, invite, "Omarchy", store=store, transport=transport)
+    assert saved.last_url == endpoint
+    assert store.load(SERVER_ID).last_url == endpoint
+    assert [request.method for request in requests] == ["GET", "POST", "GET"]
+
+
 def test_real_daemon_https_pairing_session_and_revocation(tmp_path, monkeypatch):
     """Exercise actual TLS, ASGI auth middleware, pairing persistence and client."""
     pytest.importorskip("uvicorn")

@@ -1,10 +1,14 @@
 # Python + Textual delivery plan
 
 Date: 2026-09-29. Decision: retain the Python engine and ship the Omarchy terminal
-experience with Textual. This is the plan for the next implementation cycle.
-Milestones below are pending unless explicitly described as existing work.
+experience with Textual. This document preserves the original delivery plan.
+The terminal workspace, shared review service, native-image integration,
+nearby remote sessions, and photo keeper evidence are implemented on the preview
+branch. See [implementation status](TUI_IMPLEMENTATION_STATUS.md) for subsequent
+checkpoints; the older baseline counts below are historical. Native terminal
+and two-machine hardware qualification remain release gates.
 
-The next feature priority is remote sessions: an Omarchy laptop controls the
+Remote sessions implement the next feature priority: an Omarchy laptop controls the
 Windows workstation that owns processing and an attached external SSD. The
 [remote session candidate](remote-sessions.md) implements the transport and
 existing workspace integration. The [external storage policy](REMOTE_STORAGE_POLICY.md)

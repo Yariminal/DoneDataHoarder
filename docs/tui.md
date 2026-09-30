@@ -1,6 +1,8 @@
 # Terminal workspace for Omarchy
 
-`ddh tui` opens the file pipeline and review interface in a terminal. It uses the
+`ddh tui` opens the file and folder organization pipeline in a terminal, including
+relationship collections, naming and move proposals, and duplicate review. See
+[how organization works](organization.md) for its evidence and stage boundaries. It uses the
 same SQLite sessions, durable jobs, proposal engine, and execution journal as the
 CLI and web interface. Opening a folder does not start processing or move files.
 
@@ -66,9 +68,30 @@ fresh preview of the approved actions and a separate confirmation. Changing a
 review decision or destination invalidates an earlier preview.
 
 The History workspace exposes journaled operations and a recovery preview.
-Recovery is scoped to the session and checks for conflicts; it is not a global
-filesystem rollback. Keep the workspace open while a commit or recovery is
-running. Interrupted processing resumes only through an explicit user action.
+Recovery is scoped to the session. Confirming recovery rechecks recorded file
+content, review state, and destination conflicts; failed entries remain available
+for another attempt. Older journal entries without a recorded file hash or
+directory identity require manual recovery. The CLI's `--force` skips confirmation
+only. It is not a global filesystem rollback. Keep the workspace
+open while a commit or recovery is running. Interrupted processing resumes only
+through an explicit user action.
+
+## Workstation connections and settings
+
+`F2` or the header's connection button opens connection details and the session's
+Ollama model and worker settings. Changes apply to the next new run; an unfinished
+run plan keeps its saved settings. The same workspace can connect to a separate
+Windows workstation with `ddh tui --discover`, or the manual `--connect` options.
+See [remote terminal sessions](remote-sessions.md) for installation, pairing, and
+the authorized-folder boundary.
+
+Remote processing, files, and the database stay on the workstation. Quitting the
+laptop TUI disconnects while its pipeline continues. A lost connection preserves
+the last received workspace and blocks changes until it reconnects and any
+pending command outcome is known; `F2` offers Reconnect. Image comparison uses
+bounded workstation previews, and Open original is unavailable for remote files.
+Local sessions stop their workers
+safely before quitting or changing collections.
 
 ## Keyboard navigation
 
@@ -86,8 +109,9 @@ Keyboard shortcuts:
 | `+` / `-` / `0` | Zoom in / zoom out / fit in the image view |
 | `Esc` | Close a dialog |
 | `o` | Choose a folder or recent session while idle |
+| `F2` | Connection details, reconnect, model and worker settings |
 | `?` / `F1` | Open the keyboard reference |
-| `q`, `Ctrl+C`, `Ctrl+Q` | Quit; active work must stop safely first |
+| `q`, `Ctrl+C`, `Ctrl+Q` | Quit; local work stops safely, remote work continues |
 
 ## Photos in the terminal
 
