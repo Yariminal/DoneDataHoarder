@@ -778,7 +778,7 @@ def test_hashless_recovery_leaves_replacement_and_index_untouched(workspace, ope
     result = undo_operations(session_id=sid, force=True, console=Console(file=output))
 
     assert result["failed"] == 1 and result["undone"] == 0
-    assert "manual recovery is required" in output.getvalue()
+    assert "manual recovery is required" in " ".join(output.getvalue().split())
     assert not original.exists()
     assert destination.read_bytes() == b"unrelated replacement"
     assert len(get_last_session_entries(sid)) == 1
@@ -826,7 +826,7 @@ def test_legacy_folder_recovery_requires_identity(workspace):
     result = undo_operations(session_id=sid, force=True, console=Console(file=output))
 
     assert result["failed"] == 1 and result["undone"] == 0
-    assert "manual recovery is required" in output.getvalue()
+    assert "manual recovery is required" in " ".join(output.getvalue().split())
     assert (destination / "content.txt").read_bytes() == b"unverified content"
     assert not original.exists()
     assert len(get_last_session_entries(sid)) == 1
