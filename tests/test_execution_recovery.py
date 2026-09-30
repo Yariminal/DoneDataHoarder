@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import hashlib
+import io
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
@@ -99,6 +101,41 @@ def test_rename_move_undo_and_redo(workspace):
     assert execute(dry_run=False, session_id=sid)["applied"] == 2
 
 
+def test_commit_rejects_unreadable_journal_source(workspace, monkeypatch):
+    root, sid = workspace
+    source, file_id, ids = _file_and_proposals(root, sid)
+    monkeypatch.setattr("donedatahoarder.core.undo_log._compute_sha256", lambda path: "")
+
+    result = execute(dry_run=False, session_id=sid)
+
+    assert result == {"applied": 0, "failed": 1, "skipped": 0}
+    assert source.read_bytes() == b"original content"
+    assert not (root / "renamed.txt").exists()
+    assert get_last_session_entries(sid) == []
+    with Session(get_engine()) as db:
+        assert db.get(File, file_id).path == str(source)
+        assert db.get(Proposal, ids[0]).status == ProposalStatus.APPROVED
+
+
+@pytest.mark.parametrize("with_move", [False, True])
+def test_undo_rejects_unreadable_journal_destination(workspace, monkeypatch, with_move):
+    root, sid = workspace
+    source, file_id, ids = _file_and_proposals(root, sid, with_move=with_move)
+    assert execute(dry_run=False, session_id=sid)["applied"] == len(ids)
+    destination = root / "sorted" / "renamed.txt" if with_move else root / "renamed.txt"
+    monkeypatch.setattr("donedatahoarder.core.undo_log._compute_sha256", lambda path: "")
+
+    result = undo_operations(session_id=sid, force=True)
+
+    assert result["undone"] == 0 and result["failed"] == len(ids)
+    assert destination.read_bytes() == b"original content"
+    assert not source.exists()
+    assert len(get_last_session_entries(sid)) == len(ids)
+    with Session(get_engine()) as db:
+        assert db.get(File, file_id).path == str(destination)
+        assert all(db.get(Proposal, id).status == ProposalStatus.APPLIED for id in ids)
+
+
 @pytest.mark.parametrize("rename_status", [
     ProposalStatus.PENDING, ProposalStatus.REJECTED, ProposalStatus.APPROVED,
 ])
@@ -138,6 +175,72 @@ def test_selected_move_cannot_apply_unselected_rename(workspace, rename_status):
     with Session(get_engine()) as db:
         assert db.get(File, file_id).path == str(source)
         assert db.get(Proposal, move_id).status == ProposalStatus.APPROVED
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("review_status", [ProposalStatus.APPROVED, ProposalStatus.MODIFIED])
+def test_rescanning_keeper_invalidates_prior_duplicate_review(workspace, grouped, review_status):
+    from donedatahoarder.core.enricher import enrich
+    from donedatahoarder.core.scanner import scan
+
+    root, sid = workspace
+    keeper_dir = root / "keeper"
+    keeper_dir.mkdir()
+    keeper_path = keeper_dir / "keeper.txt"
+    keeper_path.write_bytes(b"old keeper")
+    victim_path = root / "victim.txt"
+    victim_path.write_bytes(b"victim")
+    with Session(get_engine()) as db:
+        victim, keeper = [File(
+            session_id=sid, path=str(path), filename=path.name,
+            hash_md5=hashlib.md5(path.read_bytes()).hexdigest(),
+            hash_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            status=FileStatus.PROPOSED,
+        ) for path in (victim_path, keeper_path)]
+        db.add_all([victim, keeper])
+        db.flush()
+        group_id = None
+        if grouped:
+            group = DuplicateGroup(session_id=sid, dupe_type=DupeType.CONTENT,
+                                   group_hash="old-evidence", keep_file_id=keeper.id)
+            db.add(group)
+            db.flush()
+            group_id = group.id
+            db.add_all([DuplicateMember(group_id=group.id, file_id=file.id)
+                        for file in (victim, keeper)])
+        proposal = Proposal(file_id=victim.id, proposal_type=ProposalType.MARK_DUPLICATE,
+                            current_value=str(victim_path), proposed_value=str(keeper_path),
+                            duplicate_group_id=group_id, status=review_status,
+                            review_kind="individual")
+        db.add(proposal)
+        other_owner = UserSession(root_path=str(root), name="other")
+        db.add(other_owner)
+        db.flush()
+        other_victim = File(session_id=other_owner.id, path=str(victim_path),
+                            filename=victim_path.name, status=FileStatus.PROPOSED)
+        db.add(other_victim)
+        db.flush()
+        other_proposal = Proposal(
+            file_id=other_victim.id, proposal_type=ProposalType.MARK_DUPLICATE,
+            current_value=str(victim_path), proposed_value=str(keeper_path),
+            status=review_status, review_kind="individual",
+        )
+        db.add(other_proposal)
+        db.commit()
+        proposal_id = proposal.id
+        other_proposal_id = other_proposal.id
+
+    keeper_path.write_bytes(b"unrelated replacement")
+    assert scan(keeper_dir, force_rescan=True, session_id=sid, show_progress=False)["new"] == 1
+    assert enrich(session_id=sid)["enriched"] == 1
+    assert execute(dry_run=False, session_id=sid)["applied"] == 0
+    assert victim_path.read_bytes() == b"victim"
+    with Session(get_engine()) as db:
+        proposal = db.get(Proposal, proposal_id)
+        assert proposal.status == ProposalStatus.PENDING
+        assert proposal.review_kind is None
+        assert db.get(Proposal, other_proposal_id).status == review_status
+        assert db.get(Proposal, other_proposal_id).review_kind == "individual"
 
 
 def test_selective_move_cascades_pending_rename_and_keeper_then_undo(workspace):
@@ -489,6 +592,43 @@ def test_reviewed_near_match_without_group_can_be_trashed(workspace):
     assert (root / ".ddh_trash" / victim_path.name).read_bytes() == b"draft"
 
 
+@pytest.mark.parametrize("direct", [False, True])
+def test_exact_disposal_rejects_failed_sha256_reads(workspace, monkeypatch, direct):
+    """Two unreadable hash results cannot establish equal source bytes."""
+    from donedatahoarder.executor import _delete_duplicate
+
+    root, sid = workspace
+    paths = [root / name for name in ("victim.txt", "keeper.txt")]
+    for path in paths:
+        path.write_bytes(b"same")
+    md5 = hashlib.md5(b"same").hexdigest()
+    with Session(get_engine()) as db:
+        victim, keeper = [File(session_id=sid, path=str(path), filename=path.name,
+                               hash_md5=md5, status=FileStatus.PROPOSED) for path in paths]
+        db.add_all([victim, keeper])
+        db.flush()
+        group = DuplicateGroup(session_id=sid, dupe_type=DupeType.EXACT,
+                               group_hash=md5, keep_file_id=keeper.id)
+        db.add(group)
+        db.flush()
+        db.add_all([DuplicateMember(group_id=group.id, file_id=file.id)
+                    for file in (victim, keeper)])
+        proposal = Proposal(file_id=victim.id, proposal_type=ProposalType.MARK_DUPLICATE,
+                            current_value=str(paths[0]), proposed_value=str(paths[1]),
+                            status=ProposalStatus.APPROVED, duplicate_group_id=group.id)
+        db.add(proposal)
+        db.commit()
+        monkeypatch.setattr("donedatahoarder.core.undo_log._compute_sha256", lambda path: "")
+        if direct:
+            ok, reason = _delete_duplicate(victim.id, False, db, sid, proposal)
+            assert not ok and "no longer matches" in reason
+        else:
+            result = execute(dry_run=False, session_id=sid)
+            assert result["failed"] == 1 and result["applied"] == 0
+    assert all(path.read_bytes() == b"same" for path in paths)
+    assert not (root / ".ddh_trash").exists()
+
+
 def test_unrelated_second_group_does_not_override_selected_pair(workspace):
     root, sid = workspace
     paths = [root / name for name in ("victim.txt", "keeper.txt", "other.txt")]
@@ -611,3 +751,101 @@ def test_legacy_marker_does_not_hide_later_operation(workspace):
     ]
     log.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
     assert [e["original_path"] for e in get_last_session_entries(sid)] == [str(root / "c")]
+
+
+@pytest.mark.parametrize("operation", ["MOVE", "RENAME", "TRASH", "DELETE", "JUNK_TRASH"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_hashless_recovery_leaves_replacement_and_index_untouched(workspace, operation, legacy):
+    root, sid = workspace
+    original, destination = root / "original.txt", root / "destination.txt"
+    destination.write_bytes(b"unrelated replacement")
+    with Session(get_engine()) as db:
+        file = File(session_id=sid, path=str(destination), filename=destination.name,
+                    status=FileStatus.APPLIED)
+        db.add(file)
+        db.commit()
+        file_id = file.id
+    entry = {
+        "operation": operation, "original_path": str(original),
+        "new_path": str(destination), "timestamp": "2026-01-01T00:00:00+00:00",
+        "sha256": "", "session_id": sid, "extra": {"file_id": file_id},
+    }
+    if not legacy:
+        entry.update(operation_id="missing-file-evidence", phase="complete", source_type="file")
+    get_undo_log_path(sid).write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    output = io.StringIO()
+
+    result = undo_operations(session_id=sid, force=True, console=Console(file=output))
+
+    assert result["failed"] == 1 and result["undone"] == 0
+    assert "manual recovery is required" in " ".join(output.getvalue().split())
+    assert not original.exists()
+    assert destination.read_bytes() == b"unrelated replacement"
+    assert len(get_last_session_entries(sid)) == 1
+    with Session(get_engine()) as db:
+        assert db.get(File, file_id).path == str(destination)
+
+
+@pytest.mark.parametrize("operation", ["MOVE", "RENAME", "RENAME_FOLDER"])
+def test_directory_recovery_rejects_replacement_identity(workspace, operation):
+    from donedatahoarder.core.undo_log import log_operation, complete_operation
+
+    root, sid = workspace
+    original, destination, preserved = (root / name for name in ("original", "destination", "preserved"))
+    original.mkdir()
+    (original / "content.txt").write_bytes(b"journaled original")
+    entry = log_operation(operation, str(original), str(destination), sid)
+    original.rename(destination)
+    complete_operation(entry)
+    destination.rename(preserved)
+    destination.mkdir()
+    (destination / "content.txt").write_bytes(b"unrelated replacement")
+
+    result = undo_operations(session_id=sid, force=True)
+
+    assert result["failed"] == 1 and result["undone"] == 0
+    assert not original.exists()
+    assert (destination / "content.txt").read_bytes() == b"unrelated replacement"
+    assert (preserved / "content.txt").read_bytes() == b"journaled original"
+    assert len(get_last_session_entries(sid)) == 1
+
+
+def test_legacy_folder_recovery_requires_identity(workspace):
+    root, sid = workspace
+    original, destination = root / "original", root / "destination"
+    destination.mkdir()
+    (destination / "content.txt").write_bytes(b"unverified content")
+    entry = {
+        "operation": "RENAME_FOLDER", "original_path": str(original),
+        "new_path": str(destination), "timestamp": "2026-01-01T00:00:00+00:00",
+        "session_id": sid,
+    }
+    get_undo_log_path(sid).write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    output = io.StringIO()
+
+    result = undo_operations(session_id=sid, force=True, console=Console(file=output))
+
+    assert result["failed"] == 1 and result["undone"] == 0
+    assert "manual recovery is required" in " ".join(output.getvalue().split())
+    assert (destination / "content.txt").read_bytes() == b"unverified content"
+    assert not original.exists()
+    assert len(get_last_session_entries(sid)) == 1
+
+
+def test_legacy_recovery_with_matching_hash_remains_supported(workspace):
+    root, sid = workspace
+    original, destination = root / "original.txt", root / "destination.txt"
+    destination.write_bytes(b"journaled original")
+    entry = {
+        "operation": "RENAME", "original_path": str(original),
+        "new_path": str(destination), "timestamp": "2026-01-01T00:00:00+00:00",
+        "sha256": hashlib.sha256(b"journaled original").hexdigest(), "session_id": sid,
+    }
+    get_undo_log_path(sid).write_text(json.dumps(entry) + "\n", encoding="utf-8")
+
+    result = undo_operations(session_id=sid, force=True)
+
+    assert result["failed"] == 0 and result["undone"] == 1
+    assert original.read_bytes() == b"journaled original"
+    assert not destination.exists()
+    assert get_last_session_entries(sid) == []

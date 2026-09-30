@@ -3,7 +3,7 @@ Proposal review endpoints (list / approve / reject / edit / bulk ops).
 """
 from __future__ import annotations
 
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 
 from donedatahoarder.core.dependency_protection import ProtectionIndex, cached_protection_index
 from donedatahoarder.core.dedup import sequence_comparison_metadata
+from donedatahoarder.core.photo_quality import compare_photos, photo_evidence
+from donedatahoarder.core.review import proposal_review_token
 from donedatahoarder.db.models import (
     DupeType, DuplicateGroup, File, Proposal, ProposalStatus, ProposalType, UserSession,
 )
@@ -41,28 +43,12 @@ def _within_root(path: Path, root: Path) -> bool:
 
 
 def _validated_edit(proposal: Proposal, file: File, root: Path, value: str) -> str:
-    if proposal.proposal_type == ProposalType.MARK_DUPLICATE:
-        raise HTTPException(400, "Choose a duplicate keeper in the duplicate review instead")
-    value = value.strip()
-    if not value or "\x00" in value:
-        raise HTTPException(400, "A non-empty destination is required")
-    if proposal.proposal_type == ProposalType.RENAME:
-        # A rename changes only the leaf name, never the parent directory.
-        if value in (".", "..") or Path(value).name != value or PureWindowsPath(value).name != value or ":" in value:
-            raise HTTPException(400, "Enter a filename without directories or drive letters")
-        source = Path(proposal.current_value or file.path)
-        if not _within_root(source, root):
-            raise HTTPException(400, "Source is outside the session folder")
-        return str(source.parent / value)
-    if proposal.proposal_type in (ProposalType.MOVE, ProposalType.RENAME_FOLDER):
-        destination = Path(value)
-        source = Path(proposal.current_value or file.path)
-        if not destination.is_absolute() or not _within_root(destination, root):
-            raise HTTPException(400, "Destination must be inside the session folder")
-        if not _within_root(source, root):
-            raise HTTPException(400, "Source is outside the session folder")
-        return str(destination.resolve(strict=False))
-    return value
+    from donedatahoarder.core.review import ReviewError, validated_edit
+
+    try:
+        return validated_edit(proposal, file, root, value)
+    except ReviewError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
 
 
 def _owned_proposal(session: Session, proposal_id: int, session_id: str) -> tuple[Proposal, File, UserSession]:
@@ -180,6 +166,8 @@ def list_proposals(
                 group = session.get(DuplicateGroup, group_id)
                 if group and group.session_id == f.session_id:
                     keeper = session.get(File, group.keep_file_id) if group.keep_file_id else None
+                    if keeper and keeper.session_id != f.session_id:
+                        keeper = None
                     membership = next((member for member in group.members if member.file_id == f.id), None)
                     duplicate_evidence = {
                         "group_id": group.id,
@@ -196,6 +184,7 @@ def list_proposals(
                         "distance_to_keeper": getattr(membership, "distance_to_keeper", None) if membership else None,
                         "perceptual_bits": len(f.hash_perceptual) * 4 if f.hash_perceptual else None,
                         "sequence_comparison": sequence_comparison_metadata(f, keeper),
+                        "photo_quality": compare_photos(f, keeper) if keeper else None,
                     }
             items.append({
                 "id": p.id,
@@ -218,6 +207,8 @@ def list_proposals(
                 "analysis_model_tag": getattr(f, "analysis_model_tag", None) if f else None,
                 "name_date_source": name_date_source,
                 "duplicate_evidence": duplicate_evidence,
+                "photo_metadata": photo_evidence(f) if f else None,
+                "review_token": proposal_review_token(session, p, f) if f else None,
                 "review_kind": getattr(p, "review_kind", None),
                 "protected": bool(decision and decision.protected),
                 "protection_reason": decision.reason if decision else None,
@@ -232,6 +223,9 @@ def approve_proposal(proposal_id: int, body: ReviewProposalRequest):
         engine = get_engine()
         with Session(engine) as session:
             p, file, user_session = _owned_proposal(session, proposal_id, body.session_id)
+            if (body.expected_review_token is not None
+                    and body.expected_review_token != proposal_review_token(session, p, file)):
+                raise HTTPException(409, "Proposal or photo evidence changed; review this pair again")
             if p.status == ProposalStatus.APPLIED:
                 raise HTTPException(409, "Applied proposals cannot be reviewed again")
             protected = _protected_reason(p, file, _protection_index(user_session))
@@ -243,6 +237,9 @@ def approve_proposal(proposal_id: int, body: ReviewProposalRequest):
                     raise HTTPException(409, "Duplicate evidence group changed")
                 if group.dupe_type != DupeType.EXACT:
                     keeper = session.get(File, group.keep_file_id) if group.keep_file_id else None
+                    if (compare_photos(file, keeper) is not None
+                            and not body.expected_review_token):
+                        raise HTTPException(409, "Inspect current photo evidence before approving this pair")
                     if (keeper is None or keeper.session_id != file.session_id
                             or body.expected_duplicate_group_id != group.id
                             or body.expected_duplicate_type != group.dupe_type.value
@@ -289,7 +286,9 @@ def edit_proposal(proposal_id: int, body: EditProposalRequest):
             p.review_kind = "individual"
             proposed_value = p.proposed_value
             session.commit()
-    return {"status": "modified", "id": proposal_id, "proposed_value": proposed_value}
+            review_token = proposal_review_token(session, p, file)
+    return {"status": "modified", "id": proposal_id, "proposed_value": proposed_value,
+            "review_token": review_token}
 
 
 @router.post("/proposals/bulk-approve")

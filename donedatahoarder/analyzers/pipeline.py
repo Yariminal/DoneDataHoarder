@@ -291,8 +291,9 @@ def _process_one_file(
         )
         ctx = build_context(file_rec)
         ctx_digest = context_hash(ctx)
-        content_digest = eligible_hash(file_rec) if use_cache else None
-        if use_cache and file_rec.hash_sha256 and content_digest is None:
+        # Cache policy must not disable the indexed-byte staleness gate.
+        content_digest = eligible_hash(file_rec)
+        if file_rec.hash_sha256 and content_digest is None:
             file_rec.status = FileStatus.ERROR
             file_rec.analysis_outcome = "failed"
             file_rec.analysis_reason = "stale_enrichment"
@@ -300,7 +301,7 @@ def _process_one_file(
             session.commit()
             return file_id, "error", file_rec.error_message
         try:
-            if cache_route_stable and content_digest and hasattr(client, "model_digest"):
+            if use_cache and cache_route_stable and content_digest and hasattr(client, "model_digest"):
                 if isinstance(analyzer, ImageAnalyzer):
                     source, tag = "vision", getattr(client, "vision_model", None)
                 elif isinstance(analyzer, (ArchiveAnalyzer, ThreeDModelAnalyzer)):
@@ -325,6 +326,7 @@ def _process_one_file(
             model_digest = None
             if result.model_called and result.outcome != "skipped" and hasattr(client, "model_digest"):
                 model_digest = client.model_digest(model_name)
+            previous_date_best = file_rec.date_best
             analyzer.save_result(file_rec, result, model_name, model_digest)
             if content_digest:
                 saved = session.get(File, file_id)
@@ -337,14 +339,22 @@ def _process_one_file(
                     saved.ai_description = None
                     saved.ai_suggested_name = None
                     saved.ai_tags = None
+                    saved.ai_transcript = None
                     saved.ai_confidence = None
                     saved.ai_model = None
                     saved.analysis_model_tag = None
                     saved.analysis_model_digest = None
+                    saved.analysis_prompt_version = None
+                    saved.analysis_extractor_version = None
+                    saved.analysis_content_chars = None
+                    saved.analysis_context_hash = None
+                    saved.analysis_detected_date = None
+                    saved.analysis_cache_hit = False
+                    saved.date_best = previous_date_best
                     session.commit()
                     return file_id, "error", saved.error_message
                 saved.analysis_context_hash = ctx_digest
-                if cache_route_stable:
+                if use_cache and cache_route_stable:
                     remember(session, saved, content_hash=content_digest,
                              context_digest=ctx_digest, analyzer=analyzer)
             logger.info(

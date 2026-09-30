@@ -3,6 +3,7 @@
 from pathlib import Path
 from datetime import datetime
 import hashlib
+import io
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
@@ -60,6 +61,44 @@ def _proposal(sid: str, root: Path, name: str, status=ProposalStatus.PENDING,
 def _status(proposal_id: int) -> ProposalStatus:
     with Session(get_engine()) as db:
         return db.get(Proposal, proposal_id).status
+
+
+def test_photo_thumbnails_keep_orientation_alpha_and_current_pixels(review_db):
+    from PIL import Image
+
+    client, (one, _), (root, _) = review_db
+    oriented_path, alpha_path = root / "portrait.jpg", root / "transparent.png"
+    exif = Image.Exif()
+    exif[274] = 6
+    with Image.new("RGB", (120, 80), "red") as image:
+        image.save(oriented_path, exif=exif)
+    with Image.new("RGBA", (40, 20), (20, 30, 40, 64)) as image:
+        image.save(alpha_path)
+    with Session(get_engine()) as db:
+        files = [File(session_id=one, path=str(path), filename=path.name,
+                      mime_type="image/jpeg" if path == oriented_path else "image/png")
+                 for path in (oriented_path, alpha_path)]
+        db.add_all(files)
+        db.commit()
+        oriented_id, alpha_id = [file.id for file in files]
+
+    response = client.get(f"/api/files/{oriented_id}/thumbnail", params={"size": 60})
+    assert response.status_code == 200
+    with Image.open(io.BytesIO(response.content)) as image:
+        assert image.size == (40, 60)
+    response = client.get(f"/api/files/{alpha_id}/thumbnail")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.headers["cache-control"] == "no-store"
+    with Image.open(io.BytesIO(response.content)) as image:
+        assert image.getpixel((0, 0)) == (20, 30, 40, 64)
+    with Image.new("RGBA", (40, 20), (50, 60, 70, 192)) as image:
+        image.save(alpha_path)
+    response = client.get(f"/api/files/{alpha_id}/thumbnail")
+    with Image.open(io.BytesIO(response.content)) as image:
+        assert image.getpixel((0, 0)) == (50, 60, 70, 192)
+    for invalid_size in (0, -1, 2049):
+        assert client.get(f"/api/files/{alpha_id}/thumbnail", params={"size": invalid_size}).status_code == 422
 
 
 def test_dashboard_pending_review_counts_are_scoped_and_bounded(review_db):
@@ -500,6 +539,7 @@ def test_near_duplicate_requires_individual_review_not_bulk(review_db):
     evidence = review["duplicate_evidence"]
     comparison = {
         "session_id": sid,
+        "expected_review_token": review["review_token"],
         "expected_duplicate_group_id": evidence["group_id"],
         "expected_duplicate_type": evidence["type"],
         "expected_keeper_id": evidence["keeper_id"],
@@ -583,6 +623,61 @@ def test_exact_md5_group_reports_unknown_stored_sha_until_available(review_db):
     assert client.get(f"/api/proposals?session_id={sid}").json()["items"][0]["duplicate_evidence"]["exact_bytes"] is False
 
 
+def test_photo_review_api_exposes_preservation_and_binds_changed_evidence(review_db):
+    client, (sid, _), (root, _) = review_db
+    proposal_id = _proposal(sid, root, "resized.jpg", proposal_type=ProposalType.MARK_DUPLICATE,
+                            destination=str(root / "original.jpg"))
+    with Session(get_engine()) as db:
+        proposal = db.get(Proposal, proposal_id)
+        candidate = db.get(File, proposal.file_id)
+        keeper = File(session_id=sid, path=str(root / "original.jpg"), filename="original.jpg")
+        db.add(keeper)
+        db.flush()
+        for index, file in enumerate((candidate, keeper), 1):
+            file.hash_sha256 = str(index) * 64
+            file.mime_type = "image/jpeg"
+            file.photo_metadata = json.dumps({
+                "version": 1, "status": "complete", "source_sha256": file.hash_sha256,
+                "width": index * 3000, "height": index * 2000, "format": "JPEG", "mode": "RGB",
+                "fields": {"camera_model": "Camera"} if index == 1 else {}, "warnings": [],
+            })
+        group = DuplicateGroup(session_id=sid, dupe_type=DupeType.PERCEPTUAL,
+                               group_hash="photo-pair", keep_file_id=keeper.id)
+        db.add(group)
+        db.flush()
+        proposal.duplicate_group_id = group.id
+        db.add_all([DuplicateMember(group_id=group.id, file_id=candidate.id, similarity_score=1),
+                    DuplicateMember(group_id=group.id, file_id=keeper.id, similarity_score=1)])
+        db.commit()
+        candidate_id = candidate.id
+    row = client.get("/api/proposals", params={"session_id": sid}).json()["items"][0]
+    evidence = row["duplicate_evidence"]
+    assert evidence["photo_quality"]["status"] == "tradeoff"
+    assert evidence["photo_quality"]["candidate_unique_fields"] == ["camera_model"]
+    assert client.get(f"/api/files/{candidate_id}").json()["photo_metadata"]["width"] == 3000
+    duplicate = client.get("/api/duplicates", params={"session_id": sid}).json()["items"][0]
+    assert next(file for file in duplicate["files"] if file["id"] == candidate_id)["photo_quality"] == evidence["photo_quality"]
+    comparison = {
+        "session_id": sid, "expected_review_token": row["review_token"],
+        "expected_duplicate_group_id": evidence["group_id"],
+        "expected_duplicate_type": evidence["type"], "expected_keeper_id": evidence["keeper_id"],
+        "expected_candidate_path": row["file_path"], "expected_keeper_path": evidence["keeper_path"],
+    }
+    assert client.post(f"/api/proposals/{proposal_id}/approve", json={
+        key: value for key, value in comparison.items() if key != "expected_review_token"
+    }).status_code == 409
+    with Session(get_engine()) as db:
+        file = db.get(File, candidate_id)
+        data = json.loads(file.photo_metadata)
+        data["fields"]["lens_model"] = "Additional retained metadata"
+        file.photo_metadata = json.dumps(data)
+        db.commit()
+    assert client.post(f"/api/proposals/{proposal_id}/approve", json=comparison).status_code == 409
+    comparison["expected_review_token"] = client.get(
+        "/api/proposals", params={"session_id": sid}).json()["items"][0]["review_token"]
+    assert client.post(f"/api/proposals/{proposal_id}/approve", json=comparison).status_code == 200
+
+
 def test_individual_review_is_session_bound_and_edit_cannot_escape_root(review_db):
     client, (one, two), (root_one, _) = review_db
     rename = _proposal(one, root_one, "rename.txt")
@@ -604,6 +699,13 @@ def test_individual_review_is_session_bound_and_edit_cannot_escape_root(review_d
     response = client.post(f"/api/proposals/{rename}/edit", json={"session_id": one, "proposed_value": "safe.txt"})
     assert response.status_code == 200
     assert response.json()["proposed_value"] == str(root_one / "safe.txt")
+    token = response.json()["review_token"]
+    row = next(item for item in client.get("/api/proposals", params={"session_id": one, "status": "modified"}).json()["items"]
+               if item["id"] == rename)
+    assert token == row["review_token"]
+    assert client.post(f"/api/proposals/{rename}/approve", json={
+        "session_id": one, "expected_review_token": token,
+    }).status_code == 200
 
 
 def test_preview_matches_reviewed_selection_and_stale_token_blocks_commit(review_db):
@@ -1013,16 +1115,17 @@ def test_worker_registration_is_atomic_with_thread_start():
     assert not job_manager.has_live_workers()
 
 
-def test_completed_job_allows_immediate_next_job_after_writes(monkeypatch):
+def test_completed_job_blocks_unrelated_dispatch_until_thread_exits(review_db, monkeypatch):
     from donedatahoarder.core import wake_lock
     from donedatahoarder.core.jobs import JobState, job_manager
 
     monkeypatch.setattr(wake_lock, "acquire", lambda: None)
     monkeypatch.setattr(wake_lock, "release", lambda: None)
+    _, (one, two), _ = review_db
     published = Event()
     release_publish = Event()
     finished = Event()
-    job = job_manager._create_job("test", "first")
+    job = job_manager._create_job("test", one)
     original_push = job.push_progress
 
     def slow_terminal_push(progress):
@@ -1039,17 +1142,25 @@ def test_completed_job_allows_immediate_next_job_after_writes(monkeypatch):
             finished.set()
 
     job_manager._start_worker(job, finish_job)
+    worker = job_manager._worker_threads[job.job_id]
     try:
         assert published.wait(5)
         assert job_manager.get_active() is None
-        # The old worker is still finishing its terminal notification, but
-        # has no remaining database writes or nested producer.
-        assert not job_manager.has_live_workers()
-        next_job = job_manager._create_job("test", "second")
-        job_manager._finish_job(next_job, JobState.CANCELLED)
+        # Publishing a completed checkpoint does not end the thread's lifetime.
+        # Only its own saved-plan continuation may overlap final bookkeeping;
+        # unrelated work must wait until the old worker actually exits.
+        assert job_manager.has_live_workers()
+        assert job_manager.has_live_workers(one)
+        with pytest.raises(RuntimeError, match="previous pipeline worker"):
+            job_manager._create_job("test", two)
     finally:
         release_publish.set()
         assert finished.wait(5)
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert not job_manager.has_live_workers()
+    next_job = job_manager._create_job("test", two)
+    job_manager._finish_job(next_job, JobState.CANCELLED)
 
 
 def test_pipeline_uses_saved_models_when_request_omits_model(review_db, monkeypatch):

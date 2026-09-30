@@ -141,6 +141,80 @@ def test_rename_proposal_explains_only_supported_date_prefix(tmp_path, monkeypat
         assert "capture date unverified" in photo.reasoning
 
 
+@pytest.mark.parametrize("limit,offset,expected", [
+    (0, None, []), (1, 1, [1]), (101, 1, list(range(1, 102))),
+    (None, 101, [101, 102]),
+])
+def test_proposal_debug_slice_honors_file_limit_and_offset(tmp_path, monkeypatch, limit, offset, expected):
+    from sqlalchemy.orm import Session
+    from donedatahoarder.db.models import File, FileStatus, Proposal, UserSession
+    from donedatahoarder.db.session import init_db
+    from donedatahoarder.proposals.namer.core import generate_proposals
+
+    monkeypatch.setenv("DDH_DATA_DIR", str(tmp_path / "state"))
+    root = tmp_path / "collection"
+    root.mkdir()
+    engine = init_db(tmp_path / "index.db")
+    with Session(engine) as db:
+        owner = UserSession(root_path=str(root))
+        db.add(owner)
+        db.flush()
+        files = []
+        for number in range(103):
+            path = root / f"IMG_{number:04}.png"
+            path.write_bytes(b"synthetic")
+            row = File(session_id=owner.id, path=str(path), filename=path.name,
+                       extension=".png", status=FileStatus.ANALYZED,
+                       analysis_outcome="content_verified", analysis_evidence_source="vision",
+                       ai_description=f"Subject {number}", ai_suggested_name=f"subject_{number}",
+                       ai_confidence=0.9)
+            db.add(row)
+            files.append(row)
+        db.commit()
+        session_id = owner.id
+        ids = [row.id for row in files]
+
+    generate_proposals(limit=limit, offset=offset, session_id=session_id)
+
+    with Session(engine) as db:
+        processed = {row.id for row in db.query(File).filter(File.status == FileStatus.PROPOSED)}
+        assert processed == {ids[number] for number in expected}
+        assert {row.file_id for row in db.query(Proposal)} <= processed
+
+
+def test_scoped_naming_safety_handles_large_selected_id_sets(tmp_path, monkeypatch):
+    from sqlalchemy.orm import Session
+    from donedatahoarder.db.models import File, FileStatus, Proposal, ProposalStatus, ProposalType, UserSession
+    from donedatahoarder.db.session import init_db
+
+    monkeypatch.setenv("DDH_DATA_DIR", str(tmp_path / "state"))
+    root = tmp_path / "collection"
+    root.mkdir()
+    path = root / "subject.txt"
+    path.write_text("synthetic", encoding="utf-8")
+    engine = init_db(tmp_path / "index.db")
+    with Session(engine) as db:
+        owner = UserSession(root_path=str(root))
+        db.add(owner)
+        db.flush()
+        file = File(session_id=owner.id, path=str(path), filename=path.name,
+                    status=FileStatus.PROPOSED)
+        db.add(file)
+        db.flush()
+        proposal = Proposal(file_id=file.id, proposal_type=ProposalType.RENAME,
+                            current_value=str(path), proposed_value=str(root / "subject_clean.txt"),
+                            status=ProposalStatus.PENDING)
+        db.add(proposal)
+        db.commit()
+        sid, proposal_id = owner.id, proposal.id
+
+    # Production slices may include more IDs than SQLite accepts in one IN
+    # statement; the rows need not all have a pending rename to hit the limit.
+    assert _suppress_unsafe_rename_postpasses(sid, set(), file_ids=set(range(1, 40001))) == {}
+    with Session(engine) as db:
+        assert db.get(Proposal, proposal_id).status == ProposalStatus.PENDING
+
+
 class TestIsUselessStem:
     def test_pure_digits(self):
         assert _is_useless_stem("1")

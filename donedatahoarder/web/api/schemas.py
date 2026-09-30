@@ -70,6 +70,7 @@ class BulkRejectRequest(BaseModel):
 
 class ReviewProposalRequest(BaseModel):
     session_id: str = Field(min_length=1)
+    expected_review_token: Optional[str] = Field(default=None, min_length=1, max_length=128)
     expected_duplicate_group_id: Optional[int] = None
     expected_duplicate_type: Optional[str] = None
     expected_keeper_id: Optional[int] = None
@@ -85,6 +86,7 @@ class EditProposalRequest(BaseModel):
 class SetKeeperRequest(BaseModel):
     session_id: str = Field(min_length=1)
     keep_file_id: int
+    expected_keeper_id: Optional[int] = None
 
 
 class PipelineRequest(BaseModel):

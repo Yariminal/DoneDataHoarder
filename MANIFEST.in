@@ -1,0 +1,10 @@
+include scripts/check_tui_distribution.py
+include scripts/capture_readme.py
+include INSTALL.md CONTRIBUTING.md LICENSE
+recursive-include docs/assets *.svg
+include docs/launch.md docs/organization.md docs/PHOTO_KEEPER_POLICY.md docs/TUI_IMPLEMENTATION_STATUS.md
+include docs/tui*.md
+include docs/PYTHON_TEXTUAL_PLAN.md
+include docs/remote-sessions.md
+include docs/REMOTE_STORAGE_POLICY.md
+include docs/REMOTE_DISCOVERY_PLAN.md

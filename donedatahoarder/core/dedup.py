@@ -6,13 +6,13 @@ Stage 2 — Perceptual: group images by pHash distance ≤ threshold
 Stage 3 — Content:   semantic similarity using AI descriptions and tags
 
 Results are written to DuplicateGroup / DuplicateMember tables.
-The "keep" file in each group defaults to the one with the earliest
-best-date (i.e. original) and longest path (i.e. most specific location).
+Photo keepers use measured resolution and valid, hash-bound capture metadata.
+The selected reference does not make a visually similar member disposable.
+Non-photo groups retain the existing date/path/size preference.
 """
 import json
 from bisect import bisect_right
 from collections import defaultdict
-from datetime import datetime
 from difflib import SequenceMatcher
 from functools import lru_cache, wraps
 from itertools import islice
@@ -34,6 +34,7 @@ from donedatahoarder.db.session import get_engine
 from donedatahoarder.config import load_phash_config
 from donedatahoarder.phash import hash_distance
 from donedatahoarder.core.process_lock import operation_lock
+from donedatahoarder.core.photo_quality import keeper_sort_key, photo_comparison_reason
 from donedatahoarder.proposals.sequence_identity import numbered_frame_identity
 
 try:
@@ -148,19 +149,17 @@ def _writer_locked(function):
     return locked
 
 def _pick_keeper(files: list[File]) -> int:
-    """
-    Pick the file to keep from a duplicate group.
+    """Choose the same preservation reference as the bounded database path."""
+    return min(files, key=keeper_sort_key).id
 
-    Strategy:
-    1. Prefer the file with the earliest known date (most likely original).
-    2. Break ties by preferring the longer path (more descriptive location).
-    3. Break further ties by largest file size (higher quality).
-    """
-    def sort_key(f: File):
-        date = f.date_best or f.date_modified or f.date_created or datetime(9999, 1, 1)
-        return (date, -len(f.path), -(f.size_bytes or 0))
 
-    return min(files, key=sort_key).id
+def _keeper_columns():
+    """Small row projection shared by selection and proposal explanations."""
+    return (
+        File.id, File.date_best, File.date_modified, File.date_created,
+        File.path, File.size_bytes, File.extension, File.mime_type,
+        File.hash_sha256, File.hash_perceptual, File.photo_metadata,
+    )
 
 
 def _pick_keeper_ids(session: Session, file_ids) -> int:
@@ -168,15 +167,11 @@ def _pick_keeper_ids(session: Session, file_ids) -> int:
     iterator = iter(file_ids)
     best: tuple[tuple, int] | None = None
     while chunk := list(islice(iterator, KEEPER_QUERY_CHUNK)):
-        rows = session.query(
-            File.id, File.date_best, File.date_modified, File.date_created,
-            File.path, File.size_bytes,
-        ).filter(File.id.in_(chunk)).all()
-        for file_id, date_best, date_modified, date_created, path, size in rows:
-            date = date_best or date_modified or date_created or datetime(9999, 1, 1)
-            key = (date, -len(path or ""), -(size or 0))
+        rows = session.query(*_keeper_columns()).filter(File.id.in_(chunk)).all()
+        for row in rows:
+            key = keeper_sort_key(row)
             if best is None or key < best[0]:
-                best = (key, file_id)
+                best = (key, row.id)
     if best is None:
         raise ValueError("Duplicate group has no existing files")
     return best[1]
@@ -222,8 +217,9 @@ def _upsert_group(
         session.add(group)
         session.flush()
 
-    # A chosen keeper must be known before scores are attached. The score of
-    # a transitive edge is never evidence about a different keeper.
+    # Preserve existing choices: legacy rows do not record whether the user
+    # selected the keeper. New/NULL selections adopt the preservation policy.
+    # A transitive edge is never evidence about a different keeper.
     if group.keep_file_id is None:
         group.keep_file_id = _pick_keeper_ids(session, file_ids)
 
@@ -1099,13 +1095,17 @@ def generate_dedup_proposals(session_id: str | None = None) -> dict:
                 group.keep_file_id = keep_id
 
             keep_path = paths.get(keep_id, "(unknown)")
+            keeper_photo_row = session.query(*_keeper_columns()).filter(File.id == keep_id).first()
             keeper_identity = _sequence_identity(keep_path)
             label = type_label.get(group.dupe_type, str(group.dupe_type))
 
             member_rows = session.query(
                 DuplicateMember.file_id, DuplicateMember.similarity_score,
-            ).filter_by(group_id=group.id).all()
-            for member_id, member_similarity in member_rows:
+                *_keeper_columns(),
+            ).join(File, File.id == DuplicateMember.file_id).filter(
+                DuplicateMember.group_id == group.id).yield_per(KEEPER_QUERY_CHUNK)
+            for member_row in member_rows:
+                member_id, member_similarity = member_row.file_id, member_row.similarity_score
                 if member_id == keep_id:
                     continue
                 if member_id in existing_marked:
@@ -1146,6 +1146,7 @@ def generate_dedup_proposals(session_id: str | None = None) -> dict:
                         "other frames were not proposed for disposal."
                     )
                     counts["sequence_sampled"] += 1
+                reasoning += photo_comparison_reason(member_row, keeper_photo_row)
 
                 pending_insert.append({
                     "file_id": member_id, "proposal_type": ProposalType.MARK_DUPLICATE,
@@ -1302,6 +1303,7 @@ def refresh_group_proposals(session: Session, group_id: int) -> dict[str, int]:
             f"{group.dupe_type.value} candidate; direct keeper similarity={score:.3f}. "
             f"Keeper: {keeper.path}"
         )
+        proposal.reasoning += photo_comparison_reason(victim, keeper)
         if member_id in sampled_sequence_ids:
             proposal.reasoning += (
                 " Numbered sequence comparison sampled for review; "

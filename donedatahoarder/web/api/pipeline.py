@@ -5,7 +5,6 @@ before/after organize tree builders.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -108,53 +107,14 @@ def _require_worker_exit(job_manager) -> None:
 # ---------------------------------------------------------------------------
 
 def _execute_preview(session_id: str) -> dict:
-    from donedatahoarder.executor import plan_execution, select_executable_proposals
+    from donedatahoarder.core.review import ReviewError, execution_preview
 
     if not session_id or not session_id.strip():
         raise HTTPException(400, "No active session. Create or load a session first.")
-    engine = get_engine()
-    with Session(engine) as db:
-        user_session = db.get(UserSession, session_id)
-        if user_session is None:
-            raise HTTPException(404, "Session not found")
-        proposals = select_executable_proposals(db, session_id=session_id)
-        planned = plan_execution(db, proposals, Path(user_session.root_path)) if proposals else []
-        proposal_by_id = {proposal.id: proposal for proposal in proposals}
-        items = []
-        for step in planned:
-            proposal = proposal_by_id[step.proposal_id]
-            file = db.get(File, proposal.file_id)
-            item = {
-                "id": proposal.id,
-                "type": proposal.proposal_type.value,
-                "status": proposal.status.value,
-                "source": step.source or (file.path if file else ""),
-                "destination": step.destination or "",
-                "keeper": step.keeper or "",
-                "error": step.error,
-                "confidence": proposal.confidence,
-            }
-            if proposal.proposal_type == ProposalType.MARK_DUPLICATE:
-                groups = (
-                    db.query(DuplicateGroup)
-                    .join(DuplicateMember, DuplicateMember.group_id == DuplicateGroup.id)
-                    .filter(DuplicateMember.file_id == proposal.file_id,
-                            DuplicateGroup.session_id == session_id)
-                    .all()
-                )
-                item["keeper_groups"] = sorted(
-                    (group.id, group.keep_file_id) for group in groups
-                )
-            items.append(item)
-    by_type: dict[str, int] = {}
-    for item in items:
-        by_type[item["type"]] = by_type.get(item["type"], 0) + 1
-    # Bind the user's confirmation to the precise proposal values displayed.
-    fingerprint = json.dumps([session_id, user_session.root_path, items], sort_keys=True, separators=(",", ":"))
-    token = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
-    return {"session_id": session_id, "total": len(items),
-            "errors": sum(bool(item["error"]) for item in items),
-            "by_type": by_type, "items": items, "token": token}
+    try:
+        return execution_preview(session_id)
+    except ReviewError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
 
 
 @router.get("/execute/preview")

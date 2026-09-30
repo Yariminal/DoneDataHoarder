@@ -5,7 +5,9 @@ Processes all File records in PENDING status and upgrades them to ENRICHED.
 Safe to re-run; already-enriched files are skipped.
 """
 import hashlib
+import json
 import mimetypes
+import stat
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
@@ -17,11 +19,20 @@ from rich.progress import (
     BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
     TaskProgressColumn, TextColumn, TimeElapsedColumn,
 )
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from donedatahoarder.db.models import File, FileStatus
+from donedatahoarder.db.models import (
+    DuplicateGroup, DuplicateMember, File, FileStatus, Proposal, ProposalStatus,
+    ProposalType, UserSession,
+)
+from donedatahoarder.core.media_dates import parse_media_date
 from donedatahoarder.db.session import get_engine
 from donedatahoarder.logging import get_logger
+from donedatahoarder.core.photo_metadata import (
+    PHOTO_EXTENSIONS, extract_photo_metadata, is_cloud_placeholder,
+    source_identity, unavailable_metadata,
+)
 
 logger = get_logger(__name__)
 
@@ -143,11 +154,9 @@ def _audio_date(path: Path) -> Optional[datetime]:
             val = f.get(key)
             if val:
                 raw = str(val[0]).strip()
-                for fmt in ("%Y-%m-%d", "%Y", "%Y-%m-%dT%H:%M:%S"):
-                    try:
-                        return datetime.strptime(raw[:len(fmt)], fmt)
-                    except ValueError:
-                        continue
+                date = parse_media_date(raw)
+                if date is not None:
+                    return date
     except Exception:
         pass
     return None
@@ -163,17 +172,33 @@ def _perceptual_hash(path: Path) -> Optional[str]:
 
 def _disk_metadata(path: Path) -> dict:
     """Read mime, md5, exif, and perceptual hash. No database access."""
-    if not path.exists():
+    try:
+        before = path.stat()
+    except FileNotFoundError:
         return {"missing": True}
+
+    if not stat.S_ISREG(before.st_mode):
+        return {"error": "Source is not a regular file"}
+
+    if is_cloud_placeholder(before):
+        return {
+            "error": "Cloud content is not local; make it available offline before enrichment",
+            "photo_metadata": unavailable_metadata("Cloud content is not local")
+            if path.suffix.lower() in PHOTO_EXTENSIONS else None,
+        }
 
     mime = _mime_type(path) or ""
     digest, sha256 = _content_hashes(path)
+    if not digest or not sha256:
+        return {"error": "File content could not be read for hashing"}
     date_exif = None
     perceptual = None
+    photo_metadata = None
     have_exif = False
     have_phash = False
 
-    if mime.startswith("image/"):
+    if mime.startswith("image/") or path.suffix.lower() in PHOTO_EXTENSIONS:
+        photo_metadata = extract_photo_metadata(path, source_sha256=sha256)
         date_exif = _exif_date(path)
         perceptual = _perceptual_hash(path)
         have_exif = True
@@ -185,6 +210,13 @@ def _disk_metadata(path: Path) -> dict:
             perceptual = _perceptual_hash(path)
             have_phash = True
 
+    try:
+        changed = source_identity(before) != source_identity(path.stat())
+    except OSError:
+        changed = True
+    if changed:
+        return {"error": "File changed while reading hashes or metadata; enrich it again"}
+
     return {
         "mime_type": mime,
         "hash_md5": digest,
@@ -193,6 +225,7 @@ def _disk_metadata(path: Path) -> dict:
         "have_exif": have_exif,
         "hash_perceptual": perceptual,
         "have_phash": have_phash,
+        "photo_metadata": photo_metadata,
     }
 
 
@@ -206,11 +239,15 @@ def _safe_disk(path_str: str) -> dict:
 
 def _apply_disk_result(file_rec: File, result: dict) -> str:
     """Write one disk result onto a File row. Caller owns the session."""
+    photo = result.get("photo_metadata")
+    file_rec.photo_metadata = json.dumps(photo, ensure_ascii=True, separators=(",", ":")) if photo else None
     if result.get("missing"):
+        file_rec.hash_md5 = file_rec.hash_sha256 = file_rec.hash_perceptual = None
         file_rec.status = FileStatus.ERROR
         file_rec.error_message = "File not found on disk"
         return "errors"
     if "error" in result:
+        file_rec.hash_md5 = file_rec.hash_sha256 = file_rec.hash_perceptual = None
         file_rec.status = FileStatus.ERROR
         file_rec.error_message = result["error"]
         logger.warning(
@@ -224,8 +261,9 @@ def _apply_disk_result(file_rec: File, result: dict) -> str:
     file_rec.hash_sha256 = result["hash_sha256"]
     if result["have_exif"]:
         file_rec.date_exif = result["date_exif"]
-    if result["have_phash"]:
-        file_rec.hash_perceptual = result["hash_perceptual"]
+    else:
+        file_rec.date_exif = None
+    file_rec.hash_perceptual = result["hash_perceptual"] if result["have_phash"] else None
 
     exif = result["date_exif"] if result["have_exif"] else file_rec.date_exif
     file_rec.date_best = _best_date(
@@ -234,6 +272,7 @@ def _apply_disk_result(file_rec: File, result: dict) -> str:
         file_rec.date_created,
     )
     file_rec.status = FileStatus.ENRICHED
+    file_rec.error_message = None
     file_rec.enriched_at = utcnow()
     return "enriched"
 
@@ -332,8 +371,11 @@ def _write_disk_results(
                     counts["errors"] += 1
                 else:
                     counts[_apply_disk_result(file_rec, result)] += 1
+                # Consumers persist durable job progress on another connection.
+                # Never yield with pending writes: the next file's autoflush
+                # would otherwise hold SQLite's writer lock across that yield.
+                session.commit()
                 yield "file"
-            session.commit()
     finally:
         stream.close()
 
@@ -353,7 +395,7 @@ def _best_date(
 def _take(counts: dict, limit: Optional[int]) -> Optional[int]:
     """How many pending rows to pull this batch. None means stop."""
     take = BATCH_SIZE
-    if limit:
+    if limit is not None:
         remaining = limit - (counts["enriched"] + counts["errors"])
         if remaining <= 0:
             return None
@@ -376,12 +418,14 @@ def _enrich_unlocked(workers: int = 1, limit: Optional[int] = None, session_id: 
     """
     engine = get_engine()
     counts = {"enriched": 0, "errors": 0, "skipped": 0}
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
 
     with Session(engine) as session:
         query = session.query(File).filter(File.status == FileStatus.PENDING)
         if session_id:
             query = query.filter(File.session_id == session_id)
-        if limit:
+        if limit is not None:
             query = query.limit(limit)
         total = query.count()
 
@@ -440,12 +484,14 @@ def _enrich_with_progress_unlocked(
     """
     engine = get_engine()
     counts = {"enriched": 0, "errors": 0, "skipped": 0}
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
 
     with Session(engine) as session:
         query = session.query(File).filter(File.status == FileStatus.PENDING)
         if session_id:
             query = query.filter(File.session_id == session_id)
-        if limit:
+        if limit is not None:
             query = query.limit(limit)
         total = query.count()
 
@@ -509,3 +555,101 @@ def enrich_with_progress(
             workers=workers, limit=limit, session_id=session_id,
             pause_event=pause_event, cancel_check=cancel_check,
         )
+
+
+def _refresh_photo(snapshot: dict) -> dict:
+    """Read evidence only when it belongs to the already indexed bytes."""
+    path = Path(snapshot["path"])
+    try:
+        before = path.stat()
+        if not stat.S_ISREG(before.st_mode):
+            return unavailable_metadata("Source is not a regular file")
+        if is_cloud_placeholder(before):
+            return unavailable_metadata("Cloud content is not local; make it available offline to inspect")
+        indexed_hash = snapshot["hash_sha256"]
+        if not indexed_hash:
+            return unavailable_metadata("No indexed SHA-256; re-enrich this file before comparing photo evidence")
+        _, actual_hash = _content_hashes(path)
+        if not actual_hash or actual_hash != indexed_hash:
+            return unavailable_metadata("File content differs from its index; re-scan and enrich this file")
+        evidence = extract_photo_metadata(path, source_sha256=indexed_hash)
+        if source_identity(before) != source_identity(path.stat()):
+            return unavailable_metadata("File changed while refreshing photo metadata")
+        return evidence
+    except Exception:
+        return unavailable_metadata("Photo content is unavailable; existing index was preserved")
+
+
+def _invalidate_photo_approvals(db: Session, session_id: str, file_ids: list[int]) -> None:
+    """Changed keeper evidence invalidates every related unapplied approval."""
+    groups = select(DuplicateGroup.id).where(
+        DuplicateGroup.session_id == session_id,
+        or_(DuplicateGroup.keep_file_id.in_(file_ids), DuplicateGroup.id.in_(
+            select(DuplicateMember.group_id).where(DuplicateMember.file_id.in_(file_ids))
+        )),
+    )
+    related_files = select(DuplicateMember.file_id).where(DuplicateMember.group_id.in_(groups))
+    owned_files = select(File.id).where(File.session_id == session_id)
+    db.query(Proposal).filter(
+        Proposal.file_id.in_(owned_files),
+        Proposal.proposal_type == ProposalType.MARK_DUPLICATE,
+        Proposal.status.in_((ProposalStatus.APPROVED, ProposalStatus.MODIFIED)),
+        or_(Proposal.file_id.in_(file_ids), Proposal.duplicate_group_id.in_(groups),
+            Proposal.file_id.in_(related_files)),
+    ).update({"status": ProposalStatus.PENDING}, synchronize_session=False)
+
+
+def refresh_photo_metadata(session_id: str, workers: int = 1) -> dict:
+    """Explicitly backfill old photo indexes without resetting AI or file status.
+
+    Only metadata is replaced. Indexed hashes are never rewritten for changed
+    content. ``updated`` and ``skipped`` partition inspected rows; ``unknown``
+    counts every non-complete result, including unchanged ones. Applied/rejected
+    decisions are retained; affected approvals return to individual review.
+    """
+    from donedatahoarder.core.process_lock import operation_lock
+
+    engine = get_engine()
+    counts = {"updated": 0, "skipped": 0, "unknown": 0}
+    with operation_lock("refresh-photo-metadata"):
+        with Session(engine) as db:
+            if not session_id or db.get(UserSession, session_id) is None:
+                raise ValueError("An existing session is required to refresh photo metadata")
+        cursor = 0
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            while True:
+                with Session(engine) as db:
+                    rows = db.query(File.id, File.path, File.hash_sha256).filter(
+                        File.session_id == session_id, File.id > cursor,
+                        or_(File.mime_type.like("image/%"),
+                            func.lower(File.extension).in_(PHOTO_EXTENSIONS)),
+                    ).order_by(File.id).limit(BATCH_SIZE).all()
+                if not rows:
+                    break
+                snapshots = [dict(id=row.id, path=row.path, hash_sha256=row.hash_sha256) for row in rows]
+                results = list(pool.map(_refresh_photo, snapshots))
+                with Session(engine) as db:
+                    changed = []
+                    for snapshot, evidence in zip(snapshots, results):
+                        row = db.get(File, snapshot["id"])
+                        if row is None or row.hash_sha256 != snapshot["hash_sha256"] or row.path != snapshot["path"]:
+                            counts["skipped"] += 1
+                            continue
+                        if evidence["status"] != "complete":
+                            counts["unknown"] += 1
+                        serialized = json.dumps(evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+                        try:
+                            unchanged = json.loads(row.photo_metadata or "null") == evidence
+                        except (ValueError, TypeError):
+                            unchanged = False
+                        if unchanged:
+                            counts["skipped"] += 1
+                            continue
+                        row.photo_metadata = serialized
+                        changed.append(row.id)
+                        counts["updated"] += 1
+                    if changed:
+                        _invalidate_photo_approvals(db, session_id, changed)
+                    db.commit()
+                cursor = rows[-1].id
+    return counts

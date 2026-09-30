@@ -4,6 +4,7 @@ from pathlib import Path
 from io import StringIO
 
 from rich.console import Console
+import pytest
 
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
@@ -11,6 +12,41 @@ from typer.testing import CliRunner
 from donedatahoarder import cli
 from donedatahoarder.db.models import File, FileStatus, Proposal, UserSession
 from donedatahoarder.db.session import get_engine, init_db
+
+
+@pytest.mark.parametrize("options,expected", [
+    (["--limit", "0"], (0, None)),
+    (["--limit", "1"], (1, None)),
+    (["--offset", "1"], (None, 1)),
+])
+def test_propose_file_slice_does_not_start_collection_wide_organizer(tmp_path, monkeypatch, options, expected):
+    from donedatahoarder.proposals import namer, organizer
+
+    monkeypatch.setenv("DDH_DATA_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(cli, "_maybe_show_welcome", lambda: None)
+    db_path = tmp_path / "index.db"
+    engine = init_db(db_path)
+    with Session(engine) as db:
+        owner = UserSession(root_path=str(tmp_path), name="sample")
+        db.add(owner)
+        db.commit()
+        session_id = owner.id
+    calls = []
+
+    def propose_slice(**kwargs):
+        calls.append(kwargs)
+        return {"rename": 0, "tags": 0, "skipped": 0}
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("A bounded file proposal run must not initialize AI or organize the whole collection")
+
+    monkeypatch.setattr(namer, "generate_proposals", propose_slice)
+    monkeypatch.setattr(cli, "_init_ai", forbidden)
+    monkeypatch.setattr(organizer, "generate_reorg_proposals", forbidden)
+    result = CliRunner().invoke(cli.app, ["propose", "--db", str(db_path), *options])
+    assert result.exit_code == 0, result.output
+    assert calls == [{"limit": expected[0], "offset": expected[1], "session_id": session_id}]
+    assert "Skipping collection-wide organization" in result.output
 
 
 def test_pipeline_scopes_every_stage_to_its_new_collection(tmp_path, monkeypatch):

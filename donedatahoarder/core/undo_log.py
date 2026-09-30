@@ -23,19 +23,21 @@ from donedatahoarder.core.process_lock import operation_lock
 # Paths
 # ---------------------------------------------------------------------------
 
-def get_datahoarder_dir() -> Path:
+def get_datahoarder_dir(*, create: bool = True) -> Path:
     """Get the DoneDataHoarder data directory (~/.datahoarder)."""
     override = os.environ.get("DDH_DATA_DIR")
     if override:
         dh_dir = Path(override).expanduser().resolve()
-        dh_dir.mkdir(parents=True, exist_ok=True)
+        if create:
+            dh_dir.mkdir(parents=True, exist_ok=True)
         return dh_dir
     if os.name == "nt":
         base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
     else:
         base = Path.home()
     dh_dir = base / ".datahoarder"
-    dh_dir.mkdir(parents=True, exist_ok=True)
+    if create:
+        dh_dir.mkdir(parents=True, exist_ok=True)
     return dh_dir
 
 
@@ -89,6 +91,8 @@ def log_operation(
         directory_identity = [stat.st_dev, stat.st_ino]
     if operation != "TAGS" and original.exists() and original.is_file():
         sha256 = _compute_sha256(original)
+        if not sha256:
+            raise OSError(f"Cannot verify file content before {operation}: {original}")
 
     entry = {
         "operation_id": str(uuid.uuid4()),
@@ -242,6 +246,28 @@ def _remove_created_empty_dirs(entry: dict) -> None:
             # A non-empty directory may contain another operation or a user
             # file, so it must be left in place.
             pass
+
+
+def _verify_restore_source(entry: dict, path: Path) -> None:
+    """Require journaled identity before restoring any filesystem entry.
+
+    Legacy entries with recorded hashes remain recoverable. An absent hash or
+    directory identity cannot prove that a replacement belongs to the journal.
+    """
+    if entry.get("source_type") == "directory" or entry["operation"] == "RENAME_FOLDER":
+        identity = entry.get("directory_identity")
+        if identity is None:
+            raise ValueError(f"No recorded directory identity for {path}; manual recovery is required")
+        if not path.is_dir() or [path.stat().st_dev, path.stat().st_ino] != identity:
+            raise ValueError(f"Folder identity changed at {path}")
+        return
+    expected = entry.get("sha256")
+    if not expected:
+        raise ValueError(f"No recorded SHA-256 for {path}; manual recovery is required")
+    if entry.get("source_type") not in (None, "file") or not path.is_file():
+        raise ValueError(f"Source is no longer a regular file: {path}")
+    if _compute_sha256(path) != expected:
+        raise ValueError(f"File hash mismatch for {path.name}")
 
 
 def _assert_proposal_state(entry: dict, *, allow_restored: bool = False) -> None:
@@ -458,15 +484,7 @@ def _undo_operations_unlocked(
                     counts["failed"] += 1
                     continue
 
-                # Verify file integrity if SHA256 available
-                if sha256_expected and new.exists():
-                    current_hash = _compute_sha256(new)
-                    if current_hash and current_hash != sha256_expected:
-                        con.print(
-                            f"  [red]✗[/red] {op}: File hash mismatch for {new.name}"
-                        )
-                        counts["failed"] += 1
-                        continue
+                _verify_restore_source(entry, new)
 
                 # Check if destination already exists
                 if original.exists() and original != new:
@@ -512,10 +530,7 @@ def _undo_operations_unlocked(
                     con.print(f"  [red]✗[/red] {op}: Destination already exists {original}")
                     counts["failed"] += 1
                     continue
-                if sha256_expected and _compute_sha256(trash_path) != sha256_expected:
-                    con.print(f"  [red]✗[/red] {op}: File hash mismatch for {trash_path.name}")
-                    counts["failed"] += 1
-                    continue
+                _verify_restore_source(entry, trash_path)
 
                 # Ensure original directory exists
                 original.parent.mkdir(parents=True, exist_ok=True)
@@ -531,14 +546,7 @@ def _undo_operations_unlocked(
                     counts["failed"] += 1
                     continue
 
-                identity = entry.get("directory_identity")
-                if identity is not None and (
-                    not new.is_dir()
-                    or [new.stat().st_dev, new.stat().st_ino] != identity
-                ):
-                    con.print(f"  [red]✗[/red] {op}: Folder identity changed at {new}")
-                    counts["failed"] += 1
-                    continue
+                _verify_restore_source(entry, new)
 
                 if original.exists() and original != new:
                     con.print(

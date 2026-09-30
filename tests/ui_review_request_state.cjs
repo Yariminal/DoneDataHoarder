@@ -180,8 +180,17 @@ context.window.appConfirm = async () => { confirmCount += 1; return true; };
   await actions.approve(4);
   await actions.reject(5);
   actions.startEdit(actions.proposals[2]);
+  actions.proposals[2].review_token = 'before-edit';
   actions.editValue = 'updated';
+  const originalPost = api.post;
+  api.post = (url, body) => url.endsWith('/edit')
+    ? Promise.resolve({ proposed_value: '/collection/updated', review_token: 'after-edit' })
+    : originalPost(url, body);
   await actions.saveEdit(6);
+  assert.equal(actions.proposals[2].proposed_value, '/collection/updated');
+  assert.equal(actions.proposals[2].review_token, 'after-edit',
+    'edited row must retain the new review token instead of its stale snapshot token');
+  api.post = originalPost;
   assert.equal(context.window._dataVersion, previousVersion + 3,
     'review mutations must invalidate dashboard counts');
   actions.load = async () => {};

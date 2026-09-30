@@ -104,3 +104,39 @@ def test_mutagen_date_created_missing():
     """_mutagen_date_created returns None when mutagen is missing or fails."""
     with patch("donedatahoarder.core.scanner._HAS_MUTAGEN", False):
         assert _mutagen_date_created(Path("/tmp/x.mp3")) is None
+
+
+def test_background_scan_reports_committed_batches_without_console(tmp_path, monkeypatch, capsys):
+    from sqlalchemy.orm import Session
+    from donedatahoarder.core import scanner
+    from donedatahoarder.db.models import File, UserSession
+    from donedatahoarder.db.session import init_db
+
+    engine = init_db(tmp_path / "index.db")
+    root = tmp_path / "collection"
+    root.mkdir()
+    (root / "one.txt").write_text("one")
+    (root / "two.txt").write_text("two")
+    with Session(engine) as db:
+        owner = UserSession(name="background", root_path=str(root))
+        db.add(owner)
+        db.commit()
+        session_id = owner.id
+    monkeypatch.setattr(scanner, "BATCH_SIZE", 1)
+    reports = []
+
+    def record_progress(payload):
+        # A real observer writes its checkpoint through another connection.
+        # This would time out if scan called it before committing its batch.
+        with Session(engine) as db:
+            assert db.query(File).filter_by(session_id=session_id).count() == payload["new"]
+            db.get(UserSession, session_id).name = f"indexed-{payload['new']}"
+            db.commit()
+        reports.append(payload)
+
+    result = scanner.scan(root, session_id=session_id, show_progress=False,
+                          progress_callback=record_progress)
+    assert result["new"] == 2
+    assert [report["processed"] for report in reports] == [1, 2]
+    assert all(report["current_file"] for report in reports)
+    assert "Scanning" not in capsys.readouterr().out

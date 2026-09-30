@@ -149,7 +149,8 @@ def _content_verified_for_naming(file_rec: File) -> bool:
 
 
 def _suppress_unsafe_rename_postpasses(session_id: str | None,
-                                       sequence_ids: set[int]) -> dict[str, int]:
+                                       sequence_ids: set[int], *,
+                                       file_ids: set[int] | None = None) -> dict[str, int]:
     """Final gate applies to every naming post-pass, not only the AI pass."""
     if not session_id:
         return {}
@@ -165,13 +166,20 @@ def _suppress_unsafe_rename_postpasses(session_id: str | None,
                            protection)
             if protection else set()
         )
-        proposals = (
+        query = (
             db.query(Proposal, File).join(File, Proposal.file_id == File.id)
             .filter(File.session_id == session_id,
                     Proposal.proposal_type == ProposalType.RENAME,
                     Proposal.status == ProposalStatus.PENDING)
-            .all()
         )
+        if file_ids is not None:
+            proposals = []
+            selected_ids = sorted(file_ids)
+            for start in range(0, len(selected_ids), 500):
+                proposals.extend(query.filter(
+                    File.id.in_(selected_ids[start:start + 500])).all())
+        else:
+            proposals = query.all()
         reserved = {Path(p.proposed_value) for p, _ in proposals if p.proposed_value}
         next_suffixes: dict[Path, int] = {}
         for proposal, file_rec in proposals:
@@ -228,9 +236,12 @@ def _generate_proposals_impl(
     Optionally translates filenames based on session's preferred_language setting.
 
     Args:
-        limit: Maximum number of files to process.
-        offset: Skip first N files (useful for debugging partial runs).
+        limit: Maximum number of analyzed files to process.
+        offset: Skip first N analyzed files in stable ID order.
         session_id: Restrict to files belonging to this session.
+
+    Explicit slices omit collection-wide propagation and cleanup post-passes
+    so a debug request cannot create proposals outside the selected slice.
 
     Returns:
         Summary dict with proposal counts.
@@ -242,6 +253,12 @@ def _generate_proposals_impl(
 
     engine = get_engine()
     counts = {"rename": 0, "tags": 0, "skipped": 0}
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
+    if offset is not None and offset < 0:
+        raise ValueError("offset must be non-negative")
+    processed = 0
+    processed_by_session: dict[str, set[int]] = {}
 
     # Get the session's language preference and root path (latter is passed to
     # build_new_name so it can strip project-name echoes from generated stems)
@@ -275,11 +292,12 @@ def _generate_proposals_impl(
         query = session.query(File).filter(File.status == FileStatus.ANALYZED)
         if session_id:
             query = query.filter(File.session_id == session_id)
-        total = query.count()
+        query = query.order_by(File.id)
         if offset:
             query = query.offset(offset)
-        if limit:
+        if limit is not None:
             query = query.limit(limit)
+        total = query.count()
 
 
     with Progress(
@@ -303,9 +321,15 @@ def _generate_proposals_impl(
                 p_q = session.query(File).filter(File.status == FileStatus.ANALYZED)
                 if session_id:
                     p_q = p_q.filter(File.session_id == session_id)
-                # Always query from offset 0: processed files change status
-                # from ANALYZED to PROPOSED and no longer match the filter.
-                batch = p_q.limit(100).all()
+                # Processed rows leave ANALYZED; the skipped prefix remains
+                # eligible and must be excluded on every subsequent batch.
+                p_q = p_q.order_by(File.id)
+                if offset:
+                    p_q = p_q.offset(offset)
+                take = 100 if limit is None else min(100, limit - processed)
+                if take <= 0:
+                    break
+                batch = p_q.limit(take).all()
                 if not batch:
                     break
 
@@ -409,12 +433,36 @@ def _generate_proposals_impl(
 
                     # Update file status
                     file_rec.status = FileStatus.PROPOSED
+                    processed += 1
+                    processed_by_session.setdefault(file_rec.session_id, set()).add(file_rec.id)
                     if not made_proposal:
                         counts["skipped"] += 1
 
                     progress.advance(task)
 
                 session.commit()
+
+    if limit is not None or offset:
+        suppressed = {}
+        with Session(engine) as db:
+            sequences_by_session = {
+                sid: {fid for (fid,) in (
+                    db.query(RelationMember.file_id)
+                    .join(RelationGroup, RelationMember.group_id == RelationGroup.id)
+                    .filter(RelationGroup.session_id == sid,
+                            RelationGroup.label.like("frame_sequence_%"))
+                )}
+                for sid in processed_by_session
+            }
+        for sid, file_ids in processed_by_session.items():
+            for reason, number in _suppress_unsafe_rename_postpasses(
+                sid, sequences_by_session[sid], file_ids=file_ids,
+            ).items():
+                suppressed[reason] = suppressed.get(reason, 0) + number
+        if suppressed:
+            counts["suppressed_unsafe_renames"] = sum(suppressed.values())
+            counts["rename_suppression_reasons"] = suppressed
+        return counts
 
     # Post-pass 1: propagate renames to same-stem siblings so that pairs like
     # 10.8.pdf / 10.8.dwg / 10.8.bak don't get split — the analyzable file's
