@@ -48,6 +48,10 @@ async def capture(service, output: Path) -> None:
     from donedatahoarder.tui.app import DDHApp
     from donedatahoarder.tui.images import ImageCapabilities
 
+    def save_svg(name: str, title: str) -> None:
+        svg = app.export_screenshot(title=title)
+        (output / name).write_text("\n".join(line.rstrip() for line in svg.splitlines()) + "\n", encoding="utf-8")
+
     app = DDHApp(service, image_capability=ImageCapabilities("off", "Headless documentation capture: terminal images are off."))
     async with app.run_test(size=(140, 46)) as pilot:
         for _ in range(100):
@@ -61,7 +65,7 @@ async def capture(service, output: Path) -> None:
         app.update_inspector()
         await pilot.pause(.2)
         output.mkdir(parents=True, exist_ok=True)
-        (output / "workspace.svg").write_text(app.export_screenshot(title="DDH / synthetic collection / metadata-only run"), encoding="utf-8")
+        save_svg("workspace.svg", "DDH / synthetic collection / metadata-only run")
 
         proposal = next((item for item in app.snapshot["proposals"]
                          if ((item.get("duplicate_evidence") or {}).get("photo_quality") or {}).get("status") == "tradeoff"), None)
@@ -75,7 +79,7 @@ async def capture(service, output: Path) -> None:
         # the reader; preserve the full paths and reasoning in the live widget.
         app.query_one("#review-evidence").scroll_end(animate=False)
         await pilot.pause(.1)
-        (output / "photo-review.svg").write_text(app.export_screenshot(title="DDH / photo keeper evidence / synthetic collection"), encoding="utf-8")
+        save_svg("photo-review.svg", "DDH / photo keeper evidence / synthetic collection")
 
 
 def main() -> None:
